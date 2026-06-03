@@ -14,6 +14,7 @@ Env:
   AGENTLENS_AUTH   optional HTTP Basic Auth "user:pass" (default disabled)
 """
 
+import asyncio
 import base64
 import glob
 import json
@@ -29,6 +30,15 @@ import tornado.iostream
 import tornado.process
 import tornado.web
 import tornado.websocket
+
+try:
+    from claude_agent_sdk import (
+        ClaudeSDKClient, ClaudeAgentOptions, AssistantMessage, UserMessage,
+        SystemMessage, ResultMessage, TextBlock, ThinkingBlock, ToolUseBlock,
+        ToolResultBlock, PermissionResultAllow, PermissionResultDeny)
+    HAVE_SDK = True
+except Exception:
+    HAVE_SDK = False
 
 PORT = int(os.environ.get("AGENTLENS_PORT", "7703"))
 AUTH = os.environ.get("AGENTLENS_AUTH", "")
@@ -973,46 +983,182 @@ def _sanitize_mode(m):
 
 
 class ChatSession:
-    """A persistent `claude` process whose lifetime is independent of any browser
-    connection. Survives page navigation/reload (viewers attach/detach); the
-    process is killed only on explicit end()."""
+    """A persistent Claude Agent SDK client, independent of any browser connection.
+    Survives navigation/reload (viewers attach/detach); ends only on explicit end().
+    Provides per-action approval (can_use_tool) and interrupt()."""
 
     def __init__(self, sid, cwd, model, mode, resume_cc=None):
         self.id = sid
         self.cwd = cwd
         self.model = model
         self.mode = mode
-        self.proc = None
+        self.client = None
         self.log = []          # full normalized-event history, for replay on reattach
         self.viewers = set()   # currently-attached ChatSockets
         self.busy = False
         self.ended = False
-        self.exit_code = None
         self.cc_id = resume_cc   # claude's own session_id; preset when resuming
         self.resume_cc = resume_cc
+        self._pending = {}       # approval_id -> asyncio.Future
+        self._aid = 0
 
     def preload(self):
         """Populate history from the on-disk transcript before resuming."""
         if self.resume_cc:
             self.log = load_transcript_events(self.resume_cc)
 
-    def spawn(self):
-        cmd = [CLAUDE_BIN, "-p", "--input-format", "stream-json",
-               "--output-format", "stream-json", "--verbose",
-               "--permission-mode", self.mode, "--add-dir", self.cwd]
+    def title(self):
+        """First user message, as a short label to disambiguate sessions."""
+        for e in self.log:
+            if e.get("kind") == "user_text" and (e.get("text") or "").strip():
+                return e["text"].strip().replace("\n", " ")[:60]
+        return ""
+
+    async def start(self):
+        if not HAVE_SDK:
+            raise RuntimeError("claude-agent-sdk not installed")
+        opts = ClaudeAgentOptions(
+            cwd=self.cwd, permission_mode=self.mode, can_use_tool=self._can_use_tool,
+            add_dirs=[self.cwd], cli_path=CLAUDE_BIN)
         if self.model and self.model != "default":
-            cmd += ["--model", self.model]
+            opts.model = self.model
         if self.resume_cc:
-            cmd += ["--resume", self.resume_cc]
-        self.proc = tornado.process.Subprocess(
-            cmd, stdin=tornado.process.Subprocess.STREAM,
-            stdout=tornado.process.Subprocess.STREAM,
-            stderr=tornado.process.Subprocess.STREAM,
-            cwd=self.cwd, env=os.environ.copy())
-        self.proc.set_exit_callback(self._on_exit)
-        loop = tornado.ioloop.IOLoop.current()
-        loop.spawn_callback(self._read, self.proc.stdout, False)
-        loop.spawn_callback(self._read, self.proc.stderr, True)
+            opts.resume = self.resume_cc
+        self.client = ClaudeSDKClient(options=opts)
+        await self.client.connect()
+        tornado.ioloop.IOLoop.current().spawn_callback(self._consume)
+
+    async def _can_use_tool(self, tool_name, tool_input, context):
+        """SDK permission hook: surface an Approve/Deny prompt and await the user."""
+        self._aid += 1
+        aid = "ap%d" % self._aid
+        fut = asyncio.get_running_loop().create_future()
+        self._pending[aid] = fut
+        self._push([{"kind": "approval", "aid": aid, "tool": tool_name,
+                     "input": _cap_input(tool_input),
+                     "toolId": getattr(context, "tool_use_id", None)}])
+        try:
+            allow = await fut
+        except Exception:
+            allow = False
+        self._push([{"kind": "approval_resolved", "aid": aid, "allow": bool(allow)}])
+        return PermissionResultAllow() if allow else PermissionResultDeny(message="Denied by user")
+
+    def resolve_approval(self, aid, allow):
+        fut = self._pending.pop(aid, None)
+        if fut and not fut.done():
+            fut.set_result(bool(allow))
+
+    async def _consume(self):
+        try:
+            async for msg in self.client.receive_messages():
+                evs = self._normalize(msg)
+                for e in evs:
+                    if e["kind"] == "turn_done":
+                        self.busy = False
+                    elif e["kind"] == "ready":
+                        self.cc_id = e.get("session_id") or self.cc_id
+                if evs:
+                    self._push(evs)
+        except Exception as ex:
+            self._emit({"type": "stderr", "text": "stream ended: %r" % ex})
+        self.busy = False
+        self.ended = True
+        self._emit({"type": "exit", "code": 0})
+
+    def _normalize(self, msg):
+        evs = []
+        if isinstance(msg, SystemMessage):
+            if msg.subtype == "init":
+                d = msg.data or {}
+                evs.append({"kind": "ready", "session_id": d.get("session_id"),
+                            "model": d.get("model"), "cwd": d.get("cwd")})
+        elif isinstance(msg, AssistantMessage):
+            if not self.cc_id and getattr(msg, "session_id", None):
+                self.cc_id = msg.session_id
+            for b in msg.content:
+                if isinstance(b, TextBlock) and b.text.strip():
+                    evs.append({"kind": "assistant_text", "text": _cap(b.text)})
+                elif isinstance(b, ThinkingBlock) and b.thinking.strip():
+                    evs.append({"kind": "thinking", "text": _cap(b.thinking)})
+                elif isinstance(b, ToolUseBlock):
+                    evs.append({"kind": "tool_use", "tool": b.name,
+                                "input": _cap_input(b.input), "toolId": b.id})
+        elif isinstance(msg, UserMessage):
+            c = msg.content
+            if isinstance(c, list):
+                for b in c:
+                    if isinstance(b, ToolResultBlock):
+                        evs.append({"kind": "tool_result", "toolId": b.tool_use_id,
+                                    "content": _cap(_txt(b.content), RESULT_CAP),
+                                    "isError": bool(b.is_error)})
+        elif isinstance(msg, ResultMessage):
+            if getattr(msg, "session_id", None) and not self.cc_id:
+                self.cc_id = msg.session_id
+            evs.append({"kind": "turn_done", "subtype": msg.subtype,
+                        "isError": msg.is_error, "numTurns": msg.num_turns,
+                        "cost": msg.total_cost_usd})
+        return evs
+
+    def send_user(self, text):
+        if not text.strip() or not self.client or self.ended:
+            return
+        self.busy = True
+        # Echo the prompt into the shared log so every viewer (and a later
+        # reattach) sees it — the SDK stream never replays the user's own text.
+        self._push([{"kind": "user_text", "text": _cap(text)}])
+        client = self.client
+        async def _q():
+            try:
+                await client.query(text)
+            except Exception as ex:
+                self.busy = False
+                self._push([{"kind": "notice", "text": "send failed: %r" % ex}])
+        tornado.ioloop.IOLoop.current().spawn_callback(_q)
+
+    def interrupt(self):
+        if self.client and not self.ended:
+            client = self.client
+            async def _i():
+                try:
+                    await client.interrupt()
+                except Exception:
+                    pass
+            tornado.ioloop.IOLoop.current().spawn_callback(_i)
+
+    def _notice(self, text):
+        """Transient note to current viewers (not persisted in the log)."""
+        self._emit({"type": "events", "events": [{"kind": "notice", "text": text}]})
+
+    def set_model(self, model):
+        """Switch the model on the live session (SDK set_model). 'default'→None."""
+        if not self.client or self.ended:
+            return
+        m = None if (not model or model == "default") else model
+        self.model = model or "default"   # optimistic; reflected in list/attach
+        client = self.client
+        async def _s():
+            try:
+                await client.set_model(m)
+                self._notice("⚙ model → %s (this session)" % self.model)
+            except Exception as ex:
+                self._notice("model change failed: %r" % ex)
+        tornado.ioloop.IOLoop.current().spawn_callback(_s)
+
+    def set_mode(self, mode):
+        """Switch the permission mode on the live session (SDK set_permission_mode)."""
+        if not self.client or self.ended:
+            return
+        mode = _sanitize_mode(mode)
+        self.mode = mode
+        client = self.client
+        async def _s():
+            try:
+                await client.set_permission_mode(mode)
+                self._notice("⚙ permission mode → %s (this session)" % mode)
+            except Exception as ex:
+                self._notice("mode change failed: %r" % ex)
+        tornado.ioloop.IOLoop.current().spawn_callback(_s)
 
     def attach(self, ws):
         self.viewers.add(ws)
@@ -1028,65 +1174,27 @@ class ChatSession:
             except Exception:
                 self.viewers.discard(v)
 
-    def send_user(self, text):
-        if not text.strip() or not self.proc or self.ended:
-            return
-        self.busy = True
-        payload = {"type": "user", "message": {"role": "user",
-                   "content": [{"type": "text", "text": text}]}}
-        try:
-            self.proc.stdin.write((json.dumps(payload) + "\n").encode())
-        except Exception:
-            self._push([{"kind": "notice", "text": "send failed (process gone)"}])
-
     def _push(self, evs):
         self.log.extend(evs)
         if len(self.log) > 5000:
             self.log = self.log[-5000:]
         self._emit({"type": "events", "events": evs})
 
-    async def _read(self, stream, is_err):
-        while True:
-            try:
-                line = await stream.read_until(b"\n")
-            except Exception:
-                break
-            line = line.strip()
-            if not line:
-                continue
-            if is_err:
-                self._emit({"type": "stderr", "text": line.decode("utf-8", "replace")[:600]})
-                continue
-            try:
-                rec = json.loads(line)
-            except Exception:
-                continue
-            evs = normalize_cc(rec)
-            if evs:
-                for e in evs:
-                    if e["kind"] == "turn_done":
-                        self.busy = False
-                    elif e["kind"] == "ready":
-                        self.cc_id = e.get("session_id") or self.cc_id
-                self._push(evs)
-
-    def _on_exit(self, code):
-        self.busy = False
-        self.ended = True
-        self.exit_code = code
-        self._emit({"type": "exit", "code": code})
-
     def terminate(self):
         self.ended = True
-        if self.proc:
-            try:
-                self.proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                self.proc.proc.send_signal(signal.SIGTERM)
-            except Exception:
-                pass
+        for aid, fut in list(self._pending.items()):
+            if not fut.done():
+                fut.set_result(False)
+        self._pending.clear()
+        client = self.client
+        self.client = None
+        if client:
+            async def _d():
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+            tornado.ioloop.IOLoop.current().spawn_callback(_d)
 
 
 class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
@@ -1125,11 +1233,13 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             sid = secrets.token_hex(6)
             sess = ChatSession(sid, cwd, msg.get("model") or "", _sanitize_mode(msg.get("mode")))
             try:
-                sess.spawn()
+                await sess.start()
             except Exception as e:
                 self._say({"type": "error", "error": "spawn failed: %s" % e})
                 return
             CHAT_SESSIONS[sid] = sess
+            if self.session and self.session is not sess:
+                self.session.detach(self)   # keep it alive, just stop viewing it
             self.session = sess
             sess.attach(self)
             self._say({"type": "started", "id": sid, "cwd": cwd,
@@ -1146,6 +1256,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             sess.attach(self)
             self._say({"type": "attached", "id": sess.id, "cwd": sess.cwd,
                        "name": os.path.basename(sess.cwd) or sess.cwd, "cc": sess.cc_id,
+                       "title": sess.title(),
                        "model": sess.model or "default", "mode": sess.mode,
                        "busy": sess.busy, "ended": sess.ended, "events": sess.log})
         elif mt == "resume":
@@ -1166,7 +1277,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                                    _sanitize_mode(msg.get("mode")), resume_cc=cc)
                 sess.preload()
                 try:
-                    sess.spawn()
+                    await sess.start()
                 except Exception as e:
                     self._say({"type": "error", "error": "resume spawn failed: %s" % e})
                     return
@@ -1177,22 +1288,41 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             sess.attach(self)
             self._say({"type": "attached", "id": sess.id, "cwd": sess.cwd,
                        "name": os.path.basename(sess.cwd) or sess.cwd, "cc": sess.cc_id,
+                       "title": sess.title(),
                        "model": sess.model or "default", "mode": sess.mode,
                        "busy": sess.busy, "ended": sess.ended, "events": sess.log,
                        "resumed": True})
+        elif mt == "approve" and self.session:
+            self.session.resolve_approval(msg.get("aid"), bool(msg.get("allow")))
+        elif mt == "interrupt" and self.session:
+            self.session.interrupt()
+        elif mt == "set_model" and self.session:
+            self.session.set_model(msg.get("model") or "")
+        elif mt == "set_mode" and self.session:
+            self.session.set_mode(msg.get("mode") or "")
         elif mt == "user" and self.session:
             self.session.send_user(msg.get("text", ""))
-        elif mt == "end" and self.session:
-            s = self.session
-            s.terminate()
-            s.detach(self)
-            CHAT_SESSIONS.pop(s.id, None)
-            self.session = None
-            self._say({"type": "ended", "id": s.id})
+        elif mt == "end":
+            # End a specific session by id (sidebar ✕) or the active one.
+            # Ending a background session never disturbs the active stream.
+            target = msg.get("id")
+            cur = self.session
+            if target and (not cur or target != cur.id):
+                s = CHAT_SESSIONS.get(target)
+                if s:
+                    s.terminate()
+                    CHAT_SESSIONS.pop(s.id, None)
+                self._say({"type": "ended", "id": target})
+            elif cur:
+                cur.terminate()
+                cur.detach(self)
+                CHAT_SESSIONS.pop(cur.id, None)
+                self.session = None
+                self._say({"type": "ended", "id": cur.id})
         elif mt == "list":
             self._say({"type": "sessions", "sessions": [
                 {"id": s.id, "cwd": s.cwd, "name": os.path.basename(s.cwd) or s.cwd,
-                 "cc": s.cc_id, "model": s.model or "default",
+                 "cc": s.cc_id, "model": s.model or "default", "title": s.title(),
                  "busy": s.busy, "ended": s.ended, "n": len(s.log)}
                 for s in CHAT_SESSIONS.values()]})
 
@@ -1309,29 +1439,99 @@ pre code{background:none;border:none;padding:0}
 .ecard.flash{outline:2px solid var(--acc);outline-offset:-2px}
 .ecard .ed{max-height:320px;overflow:auto;padding:6px 9px}
 .ecard .res{padding:0 9px}
+/* approval prompts */
+.approval{border:1px solid #8a7430;border-radius:8px;margin:6px 0 14px;background:#2a2519;overflow:hidden}
+.approval .ah{padding:8px 10px;color:var(--tool);font-weight:600;display:flex;gap:7px;align-items:center}
+.approval .ah .tp{color:var(--mut);font-family:ui-monospace,monospace;font-weight:400;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.approval .abody{max-height:240px;overflow:auto;padding:4px 10px;border-top:1px solid #4a3f28}
+.approval .abtns{display:flex;gap:8px;padding:8px 10px;border-top:1px solid #4a3f28}
+.approval .abtns button{flex:1;padding:9px;border-radius:6px;cursor:pointer;font-size:14px;font-weight:700}
+.approval .appr{background:#143524;color:#7ee787;border:1px solid #2ea043}
+.approval .deny{background:#3a1b1b;color:#ffa198;border:1px solid #f85149}
+.approval.done .abtns{opacity:.85}
+.approval .ok{color:#7ee787;font-weight:700}.approval .no{color:#ffa198;font-weight:700}
+#stop{background:#5a2020;color:#ffb3b3;border:1px solid #f85149;border-radius:10px;padding:9px 14px;font-size:16px;font-weight:700;cursor:pointer}
+
+/* sessions sidebar + shell layout */
+.iconbtn{background:none;border:none;color:var(--fg);font-size:17px;cursor:pointer;padding:2px 5px;line-height:1}
+.curname{font-size:13px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0;max-width:46vw}
+#shell{flex:1;display:flex;min-height:0;position:relative}
+#mainCol{flex:1;display:flex;flex-direction:column;min-width:0}
+#sidebar{width:250px;flex-shrink:0;background:var(--bg2);border-right:1px solid var(--line);display:flex;flex-direction:column;overflow-y:auto}
+#sidebar.collapsed{display:none}
+.sb-new{padding:8px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:6px}
+.sb-new select,.sb-new input{width:100%;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:5px;padding:5px 7px;font-size:12.5px}
+.sb-new #cwd{display:none}
+.sb-row2{display:flex;gap:6px}.sb-row2 select{flex:1;min-width:0}
+.newbtn{background:var(--acc);color:#04121f;font-weight:700;border:none;border-radius:6px;padding:7px;font-size:13px;cursor:pointer}
+.newbtn:hover{filter:brightness(1.08)}
+.sb-sec{border-bottom:1px solid var(--line);padding:4px 0 6px}
+.sb-h{font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:var(--mut);padding:6px 10px 4px;display:flex;align-items:center;gap:6px}
+.sb-h .cnt{background:var(--bg3);border-radius:8px;padding:0 6px;font-size:10px;color:var(--mut)}
+.sb-h .grow{flex:1}
+.sb-ref{cursor:pointer}.sb-ref:hover{color:var(--fg)}
+.sb-empty{color:var(--mut);font-size:12px;padding:5px 10px;line-height:1.4}
+.srow{padding:7px 9px;cursor:pointer;display:flex;gap:8px;align-items:center;border-left:2px solid transparent}
+.srow:hover{background:var(--bg3)}
+.srow.active{background:#10243e;border-left-color:var(--acc)}
+.srow.ended{opacity:.6}
+.srow .sdot{width:7px;height:7px;border-radius:50%;background:#666;flex-shrink:0}
+.srow .sdot.on{background:var(--add)}
+.srow .sdot.busy{background:var(--tool);box-shadow:0 0 5px var(--tool);animation:pulse 1s infinite}
+.srow .smeta{flex:1;min-width:0}
+.srow .sname{font-size:12.5px;color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.srow .ssub{font-size:11px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.srow .sx{color:var(--mut);flex-shrink:0;font-size:13px;padding:0 3px;opacity:0}
+.srow:hover .sx{opacity:.6}.srow .sx:hover{opacity:1;color:var(--del)}
+#sb-backdrop{display:none}
+@media(max-width:860px){
+  #sidebar{position:fixed;left:0;top:0;bottom:0;z-index:40;transform:translateX(-100%);transition:transform .2s;width:min(310px,86vw);box-shadow:2px 0 14px rgba(0,0,0,.5)}
+  #sidebar.open{transform:none}
+  #sidebar.collapsed{display:flex}
+  #sb-backdrop.show{display:block;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:35}
+}
 </style>
 </head>
 <body>
 <header>
+  <button class="iconbtn" id="navtoggle" title="sessions">☰</button>
   <span class="brand">⬡ Console</span>
-  <select id="sessions" title="switch to a running session"><option value="">— session —</option></select>
-  <select id="project" title="working directory for a new session"></select>
-  <input id="cwd" placeholder="~/Git/…">
-  <select id="model" title="model"><option value="default">model: default</option><option>opus</option><option>sonnet</option><option>haiku</option></select>
-  <select id="mode" title="permission mode"><option value="acceptEdits">acceptEdits</option><option value="plan">plan</option><option value="default">default</option><option value="bypassPermissions">bypass</option></select>
-  <button class="btn" id="newbtn">＋ New</button>
-  <button class="btn" id="endbtn" title="end this session">✕ End</button>
+  <span class="curname" id="curname">— no session —</span>
   <button class="btn" id="chgbtn">± Changes<span id="chBadge">0</span></button>
   <a class="navlink" href="/">Observer</a>
   <span class="status"><span class="dot" id="dot"></span><span id="statxt">idle</span></span>
 </header>
 
-<div id="chat"><div class="wrap" id="stream"></div></div>
-
-<div id="composer"><div class="wrap2">
-  <textarea id="ta" rows="1" placeholder="Message Claude Code…  (Enter to send · Shift+Enter newline)" disabled></textarea>
-  <button id="send" disabled>➤</button>
-</div></div>
+<div id="shell">
+  <aside id="sidebar">
+    <div class="sb-new">
+      <select id="project" title="working directory for a new session"></select>
+      <input id="cwd" placeholder="~/Git/…">
+      <div class="sb-row2">
+        <select id="model" title="model"><option value="default">model: default</option><option>opus</option><option>sonnet</option><option>haiku</option></select>
+        <select id="mode" title="permission mode"><option value="acceptEdits">⚡ Auto-accept</option><option value="default">🔐 Approve</option><option value="plan">📋 Plan</option><option value="bypassPermissions">⏩ Full auto</option></select>
+      </div>
+      <button class="newbtn" id="newbtn">＋ New session</button>
+    </div>
+    <div class="sb-sec">
+      <div class="sb-h">Live <span id="liveN" class="cnt">0</span></div>
+      <div id="liveList"><div class="sb-empty">none running</div></div>
+    </div>
+    <div class="sb-sec">
+      <div class="sb-h">Resume from disk <span class="grow"></span><span class="sb-ref" id="resumeRef" title="refresh">↻</span></div>
+      <div id="resumeList"><div class="sb-empty">—</div></div>
+    </div>
+  </aside>
+  <div id="sb-backdrop"></div>
+  <div id="mainCol">
+    <div id="chat"><div class="wrap" id="stream"></div></div>
+    <div id="composer"><div class="wrap2">
+      <textarea id="ta" rows="1" placeholder="Message Claude Code…  (Enter to send · Shift+Enter newline)" disabled></textarea>
+      <button id="stop" title="interrupt / stop" style="display:none">⏹</button>
+      <button id="send" disabled>➤</button>
+    </div></div>
+  </div>
+</div>
 
 <div id="drawer">
   <div class="dh"><span class="tab on" id="tabEdits">Edits <span id="editN">0</span></span><span class="tab" id="tabGit">Git diff</span><span class="grow"></span><span class="btn" id="grefresh">↻</span><span class="btn" id="dclose">✕</span></div>
@@ -1345,6 +1545,7 @@ const stream=$('#stream'), ta=$('#ta'), sendBtn=$('#send');
 let ws=null, running=false, ready=false, cwd='', tools={};
 let sid=null, editCount=0, pendingStart=false, reconnectT=0;
 let showThink=false;
+let liveCCs=new Set(), lastResume=[];
 const EDIT_TOOLS=new Set(['Edit','MultiEdit','Write','NotebookEdit']);
 const SKEY='al_session';
 
@@ -1407,9 +1608,14 @@ function addResult(ev){const c=tools[ev.toolId];if(!c)return;if(ev.isError)c.cla
     '</div><pre><code>'+esc(b.length>2200?b.slice(0,2200)+'\n…':b)+'</code></pre>';}
 
 function statset(t){$('#statxt').textContent=t;}
+function bindProject(p){if(!p)return;const sel=$('#project');let ok=false;
+  for(const o of sel.options){if(o.value===p){ok=true;break;}}
+  if(!ok){const o=document.createElement('option');o.value=p;o.textContent='● '+p.split('/').slice(-2).join('/');sel.insertBefore(o,sel.firstChild);}
+  sel.value=p;}
 function setBusy(b){running=b;$('#dot').className='dot '+(b?'busy':(ready?'on':''));
   if(b)statset('working…');else if(ready)statset('ready');
-  sendBtn.disabled=b||!ready;ta.disabled=!ready;}
+  sendBtn.disabled=b||!ready;ta.disabled=!ready;
+  $('#stop').style.display=b?'':'none';sendBtn.style.display=b?'none':'';}
 function clearUI(){stream.innerHTML='';$('#edits').innerHTML='<div class="empty">no file changes yet</div>';
   $('#gitc').innerHTML='<div class="empty">—</div>';tools={};editCount=0;updateEditBadge();ready=false;}
 
@@ -1429,12 +1635,26 @@ function addMarker(ev){const s=atBottom();const cn=counts(ev);const m=document.c
   m.onclick=()=>{openDrawer('edits');const c=ev.toolId&&tools[ev.toolId];if(c){c.classList.add('flash');c.scrollIntoView({block:'center'});setTimeout(()=>c.classList.remove('flash'),1200);}};
   stream.appendChild(m);if(s)scroll();}
 
+function addApproval(ev){const c=document.createElement('div');c.className='approval';c.dataset.aid=ev.aid;
+  c.innerHTML='<div class="ah">🔐 Approve <b>'+esc(ev.tool)+'</b> <span class="tp">'+esc(primaryArg(ev.input)||'')+'</span></div>'+
+    '<div class="abody">'+toolBody(ev)+'</div>'+
+    '<div class="abtns"><button class="appr">✓ Approve</button><button class="deny">✕ Deny</button></div>';
+  c.querySelector('.appr').onclick=()=>decide(ev.aid,true);
+  c.querySelector('.deny').onclick=()=>decide(ev.aid,false);
+  stream.appendChild(c);scroll();}
+function decide(aid,allow){wsSend({type:'approve',aid:aid,allow:allow});resolveApprovalCard(aid,allow);}
+function resolveApprovalCard(aid,allow){const c=stream.querySelector('.approval[data-aid="'+aid+'"]');
+  if(c&&!c.classList.contains('done')){c.classList.add('done');
+    const bt=c.querySelector('.abtns');if(bt)bt.innerHTML='<span class="'+(allow?'ok':'no')+'">'+(allow?'✓ Approved':'✕ Denied')+'</span>';}}
 function route(ev){
-  if(ev.kind==='ready'){ready=true;cwd=ev.cwd||cwd;addNotice('● session ready · '+(ev.model||'')+' · '+(ev.cwd||''));}
+  if(ev.kind==='user_text')addUser(ev.text);
+  else if(ev.kind==='ready'){ready=true;cwd=ev.cwd||cwd;addNotice('● session ready · '+(ev.model||'')+' · '+(ev.cwd||''));}
   else if(ev.kind==='assistant_text')addAsst(ev.text);
   else if(ev.kind==='thinking')addThink(ev.text);
   else if(ev.kind==='tool_use'){if(EDIT_TOOLS.has(ev.tool)){addEditCard(ev);addMarker(ev);}else addTool(ev);}
   else if(ev.kind==='tool_result')addResult(ev);
+  else if(ev.kind==='approval')addApproval(ev);
+  else if(ev.kind==='approval_resolved')resolveApprovalCard(ev.aid,ev.allow);
   else if(ev.kind==='turn_done'){setBusy(false);if(drawerOpen()&&gitTab())refreshGit();}
   else if(ev.kind==='notice')addNotice(ev.text);
 }
@@ -1443,20 +1663,23 @@ function route(ev){
 function markEnded(msg){ready=false;ta.disabled=true;sendBtn.disabled=true;$('#dot').className='dot';statset('ended');
   localStorage.removeItem(SKEY);if(msg)addNotice(msg);}
 function onMsg(e){const m=JSON.parse(e.data);
-  if(m.type==='started'){pendingStart=false;sid=m.id;localStorage.setItem(SKEY,sid);ready=true;setBusy(false);ta.focus();
-    statset('ready · '+(m.name||''));addNotice('new session « '+(m.name||'')+' » in '+m.cwd+' — type your first message to begin');reqList();}
-  else if(m.type==='attached'){clearUI();sid=m.id;localStorage.setItem(SKEY,sid);cwd=m.cwd;ready=!m.ended;
-    statset((m.ended?'ended · ':'')+(m.name||''));m.events.forEach(route);setBusy(!!m.busy);
-    if(m.ended){markEnded('— this session has ended (history shown) —');}
-    else{ta.disabled=false;sendBtn.disabled=!!m.busy;addNotice('— reattached to « '+(m.name||'')+' » ('+m.events.length+' events) —');}reqList();}
-  else if(m.type==='no_session'){localStorage.removeItem(SKEY);sid=null;ready=false;setBusy(false);statset('idle');
-    addNotice('that session is no longer running — pick a project + ＋ New, or choose a running session.');reqList();}
+  if(m.type==='started'){pendingStart=false;sid=m.id;cwd=m.cwd;bindProject(m.cwd);localStorage.setItem(SKEY,sid);
+    ready=true;setBusy(false);ta.focus();setCurname(m.name||'session');syncPickers(m.model,m.mode);statset('ready');
+    addNotice('new session « '+(m.name||'')+' » in '+m.cwd+' — type your first message to begin');reqList();loadResume();}
+  else if(m.type==='attached'){clearUI();pendingStart=false;sid=m.id;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
+    ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));syncPickers(m.model,m.mode);statset(m.ended?'ended':'ready');
+    m.events.forEach(route);setBusy(!!m.busy);
+    if(m.ended){markEnded('— this session has ended (history shown · you can resume it from disk) —');}
+    else{ta.disabled=false;sendBtn.disabled=!!m.busy;addNotice('— '+(m.resumed?'resumed':'reattached to')+' « '+(m.name||'')+' » ('+m.events.length+' events) —');}
+    reqList();loadResume();}
+  else if(m.type==='no_session'){localStorage.removeItem(SKEY);sid=null;ready=false;setBusy(false);setCurname('');statset('idle');
+    addNotice('that session is no longer running — pick it under “Resume from disk”, or ＋ New.');reqList();loadResume();}
   else if(m.type==='events')m.events.forEach(route);
   else if(m.type==='stderr')addErr(m.text);
-  else if(m.type==='error')addErr('⚠ '+m.error);
-  else if(m.type==='exit'){if(!pendingStart)markEnded('session process exited (code '+m.code+')');reqList();}
-  else if(m.type==='ended'){if(!pendingStart){sid=null;markEnded('session ended');}reqList();}
-  else if(m.type==='sessions')fillSessions(m.sessions);
+  else if(m.type==='error'){pendingStart=false;addErr('⚠ '+m.error);}
+  else if(m.type==='exit'){if(!pendingStart){markEnded('session process exited (code '+m.code+')');setCurname('');}reqList();loadResume();}
+  else if(m.type==='ended'){if(m.id&&m.id===sid){sid=null;setCurname('');markEnded('session ended');}reqList();loadResume();}
+  else if(m.type==='sessions')renderLive(m.sessions);
 }
 function openWs(cb){const proto=location.protocol==='https:'?'wss:':'ws:';
   ws=new WebSocket(proto+'//'+location.host+'/ws/chat');
@@ -1467,19 +1690,76 @@ function openWs(cb){const proto=location.protocol==='https:'?'wss:':'ws:';
   ws.onmessage=onMsg;}
 function wsSend(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));}
 function reqList(){wsSend({type:'list'});}
-function fillSessions(list){const sel=$('#sessions');sel.innerHTML='<option value="">— switch session —</option>';
-  list.forEach(s=>{const o=document.createElement('option');o.value=s.id;
-    o.textContent=(s.busy?'⏳ ':'')+(s.name||'?')+' ('+s.n+')'+(s.ended?' [ended]':'');sel.appendChild(o);});
-  sel.value=sid||'';}
-function switchSession(id){if(!id||id===sid)return;clearUI();statset('switching…');wsSend({type:'attach',id:id});}
+function reltime(ts){const s=(Date.now()/1000)-ts;if(s<60)return Math.round(s)+'s';
+  if(s<3600)return Math.round(s/60)+'m';if(s<86400)return Math.round(s/3600)+'h';return Math.round(s/86400)+'d';}
+function setCurname(t){$('#curname').textContent=t||'— no session —';}
+/* reflect the active session's real model/mode in the pickers (programmatic
+   .value set does NOT fire onchange, so this won't echo back to the server) */
+function syncPickers(model,mode){
+  if(model){const o=$('#model');for(const x of o.options){if(x.value===model){o.value=model;break;}}}
+  if(mode){const o=$('#mode');for(const x of o.options){if(x.value===mode){o.value=mode;break;}}}
+}
+
+/* sidebar: live sessions (in-RAM) + resume-from-disk (past transcripts) */
+function renderLive(list){const box=$('#liveList');
+  liveCCs=new Set(list.map(s=>s.cc).filter(Boolean));
+  $('#liveN').textContent=list.length;
+  if(!list.length){box.innerHTML='<div class="sb-empty">none running — pick a project, ＋ New</div>';}
+  else{box.innerHTML='';list.forEach(s=>{
+    const r=document.createElement('div');
+    r.className='srow'+(s.id===sid?' active':'')+(s.ended?' ended':'');
+    const proj=(s.cwd||'').split('/').slice(-2).join('/');
+    const dot=s.busy?'busy':(s.ended?'':'on');
+    r.innerHTML='<span class="sdot '+dot+'"></span><div class="smeta">'+
+      '<div class="sname">'+esc(s.title||s.name||'new session')+(s.ended?' · ended':'')+'</div>'+
+      '<div class="ssub">'+esc(proj)+' · '+s.n+(s.busy?' · working…':'')+'</div></div>'+
+      '<span class="sx" title="end session">✕</span>';
+    r.querySelector('.smeta').onclick=()=>switchSession(s.id);
+    r.querySelector('.sdot').onclick=()=>switchSession(s.id);
+    r.querySelector('.sx').onclick=ev=>{ev.stopPropagation();endSessionById(s.id,s.name);};
+    box.appendChild(r);});}
+  renderResume(lastResume);
+}
+function renderResume(list){const box=$('#resumeList');
+  const items=(list||[]).filter(x=>!liveCCs.has(x.cc)).slice(0,15);
+  if(!items.length){box.innerHTML='<div class="sb-empty">no past sessions</div>';return;}
+  box.innerHTML='';items.forEach(s=>{
+    const r=document.createElement('div');r.className='srow';
+    const proj=(s.cwd||'').split('/').slice(-2).join('/');
+    r.innerHTML='<span class="sdot"></span><div class="smeta">'+
+      '<div class="sname">'+esc(s.title||proj)+'</div>'+
+      '<div class="ssub">↺ '+esc(proj)+' · '+reltime(s.mtime)+'</div></div>';
+    r.onclick=()=>resumeSession(s);box.appendChild(r);});
+}
+function loadResume(){fetch('api/resumable').then(r=>r.json()).then(j=>{lastResume=j.resumable||[];renderResume(lastResume);}).catch(()=>{});}
+
+function switchSession(id){if(!id||id===sid)return;clearUI();statset('switching…');wsSend({type:'attach',id:id});
+  if(window.innerWidth<=860)closeSidebar();}
+function resumeSession(s){if(!s||!s.cc)return;clearUI();pendingStart=true;sid=null;statset('resuming…');
+  const go=()=>wsSend({type:'resume',cc:s.cc,cwd:s.cwd,model:$('#model').value,mode:$('#mode').value});
+  if(ws&&ws.readyState===1)go();else openWs(go);
+  if(window.innerWidth<=860)closeSidebar();}
 function newSession(){const proj=$('#project').value;const dir=proj==='__custom__'?$('#cwd').value.trim():proj;
   if(!dir){addErr('pick a project directory first');return;}
-  clearUI();pendingStart=true;if(sid)wsSend({type:'end'});sid=null;localStorage.removeItem(SKEY);
+  /* keep any current session alive in the background — just spin up another */
+  clearUI();pendingStart=true;sid=null;
   const start=()=>wsSend({type:'start',cwd:dir,model:$('#model').value,mode:$('#mode').value});
-  if(ws&&ws.readyState===1)start();else openWs(start);statset('starting…');}
-function endSession(){if(sid)wsSend({type:'end'});sid=null;markEnded('session ended');reqList();}
+  if(ws&&ws.readyState===1)start();else openWs(start);statset('starting…');
+  if(window.innerWidth<=860)closeSidebar();}
+function endSessionById(id,name){if(!id)return;
+  if(!confirm('End session '+(name?'« '+name+' »':'')+'?\nIts claude process stops; you can still resume it from disk later.'))return;
+  wsSend({type:'end',id:id});
+  if(id===sid){sid=null;setCurname('');markEnded('session ended');}
+  reqList();loadResume();}
 function sendMsg(){const t=ta.value.trim();if(!t||!ready||running||!sid||!ws||ws.readyState!==1)return;
-  addUser(t);wsSend({type:'user',text:t});ta.value='';ta.style.height='auto';setBusy(true);}
+  wsSend({type:'user',text:t});ta.value='';ta.style.height='auto';setBusy(true);}
+
+/* sidebar open/close (mobile drawer; desktop collapse) */
+function openSidebar(){$('#sidebar').classList.add('open');$('#sb-backdrop').classList.add('show');}
+function closeSidebar(){$('#sidebar').classList.remove('open');$('#sb-backdrop').classList.remove('show');}
+function toggleSidebar(){const sb=$('#sidebar');
+  if(window.innerWidth<=860){sb.classList.contains('open')?closeSidebar():openSidebar();}
+  else sb.classList.toggle('collapsed');}
 
 /* changes drawer (Edits | Git) */
 function drawerOpen(){return $('#drawer').classList.contains('open');}
@@ -1498,9 +1778,14 @@ async function refreshGit(){if(!cwd){$('#gitc').innerHTML='<div class="empty">no
 ta.addEventListener('input',()=>{ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,160)+'px';});
 ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMsg();}});
 sendBtn.onclick=sendMsg;
+$('#stop').onclick=()=>{wsSend({type:'interrupt'});addNotice('⏹ interrupt sent');};
 $('#newbtn').onclick=newSession;
-$('#endbtn').onclick=endSession;
-$('#sessions').onchange=()=>switchSession($('#sessions').value);
+$('#navtoggle').onclick=toggleSidebar;
+$('#sb-backdrop').onclick=closeSidebar;
+$('#resumeRef').onclick=loadResume;
+/* model/mode: apply live to the active session; otherwise just seed the next New */
+$('#model').onchange=()=>{if(sid&&ws&&ws.readyState===1)wsSend({type:'set_model',model:$('#model').value});};
+$('#mode').onchange=()=>{if(sid&&ws&&ws.readyState===1)wsSend({type:'set_mode',mode:$('#mode').value});};
 $('#tabEdits').onclick=()=>showTab('edits');
 $('#tabGit').onclick=()=>showTab('git');
 $('#chgbtn').onclick=()=>{if(drawerOpen())$('#drawer').classList.remove('open');else openDrawer('edits');};
@@ -1517,6 +1802,8 @@ $('#project').onchange=()=>{const c=$('#project').value==='__custom__';
 }catch(e){}})();
 
 setInterval(()=>reqList(),8000);
+setInterval(loadResume,30000);
+loadResume();
 openWs();
 </script>
 </body>
