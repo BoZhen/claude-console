@@ -1,0 +1,1562 @@
+#!/usr/bin/env python3
+"""Agent Lens — a read-only GUI that separates an AI coding agent's *discussion*
+from its *code/file changes*.
+
+It observes Claude Code / Codex session transcripts (the JSONL each writes) plus
+the live `git diff` of the session's working directory, and renders them in three
+panes: Discussion · Activity · Git diff. It never drives the agent and never
+writes to your repos — purely an observer. Run it alongside your normal terminal
+workflow.
+
+Env:
+  AGENTLENS_PORT   listen port (default 7703)
+  AGENTLENS_BIND   bind address (default 127.0.0.1; set 0.0.0.0 to reach from LAN)
+  AGENTLENS_AUTH   optional HTTP Basic Auth "user:pass" (default disabled)
+"""
+
+import base64
+import glob
+import json
+import os
+import secrets
+import shutil
+import signal
+import subprocess
+import urllib.parse
+
+import tornado.ioloop
+import tornado.iostream
+import tornado.process
+import tornado.web
+import tornado.websocket
+
+PORT = int(os.environ.get("AGENTLENS_PORT", "7703"))
+AUTH = os.environ.get("AGENTLENS_AUTH", "")
+# Default to loopback: this serves ALL your agent transcripts + home-wide git
+# diffs, so it must not land on the network by accident. Set AGENTLENS_BIND=0.0.0.0
+# (ideally together with AGENTLENS_AUTH) to reach it from another device.
+BIND = os.environ.get("AGENTLENS_BIND", "127.0.0.1")
+HOME = os.path.expanduser("~")
+CLAUDE_ROOT = os.path.join(HOME, ".claude", "projects")
+CODEX_ROOT = os.path.join(HOME, ".codex", "sessions")
+# Interactive console drives the real `claude` CLI in headless stream-json mode.
+CLAUDE_BIN = (os.environ.get("AGENTLENS_CLAUDE") or shutil.which("claude")
+              or os.path.expanduser("~/.local/bin/claude"))
+
+CAP = 12000          # cap per long string field sent to the browser
+RESULT_CAP = 6000    # cap per tool_result body
+POLL_MS = 800        # transcript tail interval
+
+
+# ───────────────────────── normalization ─────────────────────────
+# Both adapters emit the same event shape so the frontend is source-agnostic:
+#   {kind, ts, id, ...}
+#   kind="user_text"|"assistant_text"   -> Discussion   (+ role, text)
+#   kind="thinking"                     -> Discussion (muted, collapsible) (+ text)
+#   kind="tool_use"                     -> Activity     (+ tool, input, toolId)
+#   kind="tool_result"                  -> Activity (attached by toolId) (+ content, isError)
+
+def _txt(x):
+    """Flatten arbitrary content (str | list of blocks | dict) to text."""
+    if x is None:
+        return ""
+    if isinstance(x, str):
+        return x
+    if isinstance(x, list):
+        out = []
+        for b in x:
+            if isinstance(b, dict):
+                if "text" in b:
+                    out.append(str(b.get("text", "")))
+                else:
+                    out.append(json.dumps(b, ensure_ascii=False))
+            else:
+                out.append(str(b))
+        return "\n".join(out)
+    if isinstance(x, dict):
+        if "text" in x:
+            return str(x.get("text", ""))
+        return json.dumps(x, ensure_ascii=False)
+    return str(x)
+
+
+def _cap(s, n=CAP):
+    s = s or ""
+    if len(s) > n:
+        return s[:n] + "\n…[truncated %d chars]" % (len(s) - n)
+    return s
+
+
+def _cap_input(inp):
+    if isinstance(inp, dict):
+        return {k: (_cap(v) if isinstance(v, str) else v) for k, v in inp.items()}
+    if isinstance(inp, str):
+        return _cap(inp)
+    return inp
+
+
+def parse_claude(rec, idx):
+    t = rec.get("type")
+    base = {"ts": rec.get("timestamp"), "id": rec.get("uuid") or ("L%d" % idx)}
+    msg = rec.get("message") or {}
+    evs = []
+    if t == "assistant":
+        content = msg.get("content")
+        if isinstance(content, str):
+            if content.strip():
+                evs.append({**base, "kind": "assistant_text", "role": "assistant", "text": _cap(content)})
+        elif isinstance(content, list):
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                bt = b.get("type")
+                if bt == "text" and b.get("text", "").strip():
+                    evs.append({**base, "kind": "assistant_text", "role": "assistant", "text": _cap(b["text"])})
+                elif bt == "thinking":
+                    th = b.get("thinking", "")
+                    if th.strip():
+                        evs.append({**base, "kind": "thinking", "text": _cap(th)})
+                elif bt == "tool_use":
+                    evs.append({**base, "kind": "tool_use", "tool": b.get("name", ""),
+                                "input": _cap_input(b.get("input")), "toolId": b.get("id", "")})
+    elif t == "user":
+        content = msg.get("content")
+        if isinstance(content, str):
+            if content.strip():
+                evs.append({**base, "kind": "user_text", "role": "user", "text": _cap(content)})
+        elif isinstance(content, list):
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                bt = b.get("type")
+                if bt == "text" and b.get("text", "").strip():
+                    evs.append({**base, "kind": "user_text", "role": "user", "text": _cap(b["text"])})
+                elif bt == "tool_result":
+                    evs.append({**base, "kind": "tool_result", "toolId": b.get("tool_use_id", ""),
+                                "content": _cap(_txt(b.get("content")), RESULT_CAP),
+                                "isError": bool(b.get("is_error"))})
+    return evs
+
+
+def parse_codex(rec, idx):
+    base = {"ts": rec.get("timestamp"), "id": "L%d" % idx}
+    if rec.get("type") != "response_item":
+        return []
+    p = rec.get("payload") or {}
+    pt = p.get("type")
+    evs = []
+    if pt == "message":
+        role = p.get("role", "assistant")
+        text = _txt(p.get("content"))
+        if text.strip():
+            kind = "user_text" if role == "user" else "assistant_text"
+            evs.append({**base, "kind": kind, "role": role, "text": _cap(text)})
+    elif pt == "reasoning":
+        text = _txt(p.get("summary") or p.get("content"))
+        if text.strip():
+            evs.append({**base, "kind": "thinking", "text": _cap(text)})
+    elif pt == "function_call":
+        args = p.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                pass
+        evs.append({**base, "kind": "tool_use", "tool": p.get("name", ""),
+                    "input": _cap_input(args), "toolId": p.get("call_id", "")})
+    elif pt == "function_call_output":
+        out = p.get("output")
+        if isinstance(out, str):
+            try:
+                j = json.loads(out)
+                if isinstance(j, dict) and "output" in j:
+                    out = j["output"]
+            except Exception:
+                pass
+        evs.append({**base, "kind": "tool_result", "toolId": p.get("call_id", ""),
+                    "content": _cap(_txt(out), RESULT_CAP), "isError": False})
+    return evs
+
+
+def parse_line(line, idx, source):
+    try:
+        rec = json.loads(line)
+    except Exception:
+        return []
+    try:
+        return parse_claude(rec, idx) if source == "claude" else parse_codex(rec, idx)
+    except Exception:
+        return []
+
+
+def normalize_cc(rec):
+    """Normalize one `claude --output-format stream-json` event for the console UI."""
+    t = rec.get("type")
+    evs = []
+    if t == "system":
+        if rec.get("subtype") == "init":
+            evs.append({"kind": "ready", "session_id": rec.get("session_id"),
+                        "model": rec.get("model"), "cwd": rec.get("cwd"),
+                        "tools": rec.get("tools"), "permissionMode": rec.get("permissionMode")})
+    elif t == "assistant":
+        for b in (rec.get("message") or {}).get("content") or []:
+            if not isinstance(b, dict):
+                continue
+            bt = b.get("type")
+            if bt == "text" and b.get("text", "").strip():
+                evs.append({"kind": "assistant_text", "text": _cap(b["text"])})
+            elif bt == "thinking" and b.get("thinking", "").strip():
+                evs.append({"kind": "thinking", "text": _cap(b["thinking"])})
+            elif bt == "tool_use":
+                evs.append({"kind": "tool_use", "tool": b.get("name", ""),
+                            "input": _cap_input(b.get("input")), "toolId": b.get("id", "")})
+    elif t == "user":
+        for b in (rec.get("message") or {}).get("content") or []:
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                evs.append({"kind": "tool_result", "toolId": b.get("tool_use_id", ""),
+                            "content": _cap(_txt(b.get("content")), RESULT_CAP),
+                            "isError": bool(b.get("is_error"))})
+    elif t == "result":
+        evs.append({"kind": "turn_done", "subtype": rec.get("subtype"),
+                    "isError": bool(rec.get("is_error")), "numTurns": rec.get("num_turns"),
+                    "cost": rec.get("total_cost_usd")})
+    elif t == "rate_limit_event":
+        evs.append({"kind": "notice", "text": "rate limit update"})
+    return evs
+
+
+# ───────────────────────── session discovery ─────────────────────────
+def _peek_claude(path):
+    cwd, branch, title = "", "", ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i > 150:
+                    break
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if not cwd:
+                    cwd = rec.get("cwd", "") or cwd
+                    branch = rec.get("gitBranch", "") or branch
+                if not title and rec.get("type") == "user":
+                    msg = (rec.get("message") or {}).get("content")
+                    s = msg if isinstance(msg, str) else _txt(msg)
+                    s = (s or "").strip()
+                    if s and not s.startswith("<") and "tool_result" not in s[:40]:
+                        title = s.replace("\n", " ")[:100]
+                if cwd and title:
+                    break
+    except Exception:
+        pass
+    return cwd, branch, title
+
+
+def _peek_codex(path):
+    cwd, branch, title = "", "", ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i > 150:
+                    break
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                p = rec.get("payload") or {}
+                if rec.get("type") == "session_meta":
+                    cwd = p.get("cwd", "") or cwd
+                    g = p.get("git") or {}
+                    branch = g.get("branch", "") or branch
+                if not title and rec.get("type") == "response_item" and p.get("type") == "message" \
+                        and p.get("role") == "user":
+                    s = _txt(p.get("content")).strip()
+                    if s and not s.startswith("<"):
+                        title = s.replace("\n", " ")[:100]
+                if cwd and title:
+                    break
+    except Exception:
+        pass
+    return cwd, branch, title
+
+
+def list_sessions(limit=50):
+    items = []
+    claude_files = glob.glob(os.path.join(CLAUDE_ROOT, "*", "*.jsonl"))
+    codex_files = glob.glob(os.path.join(CODEX_ROOT, "**", "*.jsonl"), recursive=True)
+    paths = ([(p, "claude") for p in claude_files] +
+             [(p, "codex") for p in codex_files])
+    try:
+        paths.sort(key=lambda pc: os.path.getmtime(pc[0]), reverse=True)
+    except Exception:
+        pass
+    for path, source in paths[:limit]:
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        cwd, branch, title = (_peek_claude if source == "claude" else _peek_codex)(path)
+        items.append({
+            "id": path, "source": source, "cwd": cwd, "branch": branch,
+            "title": title or os.path.basename(path),
+            "mtime": st.st_mtime, "size": st.st_size,
+        })
+    return items
+
+
+def list_projects():
+    """Real project dirs for the console picker: recent session cwds (filtered)
+    plus git repos under ~/Git. Excludes /tmp and runtime/cache dirs."""
+    junk = [os.path.realpath(p) for p in (
+        "/tmp", os.path.join(HOME, ".cache"), os.path.join(HOME, ".claude-mem"),
+        os.path.join(HOME, ".claude"), os.path.join(HOME, ".codex"),
+        os.path.join(HOME, ".config"))]
+
+    def is_junk(p):
+        rp = os.path.realpath(p)
+        return any(rp == j or rp.startswith(j + os.sep) for j in junk)
+
+    out, seen = [], set()
+    for s in list_sessions(60):
+        cwd = s.get("cwd")
+        if cwd and cwd not in seen and os.path.isdir(cwd) and not is_junk(cwd):
+            seen.add(cwd)
+            out.append({"path": cwd, "recent": True,
+                        "git": os.path.isdir(os.path.join(cwd, ".git"))})
+    for d in sorted(glob.glob(os.path.join(HOME, "Git", "*"))):
+        if d not in seen and os.path.isdir(os.path.join(d, ".git")):
+            seen.add(d)
+            out.append({"path": d, "recent": False, "git": True})
+    return out
+
+
+def _valid_cc(cc):
+    return bool(cc) and 6 <= len(cc) <= 64 and all(c.isalnum() or c in "-_" for c in cc)
+
+
+_JUNK_ROOTS = None
+def _is_junk(p):
+    global _JUNK_ROOTS
+    if _JUNK_ROOTS is None:
+        _JUNK_ROOTS = [os.path.realpath(x) for x in (
+            "/tmp", os.path.join(HOME, ".cache"), os.path.join(HOME, ".claude-mem"),
+            os.path.join(HOME, ".claude"), os.path.join(HOME, ".codex"),
+            os.path.join(HOME, ".config"))]
+    rp = os.path.realpath(p)
+    return any(rp == j or rp.startswith(j + os.sep) for j in _JUNK_ROOTS)
+
+
+def find_transcript(cc):
+    """Locate claude's on-disk transcript for a session id (filename == session id)."""
+    if not _valid_cc(cc):
+        return None
+    hits = glob.glob(os.path.join(CLAUDE_ROOT, "*", cc + ".jsonl"))
+    return hits[0] if hits else None
+
+
+def load_transcript_events(cc, cap=2000):
+    """Parse a saved transcript into console events, for preload on --resume."""
+    path = find_transcript(cc)
+    if not path:
+        return []
+    evs = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                line = line.strip()
+                if line:
+                    evs.extend(parse_line(line, i, "claude"))
+    except Exception:
+        pass
+    return evs[-cap:] if len(evs) > cap else evs
+
+
+def list_resumable(limit=20):
+    """Recent claude sessions (real-project cwds) that can be continued via --resume."""
+    out = []
+    for s in list_sessions(60):
+        if s.get("source") != "claude":
+            continue
+        cwd = s.get("cwd")
+        if not cwd or not os.path.isdir(cwd) or _is_junk(cwd):
+            continue
+        cc = os.path.splitext(os.path.basename(s["id"]))[0]
+        out.append({"cc": cc, "cwd": cwd, "name": os.path.basename(cwd) or cwd,
+                    "title": s.get("title", ""), "mtime": s.get("mtime", 0)})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _source_of(path):
+    rp = os.path.realpath(path)
+    if rp.startswith(os.path.realpath(CLAUDE_ROOT) + os.sep):
+        return "claude"
+    if rp.startswith(os.path.realpath(CODEX_ROOT) + os.sep):
+        return "codex"
+    return None
+
+
+# ───────────────────────── git diff (ground truth) ─────────────────────────
+def _git(cwd, args, timeout=6):
+    try:
+        r = subprocess.run(["git", "-C", cwd, *args], capture_output=True,
+                           text=True, timeout=timeout)
+        return r.stdout
+    except Exception:
+        return ""
+
+
+def git_snapshot(cwd):
+    rp = os.path.realpath(cwd)
+    if not (rp == os.path.realpath(HOME) or rp.startswith(os.path.realpath(HOME) + os.sep)):
+        return {"ok": False, "error": "path outside home"}
+    if not os.path.isdir(rp):
+        return {"ok": False, "error": "not a directory"}
+    inside = _git(rp, ["rev-parse", "--is-inside-work-tree"]).strip()
+    if inside != "true":
+        return {"ok": False, "error": "not a git repo", "cwd": rp}
+    branch = _git(rp, ["rev-parse", "--abbrev-ref", "HEAD"]).strip()
+    porcelain = _git(rp, ["status", "--porcelain"])
+    files = []
+    untracked = []
+    for line in porcelain.splitlines():
+        if len(line) < 4:
+            continue
+        code, name = line[:2], line[3:]
+        files.append({"status": code.strip() or "?", "path": name})
+        if code == "??":
+            untracked.append(name)
+    diff = _git(rp, ["-c", "core.pager=cat", "diff"])
+    staged = _git(rp, ["-c", "core.pager=cat", "diff", "--cached"])
+    chunks = []
+    if staged.strip():
+        chunks.append("# ── staged ──\n" + staged)
+    if diff.strip():
+        chunks.append(diff)
+    # synthesize a +diff for untracked (small text) files so new files are visible
+    for name in untracked[:40]:
+        fp = os.path.join(rp, name)
+        try:
+            if os.path.isfile(fp) and os.path.getsize(fp) < 80000:
+                with open(fp, "r", encoding="utf-8", errors="replace") as fh:
+                    body = fh.read()
+                if "\x00" in body:
+                    continue
+                lines = body.splitlines()
+                head = ["diff --git a/%s b/%s" % (name, name), "new file (untracked)",
+                        "--- /dev/null", "+++ b/%s" % name]
+                chunks.append("\n".join(head + ["+" + ln for ln in lines]))
+        except Exception:
+            continue
+    full = "\n".join(chunks)
+    if len(full) > 260000:
+        full = full[:260000] + "\n…[diff truncated]"
+    return {"ok": True, "cwd": rp, "branch": branch, "files": files, "diff": full}
+
+
+# ───────────────────────── auth ─────────────────────────
+class AuthMixin:
+    def _ok_auth(self):
+        if not AUTH:
+            return True
+        header = self.request.headers.get("Authorization", "")
+        if header.startswith("Basic "):
+            try:
+                if secrets.compare_digest(base64.b64decode(header[6:]).decode(), AUTH):
+                    return True
+            except Exception:
+                pass
+        self.set_status(401)
+        self.set_header("WWW-Authenticate", 'Basic realm="agent-lens"')
+        self.finish()
+        return False
+
+
+# ───────────────────────── handlers ─────────────────────────
+class IndexHandler(AuthMixin, tornado.web.RequestHandler):
+    def get(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Cache-Control", "no-store")
+        self.write(HTML)
+
+
+class SessionsHandler(AuthMixin, tornado.web.RequestHandler):
+    def get(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "application/json")
+        self.write(json.dumps({"sessions": list_sessions()}))
+
+
+class ProjectsHandler(AuthMixin, tornado.web.RequestHandler):
+    def get(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "application/json")
+        self.write(json.dumps({"projects": list_projects()}))
+
+
+class ResumableHandler(AuthMixin, tornado.web.RequestHandler):
+    def get(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "application/json")
+        self.write(json.dumps({"resumable": list_resumable()}))
+
+
+class DiffHandler(AuthMixin, tornado.web.RequestHandler):
+    def get(self):
+        if not self._ok_auth():
+            return
+        cwd = self.get_argument("cwd", "")
+        self.set_header("Content-Type", "application/json")
+        if not cwd:
+            self.write(json.dumps({"ok": False, "error": "no cwd"}))
+            return
+        self.write(json.dumps(git_snapshot(cwd)))
+
+
+class EventsSocket(AuthMixin, tornado.websocket.WebSocketHandler):
+    def check_origin(self, origin):
+        return True
+
+    def open(self):
+        if AUTH and not self._ok_auth():
+            self.close(4401, "Unauthorized")
+            return
+        raw = self.get_argument("file", "")
+        path = os.path.realpath(urllib.parse.unquote(raw))
+        self.source = _source_of(path)
+        if not self.source or not os.path.isfile(path):
+            self.close(4404, "Unknown or invalid session file")
+            return
+        self.path = path
+        self._offset = 0
+        self._buf = b""
+        self._idx = 0
+        self._cb = None
+        events, cwd, branch = self._read_new(initial=True)
+        self.write_message(json.dumps({
+            "type": "init", "source": self.source, "cwd": cwd,
+            "branch": branch, "events": events,
+        }))
+        self._cb = tornado.ioloop.PeriodicCallback(self._poll, POLL_MS)
+        self._cb.start()
+
+    def _read_new(self, initial=False):
+        cwd, branch = "", ""
+        events = []
+        try:
+            size = os.path.getsize(self.path)
+            if size < self._offset:  # rotated/truncated
+                self._offset, self._buf = 0, b""
+            with open(self.path, "rb") as f:
+                f.seek(self._offset)
+                data = f.read()
+                self._offset += len(data)
+            self._buf += data
+            *lines, self._buf = self._buf.split(b"\n")
+            for raw in lines:
+                if not raw.strip():
+                    self._idx += 1
+                    continue
+                line = raw.decode("utf-8", errors="replace")
+                if initial and (not cwd):
+                    try:
+                        rec = json.loads(line)
+                        cwd = rec.get("cwd", "") or (rec.get("payload") or {}).get("cwd", "") or cwd
+                        branch = rec.get("gitBranch", "") or branch
+                    except Exception:
+                        pass
+                events.extend(parse_line(line, self._idx, self.source))
+                self._idx += 1
+        except Exception:
+            pass
+        if initial and not cwd:
+            cwd, branch, _ = (_peek_claude if self.source == "claude" else _peek_codex)(self.path)
+        return (events, cwd, branch) if initial else events
+
+    def _poll(self):
+        try:
+            events = self._read_new()
+            if events:
+                self.write_message(json.dumps({"type": "append", "events": events}))
+        except tornado.websocket.WebSocketClosedError:
+            self.on_close()
+        except Exception:
+            pass
+
+    def on_message(self, message):
+        pass
+
+    def on_close(self):
+        if getattr(self, "_cb", None):
+            try:
+                self._cb.stop()
+            except Exception:
+                pass
+            self._cb = None
+
+
+HTML = r"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Agent Lens</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#1e1e1e;--bg2:#252526;--bg3:#2d2d2d;--line:#3c3c3c;--fg:#d4d4d4;--mut:#858585;
+  --acc:#4fc1ff;--usr:#3794ff;--asn:#cdcdcd;--think:#7a7a7a;--add:#2ea043;--del:#f85149;--tool:#e0c080}
+html,body{height:100%;background:var(--bg);color:var(--fg);overflow:hidden;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;font-size:14px}
+body{display:flex;flex-direction:column}
+header{display:flex;gap:8px;align-items:center;padding:6px 10px;background:var(--bg2);
+  border-bottom:1px solid var(--line);flex-shrink:0;flex-wrap:wrap}
+header .brand{font-weight:600;color:var(--acc);white-space:nowrap}
+header select{flex:1;min-width:140px;background:var(--bg3);color:var(--fg);border:1px solid var(--line);
+  border-radius:5px;padding:5px 8px;font-size:13px;max-width:560px}
+.badge{font-size:11px;padding:2px 7px;border-radius:10px;background:var(--bg3);color:var(--mut);
+  border:1px solid var(--line);white-space:nowrap}
+.badge.claude{color:#d98c5f;border-color:#5a3c2a}
+.badge.codex{color:#8fd0a0;border-color:#2a5a3c}
+.dot{width:8px;height:8px;border-radius:50%;background:#555;flex-shrink:0}
+.dot.live{background:var(--add);box-shadow:0 0 6px var(--add)}
+.toggle{font-size:12px;color:var(--mut);cursor:pointer;user-select:none;white-space:nowrap}
+.toggle input{vertical-align:middle;margin-right:3px}
+
+main{flex:1;display:flex;min-height:0}
+.pane{flex:1;min-width:0;display:flex;flex-direction:column;border-right:1px solid var(--line)}
+.pane:last-child{border-right:none}
+.pane>.ph{padding:5px 10px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);
+  background:var(--bg2);border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center;flex-shrink:0}
+.ph .tab{cursor:pointer;padding:2px 6px;border-radius:4px}
+.ph .tab.on{background:var(--bg3);color:var(--fg)}
+.ph .grow{flex:1}
+.scroll{flex:1;overflow-y:auto;overflow-x:hidden;padding:10px;-webkit-overflow-scrolling:touch}
+
+/* discussion */
+.msg{margin-bottom:12px;line-height:1.5;word-wrap:break-word;overflow-wrap:anywhere}
+.msg .who{font-size:11px;color:var(--mut);margin-bottom:3px}
+.msg.user .bubble{background:#10243e;border:1px solid #1f4a7a;border-radius:8px;padding:8px 10px}
+.msg.user .who{color:var(--usr)}
+.msg.assistant .bubble{color:var(--asn)}
+.msg .bubble{white-space:normal}
+.think{color:var(--think);font-style:italic;font-size:13px;border-left:2px solid #3a3a3a;
+  padding:2px 0 2px 9px;margin-bottom:10px;white-space:pre-wrap}
+.think.hide{display:none}
+.toolchip{font-size:12px;color:var(--tool);background:#2a2519;border:1px solid #4a3f28;border-radius:5px;
+  padding:2px 7px;margin-bottom:10px;display:inline-block;cursor:pointer;font-family:ui-monospace,monospace}
+.toolchip.hide{display:none}
+.toolchip:hover{filter:brightness(1.25)}
+
+/* code / markdown */
+pre{background:#161616;border:1px solid var(--line);border-radius:6px;padding:8px;overflow-x:auto;
+  margin:6px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;line-height:1.45}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;
+  background:#161616;border:1px solid var(--line);border-radius:3px;padding:0 4px}
+pre code{background:none;border:none;padding:0}
+.bubble h1,.bubble h2,.bubble h3{font-size:14px;margin:8px 0 4px}
+.bubble ul,.bubble ol{margin:4px 0 4px 20px}
+.bubble a{color:var(--acc)}
+
+/* activity */
+.act{border:1px solid var(--line);border-radius:7px;margin-bottom:8px;background:var(--bg2);overflow:hidden}
+.act .head{padding:7px 9px;cursor:pointer;display:flex;gap:8px;align-items:center;user-select:none}
+.act .head:hover{background:var(--bg3)}
+.act .ico{flex-shrink:0}
+.act .tn{color:var(--tool);font-weight:600;font-family:ui-monospace,monospace;font-size:12.5px}
+.act .arg{color:var(--mut);font-family:ui-monospace,monospace;font-size:12px;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;flex:1}
+.act .body{display:none;border-top:1px solid var(--line);padding:8px 9px}
+.act.open .body{display:block}
+.act.err .tn{color:var(--del)}
+.act.flash{outline:2px solid var(--acc);outline-offset:-2px}
+.diffline{font-family:ui-monospace,monospace;font-size:12px;white-space:pre-wrap;line-height:1.4}
+.dl-add{color:#7ee787}.dl-del{color:#ffa198}.dl-hdr{color:var(--acc)}.dl-ctx{color:var(--mut)}
+.reslabel{font-size:11px;color:var(--mut);margin:6px 0 2px}
+
+/* git */
+.gfiles{padding:4px 0;border-bottom:1px solid var(--line);margin-bottom:6px}
+.gfile{font-family:ui-monospace,monospace;font-size:12px;padding:1px 0;color:var(--fg)}
+.gfile .st{display:inline-block;width:22px;color:var(--tool);font-weight:700}
+.empty{color:var(--mut);padding:20px;text-align:center;font-size:13px}
+
+#mtabs{display:none;gap:4px;padding:6px;background:var(--bg2);border-bottom:1px solid var(--line)}
+#mtabs .mt{flex:1;text-align:center;padding:7px;border-radius:6px;background:var(--bg3);color:var(--mut);
+  cursor:pointer;font-size:13px}
+#mtabs .mt.on{background:var(--acc);color:#04121f;font-weight:600}
+
+@media(max-width:760px){
+  main{flex-direction:column}
+  #mtabs{display:flex}
+  .pane{border-right:none;border-bottom:1px solid var(--line);display:none}
+  .pane.show{display:flex;flex:1}
+}
+</style>
+</head>
+<body>
+<header>
+  <span class="brand">⬡ Agent Lens</span>
+  <select id="sessions"></select>
+  <span class="badge" id="srcBadge">—</span>
+  <span class="badge" id="branchBadge" style="display:none"></span>
+  <label class="toggle"><input type="checkbox" id="tgThink">thinking</label>
+  <label class="toggle"><input type="checkbox" id="tgChips" checked>markers</label>
+  <a class="badge" href="/console" style="text-decoration:none" title="interactive console">⌨ Console</a>
+  <span class="dot" id="live" title="live tail"></span>
+</header>
+
+<div id="mtabs">
+  <div class="mt on" data-p="0">💬 Discussion</div>
+  <div class="mt" data-p="1">🔧 Activity</div>
+  <div class="mt" data-p="2">±  Git</div>
+</div>
+
+<main>
+  <section class="pane show" data-pane="0">
+    <div class="ph">💬 Discussion <span class="grow"></span><span id="dCount" class="badge">0</span></div>
+    <div class="scroll" id="discussion"></div>
+  </section>
+  <section class="pane" data-pane="1">
+    <div class="ph">🔧 Activity <span class="grow"></span><span id="aCount" class="badge">0</span></div>
+    <div class="scroll" id="activity"></div>
+  </section>
+  <section class="pane" data-pane="2">
+    <div class="ph">± Git diff
+      <span class="grow"></span>
+      <label class="toggle"><input type="checkbox" id="tgAuto" checked>auto</label>
+      <span class="tab" id="gRefresh">↻</span>
+      <span id="gBranch" class="badge"></span>
+    </div>
+    <div class="scroll" id="git"></div>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const elDisc = $('#discussion'), elAct = $('#activity'), elGit = $('#git');
+let ws = null, curCwd = '', autoTimer = 0;
+let nDisc = 0, nAct = 0;
+const toolMap = {};   // toolId -> activity DOM node
+
+/* ---------- tiny markdown ---------- */
+function esc(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function md(src){
+  src = src || '';
+  const blocks = [];
+  src = src.replace(/```(\w*)\n?([\s\S]*?)```/g,(m,l,c)=>{
+    blocks.push('<pre><code>'+esc(c.replace(/\n$/,''))+'</code></pre>');
+    return '%%CB'+(blocks.length-1)+'%%';
+  });
+  let h = esc(src);
+  h = h.replace(/`([^`\n]+)`/g,(m,c)=>'<code>'+c+'</code>');
+  h = h.replace(/\*\*([^*\n]+)\*\*/g,'<b>$1</b>');
+  h = h.replace(/^### (.*)$/gm,'<h3>$1</h3>').replace(/^## (.*)$/gm,'<h2>$1</h2>').replace(/^# (.*)$/gm,'<h2>$1</h2>');
+  h = h.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,'<a href="$2" target="_blank">$1</a>');
+  h = h.replace(/(^|[^"=])(https?:\/\/[^\s<)]+)/g,'$1<a href="$2" target="_blank">$2</a>');
+  h = h.replace(/^[\-\*] (.*)$/gm,'<li>$1</li>');
+  h = h.replace(/(<li>[\s\S]*?<\/li>)/g,'<ul>$1</ul>');
+  h = h.replace(/\n/g,'<br>');
+  h = h.replace(/<br>(<(?:pre|h2|h3|ul)>)/g,'$1').replace(/(<\/(?:pre|h2|h3|ul)>)<br>/g,'$1');
+  h = h.replace(/%%CB(\d+)%%/g,(m,i)=>blocks[+i]);
+  return h;
+}
+
+/* ---------- discussion ---------- */
+function nearBottom(el){return el.scrollHeight-el.scrollTop-el.clientHeight < 120;}
+function addMsg(ev){
+  const stick = nearBottom(elDisc);
+  const d = document.createElement('div');
+  d.className = 'msg '+(ev.role==='user'?'user':'assistant');
+  d.innerHTML = '<div class="who">'+(ev.role==='user'?'You':'Assistant')+'</div><div class="bubble">'+md(ev.text)+'</div>';
+  elDisc.appendChild(d);
+  nDisc++; $('#dCount').textContent = nDisc;
+  if(stick) elDisc.scrollTop = elDisc.scrollHeight;
+}
+function addThink(ev){
+  const stick = nearBottom(elDisc);
+  const d = document.createElement('div');
+  d.className = 'think'+($('#tgThink').checked?'':' hide');
+  d.dataset.role='think';
+  d.textContent = ev.text;
+  elDisc.appendChild(d);
+  if(stick) elDisc.scrollTop = elDisc.scrollHeight;
+}
+function addChip(ev){
+  const stick = nearBottom(elDisc);
+  const c = document.createElement('div');
+  c.className = 'toolchip'+($('#tgChips').checked?'':' hide');
+  c.dataset.role='chip';
+  c.textContent = '🔧 '+ev.tool+(primaryArg(ev)?' · '+primaryArg(ev):'');
+  c.onclick = ()=>{ const n=toolMap[ev.toolId]; if(n){ switchPane(1); n.classList.add('open','flash'); n.scrollIntoView({block:'center'}); setTimeout(()=>n.classList.remove('flash'),1200);} };
+  elDisc.appendChild(c);
+  if(stick) elDisc.scrollTop = elDisc.scrollHeight;
+}
+
+/* ---------- activity ---------- */
+const ICON = {Edit:'✏️',MultiEdit:'✏️',Write:'📝',Bash:'▶',Read:'📖',Glob:'🔍',Grep:'🔍',
+  Task:'🤖',WebFetch:'🌐',WebSearch:'🌐',TodoWrite:'☑️',NotebookEdit:'📓',
+  shell:'▶',apply_patch:'✏️',exec:'▶',update_plan:'☑️'};
+function primaryArg(ev){
+  const i = ev.input||{};
+  if(typeof i==='string') return i.slice(0,80);
+  if(i.file_path) return i.file_path.split('/').slice(-2).join('/');
+  if(i.path) return (''+i.path).split('/').slice(-2).join('/');
+  if(i.command) return (Array.isArray(i.command)?i.command.join(' '):i.command).slice(0,80);
+  if(i.pattern) return i.pattern;
+  if(i.description) return i.description.slice(0,80);
+  return '';
+}
+function diffHtml(text){
+  return text.split('\n').map(l=>{
+    let c='dl-ctx';
+    if(l.startsWith('@@')||l.startsWith('diff ')||l.startsWith('+++')||l.startsWith('---')) c='dl-hdr';
+    else if(l.startsWith('+')) c='dl-add';
+    else if(l.startsWith('-')) c='dl-del';
+    return '<div class="diffline '+c+'">'+esc(l||' ')+'</div>';
+  }).join('');
+}
+function toolBody(ev){
+  const i = ev.input||{};
+  const t = ev.tool;
+  if((t==='Edit') && i.old_string!==undefined){
+    return diffHtml(i.old_string.split('\n').map(x=>'-'+x).join('\n')+'\n'+
+                    i.new_string.split('\n').map(x=>'+'+x).join('\n'));
+  }
+  if(t==='Write' && i.content!==undefined){
+    return '<div class="reslabel">new content</div>'+diffHtml(i.content.split('\n').map(x=>'+'+x).join('\n'));
+  }
+  if(t==='Bash' && i.command){ return '<pre><code>'+esc(i.command)+'</code></pre>'; }
+  if((t==='shell'||t==='exec') && i.command){
+    return '<pre><code>'+esc(Array.isArray(i.command)?i.command.join(' '):i.command)+'</code></pre>';
+  }
+  if(typeof i==='string') return '<pre><code>'+esc(i)+'</code></pre>';
+  return '<pre><code>'+esc(JSON.stringify(i,null,2))+'</code></pre>';
+}
+function addTool(ev){
+  const stick = nearBottom(elAct);
+  const a = document.createElement('div');
+  a.className = 'act';
+  a.innerHTML = '<div class="head"><span class="ico">'+(ICON[ev.tool]||'🔧')+'</span>'+
+    '<span class="tn">'+esc(ev.tool)+'</span><span class="arg">'+esc(primaryArg(ev))+'</span></div>'+
+    '<div class="body">'+toolBody(ev)+'<div class="res"></div></div>';
+  a.querySelector('.head').onclick = ()=>a.classList.toggle('open');
+  elAct.appendChild(a);
+  if(ev.toolId) toolMap[ev.toolId] = a;
+  nAct++; $('#aCount').textContent = nAct;
+  if(stick) elAct.scrollTop = elAct.scrollHeight;
+}
+function addResult(ev){
+  const a = toolMap[ev.toolId];
+  if(!a){ return; }
+  if(ev.isError) a.classList.add('err');
+  const res = a.querySelector('.res');
+  const body = (ev.content||'').trim();
+  res.innerHTML = '<div class="reslabel">'+(ev.isError?'error ⤵':'output ⤵')+'</div><pre><code>'+
+    esc(body.length>2500?body.slice(0,2500)+'\n…':body)+'</code></pre>';
+}
+
+function route(ev){
+  if(ev.kind==='user_text'||ev.kind==='assistant_text') addMsg(ev);
+  else if(ev.kind==='thinking') addThink(ev);
+  else if(ev.kind==='tool_use'){ addTool(ev); addChip(ev); }
+  else if(ev.kind==='tool_result') addResult(ev);
+}
+
+/* ---------- session wiring ---------- */
+function reltime(ts){
+  const s=(Date.now()/1000)-ts; if(s<60)return Math.round(s)+'s';
+  if(s<3600)return Math.round(s/60)+'m'; if(s<86400)return Math.round(s/3600)+'h';
+  return Math.round(s/86400)+'d';
+}
+async function loadSessions(keep){
+  const r = await fetch('api/sessions'); const j = await r.json();
+  const sel = $('#sessions'); const prev = sel.value;
+  sel.innerHTML='';
+  j.sessions.forEach(s=>{
+    const o=document.createElement('option');
+    o.value=s.id; o.dataset.source=s.source; o.dataset.cwd=s.cwd; o.dataset.branch=s.branch||'';
+    const proj = (s.cwd||'').split('/').slice(-2).join('/') || '?';
+    o.textContent = '['+s.source[0].toUpperCase()+'] '+proj+'  ·  '+reltime(s.mtime)+'  ·  '+(s.title||'');
+    sel.appendChild(o);
+  });
+  if(keep && prev) sel.value=prev;
+  if(!sel.value && sel.options.length) sel.selectedIndex=0;
+  if(!keep) connect();
+}
+function connect(){
+  const opt = $('#sessions').selectedOptions[0]; if(!opt) return;
+  if(ws){ try{ws.close();}catch(e){} ws=null; }
+  elDisc.innerHTML=''; elAct.innerHTML=''; for(const k in toolMap) delete toolMap[k];
+  nDisc=nAct=0; $('#dCount').textContent=0; $('#aCount').textContent=0;
+  curCwd = opt.dataset.cwd||'';
+  const src = opt.dataset.source;
+  $('#srcBadge').textContent = src; $('#srcBadge').className='badge '+src;
+  const proto = location.protocol==='https:'?'wss:':'ws:';
+  ws = new WebSocket(proto+'//'+location.host+'/ws/events?file='+encodeURIComponent(opt.value));
+  ws.onopen = ()=>$('#live').classList.add('live');
+  ws.onclose = ()=>$('#live').classList.remove('live');
+  ws.onmessage = e=>{
+    const m = JSON.parse(e.data);
+    if(m.type==='init'){
+      if(m.cwd){ curCwd=m.cwd; }
+      const b=m.branch||opt.dataset.branch;
+      $('#branchBadge').style.display = b?'':'none'; $('#branchBadge').textContent = b?('⎇ '+b):'';
+      m.events.forEach(route);
+      elDisc.scrollTop=elDisc.scrollHeight; elAct.scrollTop=elAct.scrollHeight;
+      refreshGit();
+    } else if(m.type==='append'){
+      m.events.forEach(route);
+      if(m.events.some(x=>x.kind==='tool_use'||x.kind==='tool_result')) refreshGit();
+    }
+  };
+}
+
+/* ---------- git ---------- */
+async function refreshGit(){
+  if(!curCwd){ elGit.innerHTML='<div class="empty">no working dir for this session</div>'; return; }
+  try{
+    const r = await fetch('api/diff?cwd='+encodeURIComponent(curCwd));
+    const j = await r.json();
+    if(!j.ok){ elGit.innerHTML='<div class="empty">'+esc(j.error||'no diff')+'<br><small>'+esc(curCwd)+'</small></div>'; return; }
+    $('#gBranch').textContent = j.branch?('⎇ '+j.branch):'';
+    const stick = nearBottom(elGit);
+    let html='';
+    if(j.files && j.files.length){
+      html+='<div class="gfiles">'+j.files.map(f=>'<div class="gfile"><span class="st">'+esc(f.status)+'</span>'+esc(f.path)+'</div>').join('')+'</div>';
+    }
+    if(j.diff && j.diff.trim()){ html+=diffHtml(j.diff); }
+    else if(!(j.files&&j.files.length)){ html='<div class="empty">working tree clean ✓<br><small>'+esc(curCwd)+'</small></div>'; }
+    elGit.innerHTML=html;
+    if(stick) elGit.scrollTop = elGit.scrollHeight;
+  }catch(e){ /* keep last */ }
+}
+function startAuto(){ clearInterval(autoTimer); if($('#tgAuto').checked) autoTimer=setInterval(()=>{ if(document.querySelector('[data-pane="2"]').classList.contains('show')||window.innerWidth>760) refreshGit(); }, 2600); }
+
+/* ---------- ui ---------- */
+function switchPane(i){
+  document.querySelectorAll('#mtabs .mt').forEach(t=>t.classList.toggle('on',t.dataset.p==i));
+  document.querySelectorAll('.pane').forEach(p=>p.classList.toggle('show',p.dataset.pane==i));
+  if(i==2) refreshGit();
+}
+document.querySelectorAll('#mtabs .mt').forEach(t=>t.onclick=()=>switchPane(t.dataset.p));
+$('#tgThink').onchange=()=>document.querySelectorAll('[data-role=think]').forEach(e=>e.classList.toggle('hide',!$('#tgThink').checked));
+$('#tgChips').onchange=()=>document.querySelectorAll('[data-role=chip]').forEach(e=>e.classList.toggle('hide',!$('#tgChips').checked));
+$('#sessions').onchange=connect;
+$('#gRefresh').onclick=refreshGit;
+$('#tgAuto').onchange=startAuto;
+
+loadSessions(false);
+setInterval(()=>loadSessions(true), 15000);
+startAuto();
+</script>
+</body>
+</html>"""
+
+
+CHAT_SESSIONS = {}  # id -> ChatSession (live, independent of any browser connection)
+
+
+def safe_cwd(cwd):
+    rp = os.path.realpath(cwd or "")
+    if not (rp == os.path.realpath(HOME) or rp.startswith(os.path.realpath(HOME) + os.sep)):
+        return None
+    return rp if os.path.isdir(rp) else None
+
+
+def _sanitize_mode(m):
+    return m if m in ("acceptEdits", "plan", "default", "bypassPermissions") else "acceptEdits"
+
+
+class ChatSession:
+    """A persistent `claude` process whose lifetime is independent of any browser
+    connection. Survives page navigation/reload (viewers attach/detach); the
+    process is killed only on explicit end()."""
+
+    def __init__(self, sid, cwd, model, mode, resume_cc=None):
+        self.id = sid
+        self.cwd = cwd
+        self.model = model
+        self.mode = mode
+        self.proc = None
+        self.log = []          # full normalized-event history, for replay on reattach
+        self.viewers = set()   # currently-attached ChatSockets
+        self.busy = False
+        self.ended = False
+        self.exit_code = None
+        self.cc_id = resume_cc   # claude's own session_id; preset when resuming
+        self.resume_cc = resume_cc
+
+    def preload(self):
+        """Populate history from the on-disk transcript before resuming."""
+        if self.resume_cc:
+            self.log = load_transcript_events(self.resume_cc)
+
+    def spawn(self):
+        cmd = [CLAUDE_BIN, "-p", "--input-format", "stream-json",
+               "--output-format", "stream-json", "--verbose",
+               "--permission-mode", self.mode, "--add-dir", self.cwd]
+        if self.model and self.model != "default":
+            cmd += ["--model", self.model]
+        if self.resume_cc:
+            cmd += ["--resume", self.resume_cc]
+        self.proc = tornado.process.Subprocess(
+            cmd, stdin=tornado.process.Subprocess.STREAM,
+            stdout=tornado.process.Subprocess.STREAM,
+            stderr=tornado.process.Subprocess.STREAM,
+            cwd=self.cwd, env=os.environ.copy())
+        self.proc.set_exit_callback(self._on_exit)
+        loop = tornado.ioloop.IOLoop.current()
+        loop.spawn_callback(self._read, self.proc.stdout, False)
+        loop.spawn_callback(self._read, self.proc.stderr, True)
+
+    def attach(self, ws):
+        self.viewers.add(ws)
+
+    def detach(self, ws):
+        self.viewers.discard(ws)
+
+    def _emit(self, obj):
+        data = json.dumps(obj)
+        for v in list(self.viewers):
+            try:
+                v.write_message(data)
+            except Exception:
+                self.viewers.discard(v)
+
+    def send_user(self, text):
+        if not text.strip() or not self.proc or self.ended:
+            return
+        self.busy = True
+        payload = {"type": "user", "message": {"role": "user",
+                   "content": [{"type": "text", "text": text}]}}
+        try:
+            self.proc.stdin.write((json.dumps(payload) + "\n").encode())
+        except Exception:
+            self._push([{"kind": "notice", "text": "send failed (process gone)"}])
+
+    def _push(self, evs):
+        self.log.extend(evs)
+        if len(self.log) > 5000:
+            self.log = self.log[-5000:]
+        self._emit({"type": "events", "events": evs})
+
+    async def _read(self, stream, is_err):
+        while True:
+            try:
+                line = await stream.read_until(b"\n")
+            except Exception:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            if is_err:
+                self._emit({"type": "stderr", "text": line.decode("utf-8", "replace")[:600]})
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            evs = normalize_cc(rec)
+            if evs:
+                for e in evs:
+                    if e["kind"] == "turn_done":
+                        self.busy = False
+                    elif e["kind"] == "ready":
+                        self.cc_id = e.get("session_id") or self.cc_id
+                self._push(evs)
+
+    def _on_exit(self, code):
+        self.busy = False
+        self.ended = True
+        self.exit_code = code
+        self._emit({"type": "exit", "code": code})
+
+    def terminate(self):
+        self.ended = True
+        if self.proc:
+            try:
+                self.proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                self.proc.proc.send_signal(signal.SIGTERM)
+            except Exception:
+                pass
+
+
+class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
+    """Thin attach/detach controller over persistent ChatSessions.
+    Closing the socket only DETACHES — it never kills the claude process."""
+
+    def check_origin(self, origin):
+        return True
+
+    def open(self):
+        if AUTH and not self._ok_auth():
+            self.close(4401, "Unauthorized")
+            return
+        self.session = None
+
+    def _say(self, obj):
+        try:
+            self.write_message(json.dumps(obj))
+        except Exception:
+            pass
+
+    async def on_message(self, raw):
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            return
+        mt = msg.get("type")
+        if mt == "start":
+            if not CLAUDE_BIN or not os.path.exists(CLAUDE_BIN):
+                self._say({"type": "error", "error": "claude CLI not found"})
+                return
+            cwd = safe_cwd(msg.get("cwd") or HOME)
+            if not cwd:
+                self._say({"type": "error", "error": "invalid working directory"})
+                return
+            sid = secrets.token_hex(6)
+            sess = ChatSession(sid, cwd, msg.get("model") or "", _sanitize_mode(msg.get("mode")))
+            try:
+                sess.spawn()
+            except Exception as e:
+                self._say({"type": "error", "error": "spawn failed: %s" % e})
+                return
+            CHAT_SESSIONS[sid] = sess
+            self.session = sess
+            sess.attach(self)
+            self._say({"type": "started", "id": sid, "cwd": cwd,
+                       "name": os.path.basename(cwd) or cwd,
+                       "model": sess.model or "default", "mode": sess.mode})
+        elif mt == "attach":
+            sess = CHAT_SESSIONS.get(msg.get("id"))
+            if not sess:
+                self._say({"type": "no_session", "id": msg.get("id")})
+                return
+            if self.session and self.session is not sess:
+                self.session.detach(self)
+            self.session = sess
+            sess.attach(self)
+            self._say({"type": "attached", "id": sess.id, "cwd": sess.cwd,
+                       "name": os.path.basename(sess.cwd) or sess.cwd, "cc": sess.cc_id,
+                       "model": sess.model or "default", "mode": sess.mode,
+                       "busy": sess.busy, "ended": sess.ended, "events": sess.log})
+        elif mt == "resume":
+            if not CLAUDE_BIN or not os.path.exists(CLAUDE_BIN):
+                self._say({"type": "error", "error": "claude CLI not found"})
+                return
+            cc = msg.get("cc")
+            cwd = safe_cwd(msg.get("cwd") or HOME)
+            if not cwd or not _valid_cc(cc):
+                self._say({"type": "error", "error": "invalid resume target"})
+                return
+            live = next((s for s in CHAT_SESSIONS.values()
+                         if s.cc_id == cc and not s.ended), None)
+            if live:
+                sess = live
+            else:
+                sess = ChatSession(secrets.token_hex(6), cwd, msg.get("model") or "",
+                                   _sanitize_mode(msg.get("mode")), resume_cc=cc)
+                sess.preload()
+                try:
+                    sess.spawn()
+                except Exception as e:
+                    self._say({"type": "error", "error": "resume spawn failed: %s" % e})
+                    return
+                CHAT_SESSIONS[sess.id] = sess
+            if self.session and self.session is not sess:
+                self.session.detach(self)
+            self.session = sess
+            sess.attach(self)
+            self._say({"type": "attached", "id": sess.id, "cwd": sess.cwd,
+                       "name": os.path.basename(sess.cwd) or sess.cwd, "cc": sess.cc_id,
+                       "model": sess.model or "default", "mode": sess.mode,
+                       "busy": sess.busy, "ended": sess.ended, "events": sess.log,
+                       "resumed": True})
+        elif mt == "user" and self.session:
+            self.session.send_user(msg.get("text", ""))
+        elif mt == "end" and self.session:
+            s = self.session
+            s.terminate()
+            s.detach(self)
+            CHAT_SESSIONS.pop(s.id, None)
+            self.session = None
+            self._say({"type": "ended", "id": s.id})
+        elif mt == "list":
+            self._say({"type": "sessions", "sessions": [
+                {"id": s.id, "cwd": s.cwd, "name": os.path.basename(s.cwd) or s.cwd,
+                 "cc": s.cc_id, "model": s.model or "default",
+                 "busy": s.busy, "ended": s.ended, "n": len(s.log)}
+                for s in CHAT_SESSIONS.values()]})
+
+    def on_close(self):
+        if self.session:
+            self.session.detach(self)   # keep the claude process alive
+
+
+class ConsoleHandler(AuthMixin, tornado.web.RequestHandler):
+    def get(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Cache-Control", "no-store")
+        self.write(CONSOLE_HTML)
+
+
+CONSOLE_HTML = r"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,interactive-widget=resizes-content">
+<title>Agent Lens · Console</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#1e1e1e;--bg2:#252526;--bg3:#2d2d2d;--line:#3c3c3c;--fg:#d4d4d4;--mut:#858585;
+  --acc:#4fc1ff;--usr:#3794ff;--add:#2ea043;--del:#f85149;--tool:#e0c080;--think:#7a7a7a}
+html,body{height:100%;background:var(--bg);color:var(--fg);overflow:hidden;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;font-size:14px}
+body{display:flex;flex-direction:column}
+header{display:flex;gap:6px;align-items:center;padding:6px 10px;background:var(--bg2);
+  border-bottom:1px solid var(--line);flex-shrink:0;flex-wrap:wrap}
+header .brand{font-weight:600;color:var(--acc);white-space:nowrap}
+header select,header input{background:var(--bg3);color:var(--fg);border:1px solid var(--line);
+  border-radius:5px;padding:4px 7px;font-size:12.5px}
+header select#project{flex:1;min-width:120px;max-width:380px}
+header input#cwd{flex:1;min-width:120px;display:none}
+.navlink{color:var(--mut);text-decoration:none;font-size:12.5px;padding:3px 7px;border:1px solid var(--line);border-radius:5px}
+.navlink:hover{color:var(--fg)}
+.status{font-size:11.5px;color:var(--mut);white-space:nowrap;margin-left:auto;display:flex;gap:6px;align-items:center}
+.dot{width:8px;height:8px;border-radius:50%;background:#555}
+.dot.on{background:var(--add);box-shadow:0 0 6px var(--add)}
+.dot.busy{background:var(--tool);box-shadow:0 0 6px var(--tool);animation:pulse 1s infinite}
+@keyframes pulse{50%{opacity:.35}}
+.btn{background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:5px;
+  padding:4px 9px;font-size:12.5px;cursor:pointer;white-space:nowrap}
+.btn:hover{background:#383838}
+
+#chat{flex:1;overflow-y:auto;overflow-x:hidden;padding:14px;-webkit-overflow-scrolling:touch}
+.wrap{max-width:820px;margin:0 auto}
+.msg{margin-bottom:14px;line-height:1.5;word-wrap:break-word;overflow-wrap:anywhere}
+.msg.user{display:flex;justify-content:flex-end}
+.msg.user .b{background:#10243e;border:1px solid #1f4a7a;border-radius:10px;padding:8px 12px;max-width:85%;white-space:pre-wrap}
+.msg.asst .b{color:#cdcdcd}
+.think{color:var(--think);font-style:italic;font-size:13px;border-left:2px solid #3a3a3a;padding:3px 0 3px 10px;margin-bottom:12px;white-space:pre-wrap}
+.think.hide{display:none}
+.notice{color:var(--mut);font-size:11.5px;margin:6px 0}
+.errline{color:var(--del);font-size:12px;font-family:ui-monospace,monospace;margin:4px 0;white-space:pre-wrap}
+
+/* collapsed change/tool cards */
+.tool{border:1px solid var(--line);border-radius:8px;margin:6px 0 12px;background:var(--bg2);overflow:hidden}
+.tool .th{padding:7px 10px;cursor:pointer;display:flex;gap:8px;align-items:center;user-select:none}
+.tool .th:hover{background:var(--bg3)}
+.tool .ico{flex-shrink:0}
+.tool .tn{color:var(--tool);font-weight:600;font-family:ui-monospace,monospace;font-size:12.5px;flex-shrink:0}
+.tool .tp{color:var(--mut);font-family:ui-monospace,monospace;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
+.tool .cnt{font-size:11.5px;font-family:ui-monospace,monospace;flex-shrink:0}
+.tool .cnt .a{color:#7ee787}.tool .cnt .d{color:#ffa198}
+.tool .chev{color:var(--mut);flex-shrink:0;transition:transform .15s}
+.tool.open .chev{transform:rotate(90deg)}
+.tool .tb{display:none;border-top:1px solid var(--line);padding:8px 10px}
+.tool.open .tb{display:block}
+.tool.err .tn{color:var(--del)}
+pre{background:#161616;border:1px solid var(--line);border-radius:6px;padding:8px;overflow-x:auto;margin:5px 0;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;line-height:1.45}
+code{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;background:#161616;border:1px solid var(--line);border-radius:3px;padding:0 4px}
+pre code{background:none;border:none;padding:0}
+.bubble h1,.bubble h2,.bubble h3{font-size:14px;margin:8px 0 4px}
+.msg.asst ul,.msg.asst ol{margin:4px 0 4px 20px}
+.msg.asst a{color:var(--acc)}
+.diffline{font-family:ui-monospace,monospace;font-size:12px;white-space:pre-wrap;line-height:1.4}
+.dl-add{color:#7ee787}.dl-del{color:#ffa198}.dl-hdr{color:var(--acc)}.dl-ctx{color:var(--mut)}
+.reslabel{font-size:11px;color:var(--mut);margin:6px 0 2px}
+
+#composer{flex-shrink:0;border-top:1px solid var(--line);background:var(--bg2);padding:8px 10px;
+  padding-bottom:calc(8px + env(safe-area-inset-bottom));display:flex;gap:8px;align-items:flex-end}
+#composer .wrap2{max-width:820px;margin:0 auto;width:100%;display:flex;gap:8px;align-items:flex-end}
+#ta{flex:1;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:10px;
+  padding:9px 12px;font-size:14px;font-family:inherit;resize:none;max-height:160px;line-height:1.4}
+#ta:focus{outline:1px solid var(--acc)}
+#send{background:var(--acc);color:#04121f;border:none;border-radius:10px;padding:9px 14px;font-size:16px;font-weight:700;cursor:pointer}
+#send:disabled{background:#3a3a3a;color:#777;cursor:default}
+
+#drawer{position:fixed;top:0;right:0;width:min(560px,92vw);height:100%;background:var(--bg);border-left:1px solid var(--line);
+  transform:translateX(100%);transition:transform .2s;z-index:20;display:flex;flex-direction:column}
+#drawer.open{transform:none}
+#drawer .dh{padding:8px 12px;background:var(--bg2);border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center}
+#drawer .dh .grow{flex:1}
+#drawer .dc{flex:1;overflow:auto;padding:10px}
+.gfile{font-family:ui-monospace,monospace;font-size:12px;padding:1px 0}.gfile .st{display:inline-block;width:24px;color:var(--tool);font-weight:700}
+.empty{color:var(--mut);padding:18px;text-align:center}
+/* edits-out-of-chat */
+#chBadge{font-size:10px;padding:0 5px;border-radius:8px;background:#444;color:#bbb;margin-left:3px}
+.dh .tab{cursor:pointer;padding:3px 9px;border-radius:5px;color:var(--mut);font-size:12.5px;user-select:none}
+.dh .tab.on{background:var(--bg3);color:var(--fg)}
+.dh .tab span{font-size:10px;opacity:.8}
+.emark{font-size:12px;color:var(--tool);background:#2a2519;border:1px solid #4a3f28;border-radius:6px;
+  padding:3px 9px;margin:2px 0 12px;display:inline-flex;gap:7px;cursor:pointer;font-family:ui-monospace,monospace;align-items:center}
+.emark:hover{filter:brightness(1.25)}
+.emark .a{color:#7ee787}.emark .d{color:#ffa198}.emark .mut{color:var(--mut)}
+.ecard{border:1px solid var(--line);border-radius:8px;margin-bottom:10px;background:var(--bg2);overflow:hidden}
+.ecard .eh{padding:7px 9px;display:flex;gap:7px;align-items:center;background:#2a2519;border-bottom:1px solid var(--line)}
+.ecard .ef{color:var(--tool);font-family:ui-monospace,monospace;font-size:12px;font-weight:600;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ecard .cnt{font-size:11px;font-family:ui-monospace,monospace}.ecard .cnt .a{color:#7ee787}.ecard .cnt .d{color:#ffa198}
+.ecard.flash{outline:2px solid var(--acc);outline-offset:-2px}
+.ecard .ed{max-height:320px;overflow:auto;padding:6px 9px}
+.ecard .res{padding:0 9px}
+</style>
+</head>
+<body>
+<header>
+  <span class="brand">⬡ Console</span>
+  <select id="sessions" title="switch to a running session"><option value="">— session —</option></select>
+  <select id="project" title="working directory for a new session"></select>
+  <input id="cwd" placeholder="~/Git/…">
+  <select id="model" title="model"><option value="default">model: default</option><option>opus</option><option>sonnet</option><option>haiku</option></select>
+  <select id="mode" title="permission mode"><option value="acceptEdits">acceptEdits</option><option value="plan">plan</option><option value="default">default</option><option value="bypassPermissions">bypass</option></select>
+  <button class="btn" id="newbtn">＋ New</button>
+  <button class="btn" id="endbtn" title="end this session">✕ End</button>
+  <button class="btn" id="chgbtn">± Changes<span id="chBadge">0</span></button>
+  <a class="navlink" href="/">Observer</a>
+  <span class="status"><span class="dot" id="dot"></span><span id="statxt">idle</span></span>
+</header>
+
+<div id="chat"><div class="wrap" id="stream"></div></div>
+
+<div id="composer"><div class="wrap2">
+  <textarea id="ta" rows="1" placeholder="Message Claude Code…  (Enter to send · Shift+Enter newline)" disabled></textarea>
+  <button id="send" disabled>➤</button>
+</div></div>
+
+<div id="drawer">
+  <div class="dh"><span class="tab on" id="tabEdits">Edits <span id="editN">0</span></span><span class="tab" id="tabGit">Git diff</span><span class="grow"></span><span class="btn" id="grefresh">↻</span><span class="btn" id="dclose">✕</span></div>
+  <div class="dc" id="edits"><div class="empty">no file changes yet</div></div>
+  <div class="dc" id="gitc" style="display:none"><div class="empty">—</div></div>
+</div>
+
+<script>
+const $=s=>document.querySelector(s);
+const stream=$('#stream'), ta=$('#ta'), sendBtn=$('#send');
+let ws=null, running=false, ready=false, cwd='', tools={};
+let sid=null, editCount=0, pendingStart=false, reconnectT=0;
+let showThink=false;
+const EDIT_TOOLS=new Set(['Edit','MultiEdit','Write','NotebookEdit']);
+const SKEY='al_session';
+
+function esc(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function md(src){
+  src=src||''; const bl=[];
+  src=src.replace(/```(\w*)\n?([\s\S]*?)```/g,(m,l,c)=>{bl.push('<pre><code>'+esc(c.replace(/\n$/,''))+'</code></pre>');return ' %%CB'+(bl.length-1)+'%% ';});
+  let h=esc(src);
+  h=h.replace(/`([^`\n]+)`/g,(m,c)=>'<code>'+c+'</code>');
+  h=h.replace(/\*\*([^*\n]+)\*\*/g,'<b>$1</b>');
+  h=h.replace(/^### (.*)$/gm,'<h3>$1</h3>').replace(/^## (.*)$/gm,'<h2>$1</h2>').replace(/^# (.*)$/gm,'<h2>$1</h2>');
+  h=h.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,'<a href="$2" target="_blank">$1</a>');
+  h=h.replace(/^[\-\*] (.*)$/gm,'<li>$1</li>').replace(/(<li>[\s\S]*?<\/li>)/g,'<ul>$1</ul>');
+  h=h.replace(/\n/g,'<br>').replace(/<br>(<(?:pre|h2|h3|ul)>)/g,'$1').replace(/(<\/(?:pre|h2|h3|ul)>)<br>/g,'$1');
+  h=h.replace(/%%CB(\d+)%%/g,(m,i)=>bl[+i]);
+  return h;
+}
+function diffHtml(t){return t.split('\n').map(l=>{let c='dl-ctx';
+  if(l.startsWith('@@')||l.startsWith('diff ')||l.startsWith('+++')||l.startsWith('---'))c='dl-hdr';
+  else if(l.startsWith('+'))c='dl-add';else if(l.startsWith('-'))c='dl-del';
+  return '<div class="diffline '+c+'">'+esc(l||' ')+'</div>';}).join('');}
+function atBottom(){const c=$('#chat');return c.scrollHeight-c.scrollTop-c.clientHeight<140;}
+function scroll(){const c=$('#chat');c.scrollTop=c.scrollHeight;}
+
+const ICON={Edit:'✏️',MultiEdit:'✏️',Write:'📝',Bash:'▶',Read:'📖',Glob:'🔍',Grep:'🔍',Task:'🤖',
+  WebFetch:'🌐',WebSearch:'🌐',TodoWrite:'☑️',NotebookEdit:'📓'};
+function primaryArg(i){if(!i)return '';if(typeof i==='string')return i.slice(0,80);
+  if(i.file_path)return i.file_path.split('/').slice(-2).join('/');
+  if(i.command)return (''+i.command).split('\n')[0].slice(0,90);
+  if(i.pattern)return i.pattern;if(i.description)return i.description.slice(0,80);
+  if(i.url)return i.url;return '';}
+function counts(ev){const i=ev.input||{};
+  if(ev.tool==='Edit'&&i.new_string!==undefined)return {a:(i.new_string.match(/\n/g)||[]).length+1,d:(i.old_string.match(/\n/g)||[]).length+1};
+  if(ev.tool==='Write'&&i.content!==undefined)return {a:(i.content.match(/\n/g)||[]).length+1,d:0};
+  return null;}
+function toolBody(ev){const i=ev.input||{},t=ev.tool;
+  if(t==='Edit'&&i.old_string!==undefined)return diffHtml(i.old_string.split('\n').map(x=>'-'+x).join('\n')+'\n'+i.new_string.split('\n').map(x=>'+'+x).join('\n'));
+  if(t==='Write'&&i.content!==undefined)return '<div class="reslabel">new file content</div>'+diffHtml(i.content.split('\n').map(x=>'+'+x).join('\n'));
+  if(t==='Bash'&&i.command)return '<pre><code>'+esc(i.command)+'</code></pre>';
+  if(typeof i==='string')return '<pre><code>'+esc(i)+'</code></pre>';
+  return '<pre><code>'+esc(JSON.stringify(i,null,2))+'</code></pre>';}
+
+function addUser(text){const s=atBottom();const d=document.createElement('div');d.className='msg user';
+  d.innerHTML='<div class="b">'+esc(text)+'</div>';stream.appendChild(d);scroll();}
+function addAsst(text){const s=atBottom();const d=document.createElement('div');d.className='msg asst';
+  d.innerHTML='<div class="b bubble">'+md(text)+'</div>';stream.appendChild(d);if(s)scroll();}
+function addThink(text){const s=atBottom();const d=document.createElement('div');d.className='think'+(showThink?'':' hide');d.dataset.t=1;
+  d.textContent=text;stream.appendChild(d);if(s)scroll();}
+function addNotice(t){const d=document.createElement('div');d.className='notice';d.textContent=t;stream.appendChild(d);}
+function addErr(t){const d=document.createElement('div');d.className='errline';d.textContent=t;stream.appendChild(d);if(atBottom())scroll();}
+function addTool(ev){const s=atBottom();const c=document.createElement('div');c.className='tool';
+  const cn=counts(ev);const cnt=cn?('<span class="a">+'+cn.a+'</span> <span class="d">−'+cn.d+'</span>'):'';
+  c.innerHTML='<div class="th"><span class="ico">'+(ICON[ev.tool]||'🔧')+'</span><span class="tn">'+esc(ev.tool)+'</span>'+
+    '<span class="tp">'+esc(primaryArg(ev.input))+'</span><span class="cnt">'+cnt+'</span><span class="chev">▸</span></div>'+
+    '<div class="tb">'+toolBody(ev)+'<div class="res"></div></div>';
+  c.querySelector('.th').onclick=()=>c.classList.toggle('open');
+  stream.appendChild(c);if(ev.toolId)tools[ev.toolId]=c;if(s)scroll();}
+function addResult(ev){const c=tools[ev.toolId];if(!c)return;if(ev.isError)c.classList.add('err');
+  const b=(ev.content||'').trim();c.querySelector('.res').innerHTML='<div class="reslabel">'+(ev.isError?'error ⤵':'output ⤵')+
+    '</div><pre><code>'+esc(b.length>2200?b.slice(0,2200)+'\n…':b)+'</code></pre>';}
+
+function statset(t){$('#statxt').textContent=t;}
+function setBusy(b){running=b;$('#dot').className='dot '+(b?'busy':(ready?'on':''));
+  if(b)statset('working…');else if(ready)statset('ready');
+  sendBtn.disabled=b||!ready;ta.disabled=!ready;}
+function clearUI(){stream.innerHTML='';$('#edits').innerHTML='<div class="empty">no file changes yet</div>';
+  $('#gitc').innerHTML='<div class="empty">—</div>';tools={};editCount=0;updateEditBadge();ready=false;}
+
+/* file edits → out of chat, into the Changes drawer */
+function updateEditBadge(){$('#editN').textContent=editCount;const b=$('#chBadge');b.textContent=editCount;
+  b.style.background=editCount?'#d4a017':'#444';b.style.color=editCount?'#000':'#bbb';}
+function addEditCard(ev){if(editCount===0)$('#edits').innerHTML='';
+  const c=document.createElement('div');c.className='ecard';const cn=counts(ev);
+  const cnt=cn?('<span class="cnt"><span class="a">+'+cn.a+'</span> <span class="d">−'+cn.d+'</span></span>'):'';
+  c.innerHTML='<div class="eh"><span>'+(ICON[ev.tool]||'✏️')+'</span><span class="ef">'+esc(primaryArg(ev.input)||ev.tool)+'</span>'+cnt+'</div>'+
+    '<div class="ed">'+toolBody(ev)+'</div><div class="res"></div>';
+  $('#edits').appendChild(c);if(ev.toolId)tools[ev.toolId]=c;editCount++;updateEditBadge();
+  const ed=$('#edits');ed.scrollTop=ed.scrollHeight;}
+function addMarker(ev){const s=atBottom();const cn=counts(ev);const m=document.createElement('div');m.className='emark';
+  m.innerHTML=(ICON[ev.tool]||'✏️')+'<span>'+esc(primaryArg(ev.input)||ev.tool)+'</span>'+
+    (cn?'<span><span class="a">+'+cn.a+'</span> <span class="d">−'+cn.d+'</span></span>':'')+'<span class="mut">— see Changes</span>';
+  m.onclick=()=>{openDrawer('edits');const c=ev.toolId&&tools[ev.toolId];if(c){c.classList.add('flash');c.scrollIntoView({block:'center'});setTimeout(()=>c.classList.remove('flash'),1200);}};
+  stream.appendChild(m);if(s)scroll();}
+
+function route(ev){
+  if(ev.kind==='ready'){ready=true;cwd=ev.cwd||cwd;addNotice('● session ready · '+(ev.model||'')+' · '+(ev.cwd||''));}
+  else if(ev.kind==='assistant_text')addAsst(ev.text);
+  else if(ev.kind==='thinking')addThink(ev.text);
+  else if(ev.kind==='tool_use'){if(EDIT_TOOLS.has(ev.tool)){addEditCard(ev);addMarker(ev);}else addTool(ev);}
+  else if(ev.kind==='tool_result')addResult(ev);
+  else if(ev.kind==='turn_done'){setBusy(false);if(drawerOpen()&&gitTab())refreshGit();}
+  else if(ev.kind==='notice')addNotice(ev.text);
+}
+
+/* persistent server-side session: attach / reattach / switch */
+function markEnded(msg){ready=false;ta.disabled=true;sendBtn.disabled=true;$('#dot').className='dot';statset('ended');
+  localStorage.removeItem(SKEY);if(msg)addNotice(msg);}
+function onMsg(e){const m=JSON.parse(e.data);
+  if(m.type==='started'){pendingStart=false;sid=m.id;localStorage.setItem(SKEY,sid);ready=true;setBusy(false);ta.focus();
+    statset('ready · '+(m.name||''));addNotice('new session « '+(m.name||'')+' » in '+m.cwd+' — type your first message to begin');reqList();}
+  else if(m.type==='attached'){clearUI();sid=m.id;localStorage.setItem(SKEY,sid);cwd=m.cwd;ready=!m.ended;
+    statset((m.ended?'ended · ':'')+(m.name||''));m.events.forEach(route);setBusy(!!m.busy);
+    if(m.ended){markEnded('— this session has ended (history shown) —');}
+    else{ta.disabled=false;sendBtn.disabled=!!m.busy;addNotice('— reattached to « '+(m.name||'')+' » ('+m.events.length+' events) —');}reqList();}
+  else if(m.type==='no_session'){localStorage.removeItem(SKEY);sid=null;ready=false;setBusy(false);statset('idle');
+    addNotice('that session is no longer running — pick a project + ＋ New, or choose a running session.');reqList();}
+  else if(m.type==='events')m.events.forEach(route);
+  else if(m.type==='stderr')addErr(m.text);
+  else if(m.type==='error')addErr('⚠ '+m.error);
+  else if(m.type==='exit'){if(!pendingStart)markEnded('session process exited (code '+m.code+')');reqList();}
+  else if(m.type==='ended'){if(!pendingStart){sid=null;markEnded('session ended');}reqList();}
+  else if(m.type==='sessions')fillSessions(m.sessions);
+}
+function openWs(cb){const proto=location.protocol==='https:'?'wss:':'ws:';
+  ws=new WebSocket(proto+'//'+location.host+'/ws/chat');
+  ws.onopen=()=>{clearTimeout(reconnectT);$('#dot').className='dot '+(ready?'on':'');if(cb)cb();reqList();
+    const saved=localStorage.getItem(SKEY);if(saved&&!sid&&!pendingStart){statset('reattaching…');ws.send(JSON.stringify({type:'attach',id:saved}));}};
+  ws.onclose=()=>{$('#dot').className='dot';statset('disconnected');ta.disabled=true;sendBtn.disabled=true;
+    clearTimeout(reconnectT);reconnectT=setTimeout(()=>openWs(),1800);};
+  ws.onmessage=onMsg;}
+function wsSend(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));}
+function reqList(){wsSend({type:'list'});}
+function fillSessions(list){const sel=$('#sessions');sel.innerHTML='<option value="">— switch session —</option>';
+  list.forEach(s=>{const o=document.createElement('option');o.value=s.id;
+    o.textContent=(s.busy?'⏳ ':'')+(s.name||'?')+' ('+s.n+')'+(s.ended?' [ended]':'');sel.appendChild(o);});
+  sel.value=sid||'';}
+function switchSession(id){if(!id||id===sid)return;clearUI();statset('switching…');wsSend({type:'attach',id:id});}
+function newSession(){const proj=$('#project').value;const dir=proj==='__custom__'?$('#cwd').value.trim():proj;
+  if(!dir){addErr('pick a project directory first');return;}
+  clearUI();pendingStart=true;if(sid)wsSend({type:'end'});sid=null;localStorage.removeItem(SKEY);
+  const start=()=>wsSend({type:'start',cwd:dir,model:$('#model').value,mode:$('#mode').value});
+  if(ws&&ws.readyState===1)start();else openWs(start);statset('starting…');}
+function endSession(){if(sid)wsSend({type:'end'});sid=null;markEnded('session ended');reqList();}
+function sendMsg(){const t=ta.value.trim();if(!t||!ready||running||!sid||!ws||ws.readyState!==1)return;
+  addUser(t);wsSend({type:'user',text:t});ta.value='';ta.style.height='auto';setBusy(true);}
+
+/* changes drawer (Edits | Git) */
+function drawerOpen(){return $('#drawer').classList.contains('open');}
+function gitTab(){return $('#tabGit').classList.contains('on');}
+function showTab(w){const e=w==='edits';$('#tabEdits').classList.toggle('on',e);$('#tabGit').classList.toggle('on',!e);
+  $('#edits').style.display=e?'':'none';$('#gitc').style.display=e?'none':'';if(!e)refreshGit();}
+function openDrawer(w){$('#drawer').classList.add('open');showTab(w||'edits');}
+async function refreshGit(){if(!cwd){$('#gitc').innerHTML='<div class="empty">no session</div>';return;}
+  try{const r=await fetch('api/diff?cwd='+encodeURIComponent(cwd));const j=await r.json();
+    if(!j.ok){$('#gitc').innerHTML='<div class="empty">'+esc(j.error||'n/a')+'</div>';return;}
+    let h='';if(j.files&&j.files.length)h+=j.files.map(f=>'<div class="gfile"><span class="st">'+esc(f.status)+'</span>'+esc(f.path)+'</div>').join('')+'<hr style="border-color:#333;margin:6px 0">';
+    h+=j.diff&&j.diff.trim()?diffHtml(j.diff):'<div class="empty">clean ✓</div>';$('#gitc').innerHTML=h;
+  }catch(e){}}
+
+/* bindings */
+ta.addEventListener('input',()=>{ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,160)+'px';});
+ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMsg();}});
+sendBtn.onclick=sendMsg;
+$('#newbtn').onclick=newSession;
+$('#endbtn').onclick=endSession;
+$('#sessions').onchange=()=>switchSession($('#sessions').value);
+$('#tabEdits').onclick=()=>showTab('edits');
+$('#tabGit').onclick=()=>showTab('git');
+$('#chgbtn').onclick=()=>{if(drawerOpen())$('#drawer').classList.remove('open');else openDrawer('edits');};
+$('#dclose').onclick=()=>$('#drawer').classList.remove('open');
+$('#grefresh').onclick=refreshGit;
+$('#project').onchange=()=>{const c=$('#project').value==='__custom__';
+  $('#cwd').style.display=c?'block':'none';if(c){if(!$('#cwd').value)$('#cwd').value='~/Git/';$('#cwd').focus();}};
+
+/* project picker: real projects (recent dirs + git repos under ~/Git) */
+(async function(){try{const r=await fetch('api/projects');const j=await r.json();const sel=$('#project');
+  j.projects.forEach(p=>{const o=document.createElement('option');o.value=p.path;
+    o.textContent=(p.recent?'★ ':'')+p.path.split('/').slice(-2).join('/');o.title=p.path;sel.appendChild(o);});
+  const c=document.createElement('option');c.value='__custom__';c.textContent='custom path…';sel.appendChild(c);
+}catch(e){}})();
+
+setInterval(()=>reqList(),8000);
+openWs();
+</script>
+</body>
+</html>"""
+
+
+def main():
+    app = tornado.web.Application([
+        (r"/", IndexHandler),
+        (r"/console", ConsoleHandler),
+        (r"/api/sessions", SessionsHandler),
+        (r"/api/projects", ProjectsHandler),
+        (r"/api/resumable", ResumableHandler),
+        (r"/api/diff", DiffHandler),
+        (r"/ws/events", EventsSocket),
+        (r"/ws/chat", ChatSocket),
+    ])
+    loopback = BIND in ("127.0.0.1", "localhost", "::1")
+    app.listen(PORT, address=BIND)
+    print("Agent Lens on http://%s:%d" % (BIND, PORT))
+    print("  observer: http://%s:%d/   console: http://%s:%d/console" % (BIND, PORT, BIND, PORT))
+    print("  claude bin: %s" % CLAUDE_BIN)
+    print("  claude transcripts: %s" % CLAUDE_ROOT)
+    print("  codex transcripts:  %s" % CODEX_ROOT)
+    print("  auth: %s" % ("enabled" if AUTH else "disabled"))
+    if not loopback and not AUTH:
+        print("  ⚠️  EXPOSED on %s WITHOUT auth — this serves your agent"
+              " transcripts and code diffs. Set AGENTLENS_AUTH=user:pass." % BIND)
+
+    def _shutdown(signum, frame):
+        for s in list(CHAT_SESSIONS.values()):
+            try:
+                s.terminate()
+            except Exception:
+                pass
+        os._exit(0)
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+    tornado.ioloop.IOLoop.current().start()
+
+
+if __name__ == "__main__":
+    main()
