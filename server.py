@@ -1142,6 +1142,18 @@ header input#cwd{flex:1;min-width:120px;display:none}
 .dot.on{background:var(--add);box-shadow:0 0 6px var(--add)}
 .dot.busy{background:var(--tool);box-shadow:0 0 6px var(--tool);animation:pulse 1s infinite}
 @keyframes pulse{50%{opacity:.35}}
+/* in-chat "thinking" indicator (Claude-Code-CLI style) — aligned to the composer */
+#thinking{display:none;padding:7px 10px;flex-shrink:0;border-top:1px solid var(--line);
+  background:var(--bg2);cursor:pointer;user-select:none}
+#thinking.on{display:block}
+#thinking:hover{background:var(--bg3)}
+#thinking .twrap{max-width:820px;margin:0 auto;display:flex;align-items:center;gap:9px;font-size:13px}
+#thinking .glyph{font-size:15px;color:var(--tool);width:1.1em;text-align:center;
+  text-shadow:0 0 8px var(--tool);animation:thinkpulse 1.4s ease-in-out infinite}
+#thinking .word{color:var(--fg);font-weight:600}
+#thinking .word::after{content:'…'}
+#thinking .meta{color:var(--mut);font-size:12px;margin-left:auto;font-variant-numeric:tabular-nums}
+@keyframes thinkpulse{0%,100%{opacity:.45}50%{opacity:1}}
 .btn{background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:5px;
   padding:4px 9px;font-size:12.5px;cursor:pointer;white-space:nowrap}
 .btn:hover{background:#383838}
@@ -1353,6 +1365,7 @@ pre code{background:none;border:none;padding:0}
   <div id="sb-backdrop"></div>
   <div id="mainCol">
     <div id="chat"><div class="wrap" id="stream"></div></div>
+    <div id="thinking" title="click or press Esc to interrupt"><div class="twrap"><span class="glyph">✶</span><span class="word">Thinking</span><span class="meta"></span></div></div>
     <div id="composer"><div class="wrap2">
       <textarea id="ta" rows="1" placeholder="Type a message…  (Enter to send · Shift+Enter newline)" disabled></textarea>
       <button id="stop" title="interrupt / stop" style="display:none">⏹</button>
@@ -1443,7 +1456,29 @@ function bindProject(p){if(!p)return;const sel=$('#project');let ok=false;
 function setBusy(b){running=b;$('#dot').className='dot '+(b?'busy':(ready?'on':''));
   if(b)statset('working…');else if(ready)statset('ready');
   sendBtn.disabled=b||!ready;ta.disabled=!ready;
-  $('#stop').style.display=b?'':'none';sendBtn.style.display=b?'none':'';}
+  $('#stop').style.display=b?'':'none';sendBtn.style.display=b?'none':'';
+  if(b)startThinking();else stopThinking();}
+
+/* in-chat "thinking" indicator — animated glyph + cycling word + elapsed timer */
+const THINK_WORDS=['Thinking','Pondering','Cogitating','Brewing','Conjuring','Percolating',
+  'Ruminating','Noodling','Mulling','Synthesizing','Computing','Untangling','Divining','Tinkering'];
+const THINK_GLYPHS=['✶','✷','✸','✹','✺','✹','✸','✷'];
+let thinkTimer=0,thinkStart=0,thinkGi=0,thinkWi=0;
+function startThinking(){const el=$('#thinking');if(!el)return;
+  if(!thinkTimer){                 /* new turn: fresh clock + ONE word, fixed for this turn */
+    thinkStart=Date.now();
+    thinkWi=Math.floor(Math.random()*THINK_WORDS.length);
+    el.querySelector('.word').textContent=THINK_WORDS[thinkWi];
+  }
+  el.classList.add('on');if(atBottom())scroll();
+  clearInterval(thinkTimer);
+  thinkTimer=setInterval(()=>{     /* during the turn only the glyph + timer move */
+    thinkGi=(thinkGi+1)%THINK_GLYPHS.length;
+    el.querySelector('.glyph').textContent=THINK_GLYPHS[thinkGi];
+    el.querySelector('.meta').textContent=Math.floor((Date.now()-thinkStart)/1000)+'s · esc to interrupt';
+  },130);}
+function stopThinking(){clearInterval(thinkTimer);thinkTimer=0;const el=$('#thinking');if(el)el.classList.remove('on');}
+function doInterrupt(){if(!running)return;wsSend({type:'interrupt'});addNotice('⏹ interrupt sent');}
 function clearUI(){stream.innerHTML='';$('#edits').innerHTML='<div class="empty">no file changes yet</div>';
   $('#gitc').innerHTML='<div class="empty">—</div>';tools={};editCount=0;updateEditBadge();renderCtx(null);ready=false;}
 
@@ -1721,7 +1756,10 @@ async function refreshGit(){if(!cwd){$('#gitc').innerHTML='<div class="empty">no
 ta.addEventListener('input',()=>{ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,160)+'px';});
 ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMsg();}});
 sendBtn.onclick=sendMsg;
-$('#stop').onclick=()=>{wsSend({type:'interrupt'});addNotice('⏹ interrupt sent');};
+$('#stop').onclick=doInterrupt;
+$('#thinking').onclick=doInterrupt;
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape'&&running&&!$('#cwdac').classList.contains('on')){e.preventDefault();doInterrupt();}});
 $('#newbtn').onclick=newSession;
 $('#navtoggle').onclick=toggleSidebar;
 $('#sb-backdrop').onclick=closeSidebar;
