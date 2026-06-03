@@ -23,6 +23,7 @@ import signal
 import subprocess
 import time
 import urllib.parse
+import urllib.request
 
 import tornado.ioloop
 import tornado.iostream
@@ -440,6 +441,90 @@ def set_name(cc, name):
         return False
 
 
+PREFS_FILE = os.path.join(HOME, ".claude", "console-prefs.json")
+_prefs_cache = {"mtime": -1.0, "v": {}}
+
+def load_prefs():
+    """Per-session UI prefs {claude_session_id: {mode, model}} so a resumed
+    session restores its own permission mode / model instead of reverting to the
+    picker defaults. Cached; invalidated by mtime."""
+    try:
+        m = os.path.getmtime(PREFS_FILE)
+    except OSError:
+        _prefs_cache["mtime"], _prefs_cache["v"] = -1.0, {}
+        return _prefs_cache["v"]
+    if m != _prefs_cache["mtime"]:
+        try:
+            with open(PREFS_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+            _prefs_cache["v"] = d if isinstance(d, dict) else {}
+        except Exception:
+            _prefs_cache["v"] = {}
+        _prefs_cache["mtime"] = m
+    return _prefs_cache["v"]
+
+
+def save_pref(cc, mode=None, model=None):
+    """Persist a session's mode and/or model. No-op write when unchanged."""
+    if not _valid_cc(cc):
+        return
+    prefs = load_prefs()
+    cur = dict(prefs.get(cc) or {})
+    if mode is not None:
+        cur["mode"] = mode
+    if model is not None:
+        cur["model"] = model
+    if cur == prefs.get(cc):
+        return
+    prefs = dict(prefs); prefs[cc] = cur
+    try:
+        os.makedirs(os.path.dirname(PREFS_FILE), exist_ok=True)
+        tmp = PREFS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(prefs, f, ensure_ascii=False)
+        os.replace(tmp, PREFS_FILE)
+        _prefs_cache["mtime"] = -1.0
+    except Exception:
+        pass
+
+
+_usage_cache = {"t": 0.0, "v": None}
+
+def fetch_usage():
+    """The rolling 5h / 7d usage limits, from Claude's OAuth usage endpoint — the
+    same numbers the CLI shows. Reads the local OAuth token; cached ~5 min (the
+    endpoint is itself rate-limited). Blocking (run it off the IO loop). Returns a
+    dict {window: {utilization, resets_at}}, the last good value on a transient
+    error, or None when never available (no token)."""
+    now = time.monotonic()
+    if _usage_cache["v"] is not None and now - _usage_cache["t"] < 300:
+        return _usage_cache["v"]
+    try:
+        with open(os.path.join(HOME, ".claude", ".credentials.json"), encoding="utf-8") as f:
+            tok = (json.load(f).get("claudeAiOauth") or {}).get("accessToken")
+        if not tok:
+            return None
+        req = urllib.request.Request(
+            "https://api.anthropic.com/api/oauth/usage",
+            headers={"Authorization": "Bearer " + tok,
+                     "anthropic-beta": "oauth-2025-04-20",
+                     "User-Agent": "claude-console"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.load(r)
+        out = {}
+        for k in ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"):
+            v = data.get(k)
+            if isinstance(v, dict) and v.get("utilization") is not None:
+                out[k] = {"utilization": v.get("utilization"), "resets_at": v.get("resets_at")}
+        _usage_cache["t"], _usage_cache["v"] = now, out
+        return out
+    except Exception:
+        # transient failure (rate-limited 429 / network): keep serving the last
+        # good value so the indicator doesn't blink out. Don't touch the timer,
+        # so a real refresh is retried on the next poll.
+        return _usage_cache["v"]
+
+
 def load_transcript_events(cc, cap=2000):
     """Parse a saved transcript into console events, for preload on --resume."""
     path = find_transcript(cc)
@@ -664,6 +749,16 @@ class DiffHandler(AuthMixin, tornado.web.RequestHandler):
         self.write(json.dumps(git_snapshot(cwd)))
 
 
+class UsageHandler(AuthMixin, tornado.web.RequestHandler):
+    async def get(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "application/json")
+        loop = tornado.ioloop.IOLoop.current()
+        u = await loop.run_in_executor(None, fetch_usage)   # blocking HTTP off-loop
+        self.write(json.dumps({"usage": u}))
+
+
 CHAT_SESSIONS = {}  # id -> ChatSession (live, independent of any browser connection)
 
 
@@ -798,6 +893,8 @@ class ChatSession:
                         self.busy = False
                     elif e["kind"] == "ready":
                         self.cc_id = e.get("session_id") or self.cc_id
+                        if self.cc_id:   # record this session's mode/model once
+                            save_pref(self.cc_id, mode=self.mode, model=self.model)
                 if evs:
                     self._push(evs)
                 # refresh context-window usage after a turn settles or on init
@@ -893,6 +990,8 @@ class ChatSession:
             return
         m = None if (not model or model == "default") else model
         self.model = model or "default"   # optimistic; reflected in list/attach
+        if self.cc_id:
+            save_pref(self.cc_id, model=self.model)
         client = self.client
         async def _s():
             try:
@@ -908,6 +1007,8 @@ class ChatSession:
             return
         mode = _sanitize_mode(mode)
         self.mode = mode
+        if self.cc_id:
+            save_pref(self.cc_id, mode=mode)
         client = self.client
         async def _s():
             try:
@@ -1033,8 +1134,11 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             if live:
                 sess = live
             else:
-                sess = ChatSession(secrets.token_hex(6), cwd, msg.get("model") or "",
-                                   _sanitize_mode(msg.get("mode")), resume_cc=cc)
+                pf = load_prefs().get(cc) or {}   # restore this session's own
+                r_mode = _sanitize_mode(pf.get("mode") or msg.get("mode"))
+                r_model = pf.get("model") or msg.get("model") or ""
+                sess = ChatSession(secrets.token_hex(6), cwd, r_model,
+                                   r_mode, resume_cc=cc)
                 sess.preload()
                 try:
                     await sess.start()
@@ -1264,11 +1368,19 @@ pre code{background:none;border:none;padding:0}
 /* sessions sidebar + shell layout */
 .iconbtn{background:none;border:none;color:var(--fg);font-size:17px;cursor:pointer;padding:2px 5px;line-height:1}
 .curname{font-size:13px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0;max-width:46vw}
-.ctx{display:none;align-items:center;gap:5px;font-size:11px;color:var(--mut);white-space:nowrap;font-family:ui-monospace,monospace}
-.ctx .bar{width:52px;height:6px;border-radius:3px;background:var(--bg3);border:1px solid var(--line);overflow:hidden}
+.ctx{display:none;align-items:center;gap:6px;font-size:12.5px;font-weight:600;color:var(--fg);white-space:nowrap;font-family:ui-monospace,monospace}
+.ctx .bar{width:54px;height:7px;border-radius:3px;background:var(--bg3);border:1px solid var(--line);overflow:hidden}
 .ctx .fill{display:block;height:100%;width:0;background:var(--add);transition:width .3s,background .3s}
 .ctx.warn .fill{background:var(--tool)}
 .ctx.hot .fill{background:var(--del)}
+.usage{display:none;align-items:center;gap:6px;font-size:12.5px;font-weight:600;color:var(--fg);white-space:nowrap;font-family:ui-monospace,monospace;
+  border-left:1px solid var(--line);padding-left:11px;margin-left:4px}
+.ctx .ulabel,.usage .ulabel{opacity:.7}
+.usage .bar{width:54px;height:7px;border-radius:3px;background:var(--bg3);border:1px solid var(--line);overflow:hidden}
+.usage .fill{display:block;height:100%;width:0;background:var(--add);transition:width .3s,background .3s}
+.usage.warn .fill{background:var(--tool)}
+.usage.hot .fill{background:var(--del)}
+@media(max-width:680px){.usage{display:none!important}}
 #shell{flex:1;display:flex;min-height:0;position:relative}
 #mainCol{flex:1;display:flex;flex-direction:column;min-width:0}
 #sidebar{width:250px;flex-shrink:0;background:var(--bg2);border-right:1px solid var(--line);display:flex;flex-direction:column;overflow-y:auto}
@@ -1330,6 +1442,7 @@ pre code{background:none;border:none;padding:0}
   <span class="brand">⬡ Claude Console</span>
   <span class="curname" id="curname">— no session —</span>
   <span class="ctx" id="ctx" title="context-window usage"></span>
+  <span class="usage" id="usage" title="5-hour usage limit"></span>
   <button class="btn" id="chgbtn">± Changes<span id="chBadge">0</span></button>
   <span class="status"><span class="dot" id="dot"></span><span id="statxt">idle</span></span>
 </header>
@@ -1599,9 +1712,25 @@ function renderCtx(c){const el=$('#ctx');
   const pct=Math.round(c.percentage);
   el.className='ctx'+(pct>=85?' hot':(pct>=65?' warn':''));
   el.style.display='inline-flex';
-  el.innerHTML='<span class="bar"><span class="fill" style="width:'+Math.min(100,pct)+'%"></span></span>'+
-    '<span>'+pct+'% · '+fmtTok(c.totalTokens)+'/'+fmtTok(c.maxTokens)+'</span>';
+  el.innerHTML='<span class="ulabel">Context</span><span class="bar"><span class="fill" style="width:'+Math.min(100,pct)+'%"></span></span>'+
+    '<span>'+pct+'%</span>';
   el.title='context '+(c.totalTokens||'?')+' / '+(c.maxTokens||'?')+' tokens ('+pct+'%)'+(c.model?' · '+c.model:'');}
+/* rolling 5-hour usage limit (Claude-Code-CLI style: Usage ░░░ 2% (4h 38m / 5h)) */
+function fmtDur(ms){if(ms==null||ms<=0)return '0m';const m=Math.floor(ms/60000),h=Math.floor(m/60);
+  return h>0?(h+'h '+(m%60)+'m'):(m+'m');}
+function renderUsage(u){const el=$('#usage');const f=u&&u.five_hour;
+  if(!f||f.utilization==null){el.style.display='none';return;}
+  const pct=Math.round(f.utilization);
+  const rem=f.resets_at?fmtDur(new Date(f.resets_at)-Date.now()):'';
+  el.className='usage'+(pct>=85?' hot':(pct>=60?' warn':''));
+  el.style.display='inline-flex';
+  el.innerHTML='<span class="ulabel">Usage</span><span class="bar"><span class="fill" style="width:'+Math.min(100,pct)+'%"></span></span>'+
+    '<span>'+pct+'%'+(rem?(' ('+rem+' / 5h)'):'')+'</span>';
+  let t='5-hour limit: '+pct+'% used'+(rem?(' · resets in '+rem):'');
+  const w7=[['seven_day','7-day'],['seven_day_sonnet','7-day Sonnet'],['seven_day_opus','7-day Opus']];
+  w7.forEach(([k,lbl])=>{if(u[k]&&u[k].utilization!=null)t+='\n'+lbl+': '+Math.round(u[k].utilization)+'%';});
+  el.title=t;}
+function loadUsage(){fetch('api/usage').then(r=>r.json()).then(j=>renderUsage(j.usage)).catch(()=>{});}
 /* reflect the active session's real model/mode in the pickers (programmatic
    .value set does NOT fire onchange, so this won't echo back to the server) */
 function syncPickers(model,mode){
@@ -1804,6 +1933,8 @@ $('#cwd').addEventListener('keydown',e=>{const b=$('#cwdac');if(!b.classList.con
 setInterval(()=>reqList(),8000);
 setInterval(loadPast,30000);
 loadPast();
+loadUsage();
+setInterval(loadUsage,60000);
 openWs();
 </script>
 </body>
@@ -1818,6 +1949,7 @@ def main():
         (r"/api/resumable", ResumableHandler),
         (r"/api/dircomplete", DirCompleteHandler),
         (r"/api/diff", DiffHandler),
+        (r"/api/usage", UsageHandler),
         (r"/ws/chat", ChatSocket),
     ])
     loopback = BIND in ("127.0.0.1", "localhost", "::1")
