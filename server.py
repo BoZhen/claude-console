@@ -642,9 +642,16 @@ class ChatSession:
     async def start(self):
         if not HAVE_SDK:
             raise RuntimeError("claude-agent-sdk not installed")
+        # Launch with --dangerously-skip-permissions so the user can switch to
+        # the "Full auto" (bypassPermissions) mode at runtime — the CLI refuses
+        # set_permission_mode('bypassPermissions') unless the session was started
+        # with that flag. It only UNLOCKS the capability: the session still starts
+        # in self.mode and can_use_tool still fires for approvals / AskUserQuestion
+        # in default & acceptEdits (verified) — it is not forced bypass.
         opts = ClaudeAgentOptions(
             cwd=self.cwd, permission_mode=self.mode, can_use_tool=self._can_use_tool,
-            add_dirs=[self.cwd], cli_path=CLAUDE_BIN)
+            add_dirs=[self.cwd], cli_path=CLAUDE_BIN,
+            extra_args={"dangerously-skip-permissions": None})
         if self.model and self.model != "default":
             opts.model = self.model
         if self.resume_cc:
@@ -830,6 +837,9 @@ class ChatSession:
             try:
                 await client.set_permission_mode(mode)
                 self._notice("⚙ permission mode → %s (this session)" % mode)
+                if mode == "bypassPermissions":
+                    self._notice("⚠ Full auto: tools run without prompts; "
+                                 "AskUserQuestion won't be interactive in this mode.")
             except Exception as ex:
                 self._notice("mode change failed: %r" % ex)
         tornado.ioloop.IOLoop.current().spawn_callback(_s)
