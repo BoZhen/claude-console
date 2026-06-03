@@ -23,6 +23,7 @@ import secrets
 import shutil
 import signal
 import subprocess
+import time
 import urllib.parse
 
 import tornado.ioloop
@@ -382,21 +383,93 @@ def load_transcript_events(cc, cap=2000):
     return evs[-cap:] if len(evs) > cap else evs
 
 
-def list_resumable(limit=20):
-    """Recent claude sessions (real-project cwds) that can be continued via --resume."""
+def list_resumable(cwd=None, limit=20):
+    """Recent claude sessions that can be continued via --resume. If `cwd` is
+    given, restrict to sessions whose working dir is exactly that folder
+    (scan deeper, since one folder's sessions may be far down the global list)."""
+    target = os.path.realpath(cwd) if cwd else None
     out = []
-    for s in list_sessions(60):
+    for s in list_sessions(500 if target else 60):
         if s.get("source") != "claude":
             continue
-        cwd = s.get("cwd")
-        if not cwd or not os.path.isdir(cwd) or _is_junk(cwd):
+        scwd = s.get("cwd")
+        if not scwd or not os.path.isdir(scwd) or _is_junk(scwd):
+            continue
+        # match the folder AND everything under it (sessions usually live in a
+        # project subdir, not the container folder itself)
+        rscwd = os.path.realpath(scwd)
+        if target and not (rscwd == target or rscwd.startswith(target + os.sep)):
             continue
         cc = os.path.splitext(os.path.basename(s["id"]))[0]
-        out.append({"cc": cc, "cwd": cwd, "name": os.path.basename(cwd) or cwd,
+        out.append({"cc": cc, "cwd": scwd, "name": os.path.basename(scwd) or scwd,
                     "title": s.get("title", ""), "mtime": s.get("mtime", 0)})
         if len(out) >= limit:
             break
     return out
+
+
+_proj_cache = {"t": 0.0, "v": []}
+def _projects_cached():
+    now = time.monotonic()
+    if now - _proj_cache["t"] > 8 or not _proj_cache["v"]:
+        _proj_cache["v"] = list_projects()
+        _proj_cache["t"] = now
+    return _proj_cache["v"]
+
+
+def dir_complete(q, limit=30):
+    """Directory autocomplete for the console path box. If the typed path IS an
+    existing directory, list its children (so you don't need a trailing '/');
+    otherwise complete the last segment within its parent. A bare name fragment
+    (no '/') also fuzzy-matches known projects. Restricted to $HOME. Returns
+    (dirs, more) where `more` flags that results were capped."""
+    q = (q or "").strip()
+    home = os.path.realpath(HOME)
+    out, seen = [], set()
+
+    def add(p):
+        rp = os.path.realpath(os.path.expanduser(p))
+        if rp in seen or not os.path.isdir(rp):
+            return
+        if not (rp == home or rp.startswith(home + os.sep)):
+            return
+        if _is_junk(rp):
+            return
+        seen.add(rp)
+        out.append(rp)
+
+    def fs_complete():
+        cand = os.path.expanduser(q) if q else HOME
+        if cand and not cand.endswith(os.sep) and os.path.isdir(cand):
+            base, frag = cand, ""           # typed path is a dir → list its children
+        elif cand.endswith(os.sep):
+            base, frag = cand, ""
+        else:
+            base, frag = os.path.split(cand)
+        base = base or HOME
+        try:
+            names = sorted(os.listdir(base), key=str.lower)
+        except Exception:
+            return
+        fl = frag.lower()
+        for name in names:
+            if name.startswith(".") and not frag.startswith("."):
+                continue
+            if not fl or name.lower().startswith(fl):
+                add(os.path.join(base, name))
+
+    def fuzzy():
+        ql = q.lower()
+        for proj in _projects_cached():
+            p = proj["path"]
+            if not ql or ql in p.lower() or ql in os.path.basename(p).lower():
+                add(p)
+
+    if ("/" in q) or q.startswith("~"):
+        fs_complete()                       # explicit path → filesystem browse only
+    else:
+        fuzzy(); fs_complete()              # bare name → fuzzy projects + home entries
+    return out[:limit], len(out) > limit
 
 
 def _source_of(path):
@@ -506,7 +579,7 @@ class ProjectsHandler(AuthMixin, tornado.web.RequestHandler):
         if not self._ok_auth():
             return
         self.set_header("Content-Type", "application/json")
-        self.write(json.dumps({"projects": list_projects()}))
+        self.write(json.dumps({"projects": list_projects(), "home": HOME}))
 
 
 class ResumableHandler(AuthMixin, tornado.web.RequestHandler):
@@ -514,7 +587,17 @@ class ResumableHandler(AuthMixin, tornado.web.RequestHandler):
         if not self._ok_auth():
             return
         self.set_header("Content-Type", "application/json")
-        self.write(json.dumps({"resumable": list_resumable()}))
+        cwd = self.get_argument("cwd", "") or None
+        self.write(json.dumps({"resumable": list_resumable(cwd)}))
+
+
+class DirCompleteHandler(AuthMixin, tornado.web.RequestHandler):
+    def get(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "application/json")
+        dirs, more = dir_complete(self.get_argument("q", ""))
+        self.write(json.dumps({"dirs": dirs, "more": more}))
 
 
 class DiffHandler(AuthMixin, tornado.web.RequestHandler):
@@ -1001,6 +1084,7 @@ class ChatSession:
         self.resume_cc = resume_cc
         self._pending = {}       # approval_id -> asyncio.Future
         self._aid = 0
+        self.ctx = None          # latest context-window usage (get_context_usage)
 
     def preload(self):
         """Populate history from the on-disk transcript before resuming."""
@@ -1060,11 +1144,28 @@ class ChatSession:
                         self.cc_id = e.get("session_id") or self.cc_id
                 if evs:
                     self._push(evs)
+                # refresh context-window usage after a turn settles or on init
+                if any(e["kind"] in ("turn_done", "ready") for e in evs):
+                    await self._refresh_context()
         except Exception as ex:
             self._emit({"type": "stderr", "text": "stream ended: %r" % ex})
         self.busy = False
         self.ended = True
         self._emit({"type": "exit", "code": 0})
+
+    async def _refresh_context(self):
+        """Pull the /context breakdown from the SDK and push it to viewers."""
+        if not self.client or self.ended:
+            return
+        try:
+            u = await asyncio.wait_for(self.client.get_context_usage(), 6)
+        except Exception:
+            return
+        if not isinstance(u, dict):
+            return
+        self.ctx = {"totalTokens": u.get("totalTokens"), "maxTokens": u.get("maxTokens"),
+                    "percentage": u.get("percentage"), "model": u.get("model")}
+        self._emit({"type": "context", "ctx": self.ctx})
 
     def _normalize(self, msg):
         evs = []
@@ -1256,7 +1357,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             sess.attach(self)
             self._say({"type": "attached", "id": sess.id, "cwd": sess.cwd,
                        "name": os.path.basename(sess.cwd) or sess.cwd, "cc": sess.cc_id,
-                       "title": sess.title(),
+                       "title": sess.title(), "ctx": sess.ctx,
                        "model": sess.model or "default", "mode": sess.mode,
                        "busy": sess.busy, "ended": sess.ended, "events": sess.log})
         elif mt == "resume":
@@ -1288,7 +1389,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             sess.attach(self)
             self._say({"type": "attached", "id": sess.id, "cwd": sess.cwd,
                        "name": os.path.basename(sess.cwd) or sess.cwd, "cc": sess.cc_id,
-                       "title": sess.title(),
+                       "title": sess.title(), "ctx": sess.ctx,
                        "model": sess.model or "default", "mode": sess.mode,
                        "busy": sess.busy, "ended": sess.ended, "events": sess.log,
                        "resumed": True})
@@ -1455,13 +1556,28 @@ pre code{background:none;border:none;padding:0}
 /* sessions sidebar + shell layout */
 .iconbtn{background:none;border:none;color:var(--fg);font-size:17px;cursor:pointer;padding:2px 5px;line-height:1}
 .curname{font-size:13px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0;max-width:46vw}
+.ctx{display:none;align-items:center;gap:5px;font-size:11px;color:var(--mut);white-space:nowrap;font-family:ui-monospace,monospace}
+.ctx .bar{width:52px;height:6px;border-radius:3px;background:var(--bg3);border:1px solid var(--line);overflow:hidden}
+.ctx .fill{display:block;height:100%;width:0;background:var(--add);transition:width .3s,background .3s}
+.ctx.warn .fill{background:var(--tool)}
+.ctx.hot .fill{background:var(--del)}
 #shell{flex:1;display:flex;min-height:0;position:relative}
 #mainCol{flex:1;display:flex;flex-direction:column;min-width:0}
 #sidebar{width:250px;flex-shrink:0;background:var(--bg2);border-right:1px solid var(--line);display:flex;flex-direction:column;overflow-y:auto}
 #sidebar.collapsed{display:none}
 .sb-new{padding:8px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:6px}
 .sb-new select,.sb-new input{width:100%;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:5px;padding:5px 7px;font-size:12.5px}
-.sb-new #cwd{display:none}
+.cwdwrap{position:relative;display:none}
+.cwdwrap.show{display:block}
+#cwdac{position:absolute;left:0;right:0;top:100%;z-index:50;background:var(--bg3);border:1px solid var(--acc);border-top:none;border-radius:0 0 6px 6px;max-height:240px;overflow:auto;display:none;box-shadow:0 8px 18px rgba(0,0,0,.5)}
+#cwdac.on{display:block}
+.acitem{padding:5px 8px;cursor:pointer;border-bottom:1px solid var(--line)}
+.acitem:last-child{border-bottom:none}
+.acitem:hover,.acitem.sel{background:var(--acc)}
+.acname{font-size:12px;font-family:ui-monospace,monospace;color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.acpath{font-size:10px;font-family:ui-monospace,monospace;color:var(--mut);overflow-wrap:anywhere;line-height:1.3}
+.acitem:hover .acname,.acitem.sel .acname,.acitem:hover .acpath,.acitem.sel .acpath{color:#04121f}
+.acmore{padding:5px 8px;font-size:10px;color:var(--mut);font-style:italic}
 .sb-row2{display:flex;gap:6px}.sb-row2 select{flex:1;min-width:0}
 .newbtn{background:var(--acc);color:#04121f;font-weight:700;border:none;border-radius:6px;padding:7px;font-size:13px;cursor:pointer}
 .newbtn:hover{filter:brightness(1.08)}
@@ -1483,6 +1599,10 @@ pre code{background:none;border:none;padding:0}
 .srow .ssub{font-size:11px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .srow .sx{color:var(--mut);flex-shrink:0;font-size:13px;padding:0 3px;opacity:0}
 .srow:hover .sx{opacity:.6}.srow .sx:hover{opacity:1;color:var(--del)}
+.srow .star{flex-shrink:0;font-size:13px;padding:0 3px;color:var(--mut);cursor:pointer}
+.srow .star.on{color:var(--tool)}
+.srow .star:hover{color:var(--tool);filter:brightness(1.2)}
+.fscope{font-size:10px;color:var(--mut);font-family:ui-monospace,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:130px}
 #sb-backdrop{display:none}
 @media(max-width:860px){
   #sidebar{position:fixed;left:0;top:0;bottom:0;z-index:40;transform:translateX(-100%);transition:transform .2s;width:min(310px,86vw);box-shadow:2px 0 14px rgba(0,0,0,.5)}
@@ -1497,6 +1617,7 @@ pre code{background:none;border:none;padding:0}
   <button class="iconbtn" id="navtoggle" title="sessions">☰</button>
   <span class="brand">⬡ Console</span>
   <span class="curname" id="curname">— no session —</span>
+  <span class="ctx" id="ctx" title="context-window usage"></span>
   <button class="btn" id="chgbtn">± Changes<span id="chBadge">0</span></button>
   <a class="navlink" href="/">Observer</a>
   <span class="status"><span class="dot" id="dot"></span><span id="statxt">idle</span></span>
@@ -1506,7 +1627,7 @@ pre code{background:none;border:none;padding:0}
   <aside id="sidebar">
     <div class="sb-new">
       <select id="project" title="working directory for a new session"></select>
-      <input id="cwd" placeholder="~/Git/…">
+      <div class="cwdwrap" id="cwdwrap"><input id="cwd" placeholder="type a path…  ↑↓ to pick" autocomplete="off"><div id="cwdac"></div></div>
       <div class="sb-row2">
         <select id="model" title="model"><option value="default">model: default</option><option>opus</option><option>sonnet</option><option>haiku</option></select>
         <select id="mode" title="permission mode"><option value="acceptEdits">⚡ Auto-accept</option><option value="default">🔐 Approve</option><option value="plan">📋 Plan</option><option value="bypassPermissions">⏩ Full auto</option></select>
@@ -1518,15 +1639,23 @@ pre code{background:none;border:none;padding:0}
       <div id="liveList"><div class="sb-empty">none running</div></div>
     </div>
     <div class="sb-sec">
-      <div class="sb-h">Resume from disk <span class="grow"></span><span class="sb-ref" id="resumeRef" title="refresh">↻</span></div>
-      <div id="resumeList"><div class="sb-empty">—</div></div>
+      <div class="sb-h">★ Favorites <span id="favN" class="cnt">0</span></div>
+      <div id="favList"><div class="sb-empty">star a session to pin it here</div></div>
+    </div>
+    <div class="sb-sec">
+      <div class="sb-h">🕘 Recent <span class="grow"></span><span class="sb-ref" id="resumeRef" title="refresh">↻</span></div>
+      <div id="recentList"><div class="sb-empty">—</div></div>
+    </div>
+    <div class="sb-sec">
+      <div class="sb-h">📁 In folder <span class="grow"></span><span id="folderScope" class="fscope"></span></div>
+      <div id="folderList"><div class="sb-empty">—</div></div>
     </div>
   </aside>
   <div id="sb-backdrop"></div>
   <div id="mainCol">
     <div id="chat"><div class="wrap" id="stream"></div></div>
     <div id="composer"><div class="wrap2">
-      <textarea id="ta" rows="1" placeholder="Message Claude Code…  (Enter to send · Shift+Enter newline)" disabled></textarea>
+      <textarea id="ta" rows="1" placeholder="Type a message…  (Enter to send · Shift+Enter newline)" disabled></textarea>
       <button id="stop" title="interrupt / stop" style="display:none">⏹</button>
       <button id="send" disabled>➤</button>
     </div></div>
@@ -1545,7 +1674,7 @@ const stream=$('#stream'), ta=$('#ta'), sendBtn=$('#send');
 let ws=null, running=false, ready=false, cwd='', tools={};
 let sid=null, editCount=0, pendingStart=false, reconnectT=0;
 let showThink=false;
-let liveCCs=new Set(), lastResume=[];
+let liveCCs=new Set(), recentData=[], folderData=[], HOMEDIR='';
 const EDIT_TOOLS=new Set(['Edit','MultiEdit','Write','NotebookEdit']);
 const SKEY='al_session';
 
@@ -1617,7 +1746,7 @@ function setBusy(b){running=b;$('#dot').className='dot '+(b?'busy':(ready?'on':'
   sendBtn.disabled=b||!ready;ta.disabled=!ready;
   $('#stop').style.display=b?'':'none';sendBtn.style.display=b?'none':'';}
 function clearUI(){stream.innerHTML='';$('#edits').innerHTML='<div class="empty">no file changes yet</div>';
-  $('#gitc').innerHTML='<div class="empty">—</div>';tools={};editCount=0;updateEditBadge();ready=false;}
+  $('#gitc').innerHTML='<div class="empty">—</div>';tools={};editCount=0;updateEditBadge();renderCtx(null);ready=false;}
 
 /* file edits → out of chat, into the Changes drawer */
 function updateEditBadge(){$('#editN').textContent=editCount;const b=$('#chBadge');b.textContent=editCount;
@@ -1664,22 +1793,23 @@ function markEnded(msg){ready=false;ta.disabled=true;sendBtn.disabled=true;$('#d
   localStorage.removeItem(SKEY);if(msg)addNotice(msg);}
 function onMsg(e){const m=JSON.parse(e.data);
   if(m.type==='started'){pendingStart=false;sid=m.id;cwd=m.cwd;bindProject(m.cwd);localStorage.setItem(SKEY,sid);
-    ready=true;setBusy(false);ta.focus();setCurname(m.name||'session');syncPickers(m.model,m.mode);statset('ready');
-    addNotice('new session « '+(m.name||'')+' » in '+m.cwd+' — type your first message to begin');reqList();loadResume();}
+    ready=true;setBusy(false);ta.focus();setCurname(m.name||'session');syncPickers(m.model,m.mode);renderCtx(null);statset('ready');
+    addNotice('new session « '+(m.name||'')+' » in '+m.cwd+' — type your first message to begin');reqList();loadPast();}
   else if(m.type==='attached'){clearUI();pendingStart=false;sid=m.id;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
-    ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));syncPickers(m.model,m.mode);statset(m.ended?'ended':'ready');
+    ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));syncPickers(m.model,m.mode);renderCtx(m.ctx);statset(m.ended?'ended':'ready');
     m.events.forEach(route);setBusy(!!m.busy);
     if(m.ended){markEnded('— this session has ended (history shown · you can resume it from disk) —');}
     else{ta.disabled=false;sendBtn.disabled=!!m.busy;addNotice('— '+(m.resumed?'resumed':'reattached to')+' « '+(m.name||'')+' » ('+m.events.length+' events) —');}
-    reqList();loadResume();}
-  else if(m.type==='no_session'){localStorage.removeItem(SKEY);sid=null;ready=false;setBusy(false);setCurname('');statset('idle');
-    addNotice('that session is no longer running — pick it under “Resume from disk”, or ＋ New.');reqList();loadResume();}
+    reqList();loadPast();}
+  else if(m.type==='no_session'){localStorage.removeItem(SKEY);sid=null;ready=false;setBusy(false);setCurname('');renderCtx(null);statset('idle');
+    addNotice('that session is no longer running — pick it under “Resume from disk”, or ＋ New.');reqList();loadPast();}
   else if(m.type==='events')m.events.forEach(route);
   else if(m.type==='stderr')addErr(m.text);
   else if(m.type==='error'){pendingStart=false;addErr('⚠ '+m.error);}
-  else if(m.type==='exit'){if(!pendingStart){markEnded('session process exited (code '+m.code+')');setCurname('');}reqList();loadResume();}
-  else if(m.type==='ended'){if(m.id&&m.id===sid){sid=null;setCurname('');markEnded('session ended');}reqList();loadResume();}
+  else if(m.type==='exit'){if(!pendingStart){markEnded('session process exited (code '+m.code+')');setCurname('');}reqList();loadPast();}
+  else if(m.type==='ended'){if(m.id&&m.id===sid){sid=null;setCurname('');markEnded('session ended');}reqList();loadPast();}
   else if(m.type==='sessions')renderLive(m.sessions);
+  else if(m.type==='context')renderCtx(m.ctx);
 }
 function openWs(cb){const proto=location.protocol==='https:'?'wss:':'ws:';
   ws=new WebSocket(proto+'//'+location.host+'/ws/chat');
@@ -1693,6 +1823,18 @@ function reqList(){wsSend({type:'list'});}
 function reltime(ts){const s=(Date.now()/1000)-ts;if(s<60)return Math.round(s)+'s';
   if(s<3600)return Math.round(s/60)+'m';if(s<86400)return Math.round(s/3600)+'h';return Math.round(s/86400)+'d';}
 function setCurname(t){$('#curname').textContent=t||'— no session —';}
+function fmtTok(n){if(n==null)return '?';
+  if(n>=1e6)return (n/1e6).toFixed(1).replace(/\.0$/,'')+'M';
+  if(n>=1000)return (n/1000).toFixed(n>=1e4?0:1)+'k';
+  return ''+n;}
+function renderCtx(c){const el=$('#ctx');
+  if(!c||c.percentage==null){el.style.display='none';return;}
+  const pct=Math.round(c.percentage);
+  el.className='ctx'+(pct>=85?' hot':(pct>=65?' warn':''));
+  el.style.display='inline-flex';
+  el.innerHTML='<span class="bar"><span class="fill" style="width:'+Math.min(100,pct)+'%"></span></span>'+
+    '<span>'+pct+'% · '+fmtTok(c.totalTokens)+'/'+fmtTok(c.maxTokens)+'</span>';
+  el.title='context '+(c.totalTokens||'?')+' / '+(c.maxTokens||'?')+' tokens ('+pct+'%)'+(c.model?' · '+c.model:'');}
 /* reflect the active session's real model/mode in the pickers (programmatic
    .value set does NOT fire onchange, so this won't echo back to the server) */
 function syncPickers(model,mode){
@@ -1718,20 +1860,69 @@ function renderLive(list){const box=$('#liveList');
     r.querySelector('.sdot').onclick=()=>switchSession(s.id);
     r.querySelector('.sx').onclick=ev=>{ev.stopPropagation();endSessionById(s.id,s.name);};
     box.appendChild(r);});}
-  renderResume(lastResume);
+  renderPast();
 }
-function renderResume(list){const box=$('#resumeList');
-  const items=(list||[]).filter(x=>!liveCCs.has(x.cc)).slice(0,15);
-  if(!items.length){box.innerHTML='<div class="sb-empty">no past sessions</div>';return;}
-  box.innerHTML='';items.forEach(s=>{
-    const r=document.createElement('div');r.className='srow';
-    const proj=(s.cwd||'').split('/').slice(-2).join('/');
-    r.innerHTML='<span class="sdot"></span><div class="smeta">'+
-      '<div class="sname">'+esc(s.title||proj)+'</div>'+
-      '<div class="ssub">↺ '+esc(proj)+' · '+reltime(s.mtime)+'</div></div>';
-    r.onclick=()=>resumeSession(s);box.appendChild(r);});
+
+/* favorites: starred sessions, persisted in localStorage by claude session id */
+const FKEY='al_favs';
+function getFavs(){try{return JSON.parse(localStorage.getItem(FKEY)||'[]');}catch(e){return [];}}
+function isFav(cc){return getFavs().some(f=>f.cc===cc);}
+function toggleFav(s){let a=getFavs();
+  if(a.some(f=>f.cc===s.cc))a=a.filter(f=>f.cc!==s.cc);
+  else a.unshift({cc:s.cc,cwd:s.cwd,name:s.name||'',title:s.title||''});
+  localStorage.setItem(FKEY,JSON.stringify(a));renderPast();}
+
+/* a past-session row: click to resume; star toggles favorite */
+function pastRow(s,fav){const r=document.createElement('div');r.className='srow';
+  const proj=(s.cwd||'').split('/').slice(-2).join('/');
+  const sub=(fav?'':'↺ ')+esc(proj)+(s.mtime?(' · '+reltime(s.mtime)):'');
+  r.innerHTML='<span class="sdot"></span><div class="smeta">'+
+    '<div class="sname">'+esc(s.title||proj||'session')+'</div><div class="ssub">'+sub+'</div></div>'+
+    '<span class="star'+(fav?' on':'')+'" title="'+(fav?'unfavorite':'favorite')+'">'+(fav?'★':'☆')+'</span>';
+  r.querySelector('.smeta').onclick=()=>resumeSession(s);
+  r.querySelector('.sdot').onclick=()=>resumeSession(s);
+  r.querySelector('.star').onclick=ev=>{ev.stopPropagation();toggleFav(s);};
+  return r;}
+
+function renderPast(){
+  const favs=getFavs(),favCC=new Set(favs.map(f=>f.cc));
+  const fb=$('#favList');$('#favN').textContent=favs.length;
+  if(!favs.length)fb.innerHTML='<div class="sb-empty">star a session to pin it here</div>';
+  else{fb.innerHTML='';favs.forEach(f=>fb.appendChild(pastRow(f,true)));}
+  const rec=(recentData||[]).filter(s=>!liveCCs.has(s.cc)&&!favCC.has(s.cc)).slice(0,8);
+  const rb=$('#recentList');
+  if(!rec.length)rb.innerHTML='<div class="sb-empty">no recent sessions</div>';
+  else{rb.innerHTML='';rec.forEach(s=>rb.appendChild(pastRow(s,false)));}
+  const fol=(folderData||[]).filter(s=>!liveCCs.has(s.cc)&&!favCC.has(s.cc)).slice(0,15);
+  const ob=$('#folderList');
+  if(!fol.length)ob.innerHTML='<div class="sb-empty">no past sessions in this folder</div>';
+  else{ob.innerHTML='';fol.forEach(s=>ob.appendChild(pastRow(s,false)));}
 }
-function loadResume(){fetch('api/resumable').then(r=>r.json()).then(j=>{lastResume=j.resumable||[];renderResume(lastResume);}).catch(()=>{});}
+function currentFolder(){const p=$('#project').value;
+  return p==='__custom__'?$('#cwd').value.trim():(p||'');}
+function loadPast(){const folder=currentFolder();
+  $('#folderScope').textContent=folder?(folder.split('/').filter(Boolean).slice(-1)[0]||folder):'';
+  fetch('api/resumable').then(r=>r.json()).then(j=>{recentData=j.resumable||[];renderPast();}).catch(()=>{});
+  if(folder)fetch('api/resumable?cwd='+encodeURIComponent(folder)).then(r=>r.json()).then(j=>{folderData=j.resumable||[];renderPast();}).catch(()=>{});
+  else{folderData=[];renderPast();}}
+
+/* directory autocomplete for the custom path box (server /api/dircomplete) */
+let acItems=[],acSel=-1,acTimer=0;
+function acClose(){const b=$('#cwdac');b.classList.remove('on');b.innerHTML='';acItems=[];acSel=-1;}
+function acRender(j){const b=$('#cwdac');acItems=(j&&j.dirs)||[];acSel=-1;
+  if(!acItems.length){acClose();return;}
+  let html=acItems.map((p,i)=>{const base=(p.split('/').filter(Boolean).slice(-1)[0])||p;
+    return '<div class="acitem" data-i="'+i+'"><div class="acname">'+esc(base)+'</div><div class="acpath">'+esc(p)+'</div></div>';}).join('');
+  if(j&&j.more)html+='<div class="acmore">… more — keep typing to narrow</div>';
+  b.innerHTML=html;b.classList.add('on');
+  b.querySelectorAll('.acitem').forEach(el=>el.onmousedown=ev=>{ev.preventDefault();acPick(+el.dataset.i);});}
+function acPick(i){if(i<0||i>=acItems.length)return;
+  $('#cwd').value=acItems[i]+'/';   /* auto-append slash → keep drilling with the mouse, no typing */
+  $('#cwd').focus();loadPast();acQuery();}
+function acMove(d){const els=$('#cwdac').querySelectorAll('.acitem');if(!els.length)return;
+  acSel=(acSel+d+els.length)%els.length;els.forEach((el,i)=>el.classList.toggle('sel',i===acSel));els[acSel].scrollIntoView({block:'nearest'});}
+function acQuery(){clearTimeout(acTimer);const q=$('#cwd').value;
+  acTimer=setTimeout(()=>fetch('api/dircomplete?q='+encodeURIComponent(q)).then(r=>r.json()).then(acRender).catch(acClose),130);}
 
 function switchSession(id){if(!id||id===sid)return;clearUI();statset('switching…');wsSend({type:'attach',id:id});
   if(window.innerWidth<=860)closeSidebar();}
@@ -1750,7 +1941,7 @@ function endSessionById(id,name){if(!id)return;
   if(!confirm('End session '+(name?'« '+name+' »':'')+'?\nIts claude process stops; you can still resume it from disk later.'))return;
   wsSend({type:'end',id:id});
   if(id===sid){sid=null;setCurname('');markEnded('session ended');}
-  reqList();loadResume();}
+  reqList();loadPast();}
 function sendMsg(){const t=ta.value.trim();if(!t||!ready||running||!sid||!ws||ws.readyState!==1)return;
   wsSend({type:'user',text:t});ta.value='';ta.style.height='auto';setBusy(true);}
 
@@ -1782,7 +1973,7 @@ $('#stop').onclick=()=>{wsSend({type:'interrupt'});addNotice('⏹ interrupt sent
 $('#newbtn').onclick=newSession;
 $('#navtoggle').onclick=toggleSidebar;
 $('#sb-backdrop').onclick=closeSidebar;
-$('#resumeRef').onclick=loadResume;
+$('#resumeRef').onclick=loadPast;
 /* model/mode: apply live to the active session; otherwise just seed the next New */
 $('#model').onchange=()=>{if(sid&&ws&&ws.readyState===1)wsSend({type:'set_model',model:$('#model').value});};
 $('#mode').onchange=()=>{if(sid&&ws&&ws.readyState===1)wsSend({type:'set_mode',mode:$('#mode').value});};
@@ -1792,18 +1983,37 @@ $('#chgbtn').onclick=()=>{if(drawerOpen())$('#drawer').classList.remove('open');
 $('#dclose').onclick=()=>$('#drawer').classList.remove('open');
 $('#grefresh').onclick=refreshGit;
 $('#project').onchange=()=>{const c=$('#project').value==='__custom__';
-  $('#cwd').style.display=c?'block':'none';if(c){if(!$('#cwd').value)$('#cwd').value='~/Git/';$('#cwd').focus();}};
+  $('#cwdwrap').classList.toggle('show',c);
+  if(c){if(!$('#cwd').value)$('#cwd').value=HOMEDIR?(HOMEDIR+'/'):'';$('#cwd').focus();acQuery();}else acClose();
+  loadPast();};
+$('#cwd').addEventListener('input',acQuery);
+$('#cwd').addEventListener('focus',acQuery);
+$('#cwd').addEventListener('change',loadPast);
+$('#cwd').addEventListener('blur',()=>setTimeout(acClose,160));
+$('#cwd').addEventListener('keydown',e=>{const b=$('#cwdac');if(!b.classList.contains('on'))return;
+  if(e.key==='ArrowDown'){e.preventDefault();acMove(1);}
+  else if(e.key==='ArrowUp'){e.preventDefault();acMove(-1);}
+  else if(e.key==='Enter'&&acSel>=0){e.preventDefault();acPick(acSel);}
+  else if(e.key==='Escape')acClose();});
 
 /* project picker: real projects (recent dirs + git repos under ~/Git) */
-(async function(){try{const r=await fetch('api/projects');const j=await r.json();const sel=$('#project');
-  j.projects.forEach(p=>{const o=document.createElement('option');o.value=p.path;
-    o.textContent=(p.recent?'★ ':'')+p.path.split('/').slice(-2).join('/');o.title=p.path;sel.appendChild(o);});
-  const c=document.createElement('option');c.value='__custom__';c.textContent='custom path…';sel.appendChild(c);
+(async function(){try{const r=await fetch('api/projects');const j=await r.json();HOMEDIR=j.home||'';const sel=$('#project');
+  /* Custom path… first (easy to reach); recent vs git-repos as labelled groups
+     instead of a ★ marker (★ now means "favorite" in the session lists) */
+  const cust=document.createElement('option');cust.value='__custom__';cust.textContent='✎  Custom path…';sel.appendChild(cust);
+  const mk=(label,items)=>{if(!items.length)return;const g=document.createElement('optgroup');g.label=label;
+    items.forEach(p=>{const o=document.createElement('option');o.value=p.path;o.textContent=p.path.split('/').slice(-2).join('/');o.title=p.path;g.appendChild(o);});sel.appendChild(g);};
+  const recent=(j.projects||[]).filter(p=>p.recent), repos=(j.projects||[]).filter(p=>!p.recent);
+  mk('Recent',recent); mk('Git repos (~/Git)',repos);
+  const first=recent[0]||repos[0];
+  sel.value=first?first.path:'__custom__';
+  $('#cwdwrap').classList.toggle('show',sel.value==='__custom__');
+  loadPast();
 }catch(e){}})();
 
 setInterval(()=>reqList(),8000);
-setInterval(loadResume,30000);
-loadResume();
+setInterval(loadPast,30000);
+loadPast();
 openWs();
 </script>
 </body>
@@ -1817,6 +2027,7 @@ def main():
         (r"/api/sessions", SessionsHandler),
         (r"/api/projects", ProjectsHandler),
         (r"/api/resumable", ResumableHandler),
+        (r"/api/dircomplete", DirCompleteHandler),
         (r"/api/diff", DiffHandler),
         (r"/ws/events", EventsSocket),
         (r"/ws/chat", ChatSocket),
