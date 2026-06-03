@@ -369,6 +369,33 @@ def find_transcript(cc):
     return hits[0] if hits else None
 
 
+def trash_transcript(cc):
+    """Move a claude session's on-disk transcript to the trash (reversible) — the
+    sidebar 🗑 uses this to clean resumable sessions out of a folder. Prefers
+    `gio trash`; falls back to an in-place rename if gio is unavailable."""
+    if not _valid_cc(cc):
+        return {"ok": False, "error": "invalid session id"}
+    path = find_transcript(cc)
+    if not path:
+        return {"ok": False, "error": "transcript not found"}
+    try:
+        subprocess.run(["gio", "trash", path], check=True,
+                       capture_output=True, timeout=10)
+        return {"ok": True}
+    except FileNotFoundError:
+        pass  # gio not installed — fall through to the rename fallback
+    except subprocess.CalledProcessError as ex:
+        err = (ex.stderr or b"").decode("utf-8", "replace").strip()
+        return {"ok": False, "error": err or "gio trash failed"}
+    except Exception as ex:
+        return {"ok": False, "error": str(ex)}
+    try:
+        os.rename(path, "%s.trashed-%d" % (path, int(time.time())))
+        return {"ok": True}
+    except Exception as ex:
+        return {"ok": False, "error": str(ex)}
+
+
 def load_transcript_events(cc, cap=2000):
     """Parse a saved transcript into console events, for preload on --resume."""
     path = find_transcript(cc)
@@ -988,6 +1015,16 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             self.session.set_mode(msg.get("mode") or "")
         elif mt == "user" and self.session:
             self.session.send_user(msg.get("text", ""))
+        elif mt == "del_resumable":
+            # Sidebar 🗑: move a resumable session's transcript to the trash.
+            cc = msg.get("cc")
+            for s in list(CHAT_SESSIONS.values()):
+                if s.cc_id == cc:          # end a live session resumed from it first
+                    s.terminate()
+                    CHAT_SESSIONS.pop(s.id, None)
+            res = trash_transcript(cc)
+            self._say({"type": "resumable_deleted", "cc": cc,
+                       "ok": bool(res.get("ok")), "error": res.get("error")})
         elif mt == "end":
             # End a specific session by id (sidebar ✕) or the active one.
             # Ending a background session never disturbs the active stream.
@@ -1206,6 +1243,8 @@ pre code{background:none;border:none;padding:0}
 .srow .star{flex-shrink:0;font-size:13px;padding:0 3px;color:var(--mut);cursor:pointer}
 .srow .star.on{color:var(--tool)}
 .srow .star:hover{color:var(--tool);filter:brightness(1.2)}
+.srow .strash{flex-shrink:0;font-size:12.5px;padding:0 3px;cursor:pointer;opacity:0}
+.srow:hover .strash{opacity:.5}.srow .strash:hover{opacity:1;filter:brightness(1.3) saturate(1.4)}
 .fscope{font-size:10px;color:var(--mut);font-family:ui-monospace,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:130px}
 #sb-backdrop{display:none}
 @media(max-width:860px){
@@ -1442,6 +1481,7 @@ function onMsg(e){const m=JSON.parse(e.data);
   else if(m.type==='error'){pendingStart=false;addErr('⚠ '+m.error);}
   else if(m.type==='exit'){if(!pendingStart){markEnded('session process exited (code '+m.code+')');setCurname('');}reqList();loadPast();}
   else if(m.type==='ended'){if(m.id&&m.id===sid){sid=null;setCurname('');markEnded('session ended');}reqList();loadPast();}
+  else if(m.type==='resumable_deleted'){addNotice(m.ok?'🗑 session moved to trash':('delete failed: '+(m.error||'?')));loadPast();}
   else if(m.type==='sessions')renderLive(m.sessions);
   else if(m.type==='context')renderCtx(m.ctx);
 }
@@ -1512,11 +1552,22 @@ function pastRow(s,fav){const r=document.createElement('div');r.className='srow'
   const sub=(fav?'':'↺ ')+esc(proj)+(s.mtime?(' · '+reltime(s.mtime)):'');
   r.innerHTML='<span class="sdot"></span><div class="smeta">'+
     '<div class="sname">'+esc(s.title||proj||'session')+'</div><div class="ssub">'+sub+'</div></div>'+
-    '<span class="star'+(fav?' on':'')+'" title="'+(fav?'unfavorite':'favorite')+'">'+(fav?'★':'☆')+'</span>';
+    '<span class="star'+(fav?' on':'')+'" title="'+(fav?'unfavorite':'favorite')+'">'+(fav?'★':'☆')+'</span>'+
+    '<span class="strash" title="delete from disk (moves to trash)">🗑</span>';
   r.querySelector('.smeta').onclick=()=>resumeSession(s);
   r.querySelector('.sdot').onclick=()=>resumeSession(s);
   r.querySelector('.star').onclick=ev=>{ev.stopPropagation();toggleFav(s);};
+  r.querySelector('.strash').onclick=ev=>{ev.stopPropagation();delResumable(s);};
   return r;}
+function delResumable(s){
+  if(!confirm('Delete this session from disk?\n\n'+(s.title||s.name||s.cc||'session')+
+    '\n\nIt is moved to the trash (recoverable), not permanently deleted.'))return;
+  wsSend({type:'del_resumable',cc:s.cc});
+  /* optimistic: drop it from favorites + cached lists so it vanishes at once */
+  localStorage.setItem(FKEY,JSON.stringify(getFavs().filter(f=>f.cc!==s.cc)));
+  recentData=(recentData||[]).filter(x=>x.cc!==s.cc);
+  folderData=(folderData||[]).filter(x=>x.cc!==s.cc);
+  renderPast();}
 
 function renderPast(){
   const favs=getFavs(),favCC=new Set(favs.map(f=>f.cc));
