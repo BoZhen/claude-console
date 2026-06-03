@@ -396,6 +396,50 @@ def trash_transcript(cc):
         return {"ok": False, "error": str(ex)}
 
 
+NAMES_FILE = os.path.join(HOME, ".claude", "console-names.json")
+_names_cache = {"mtime": -1.0, "v": {}}
+
+def load_names():
+    """Custom session labels {claude_session_id: name} that override the auto
+    title. Cached; invalidated by the file's mtime."""
+    try:
+        m = os.path.getmtime(NAMES_FILE)
+    except OSError:
+        _names_cache["mtime"], _names_cache["v"] = -1.0, {}
+        return _names_cache["v"]
+    if m != _names_cache["mtime"]:
+        try:
+            with open(NAMES_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+            _names_cache["v"] = d if isinstance(d, dict) else {}
+        except Exception:
+            _names_cache["v"] = {}
+        _names_cache["mtime"] = m
+    return _names_cache["v"]
+
+
+def set_name(cc, name):
+    """Set (or, when name is blank, clear) the custom label for a session."""
+    if not _valid_cc(cc):
+        return False
+    names = dict(load_names())
+    name = (name or "").strip()[:120]
+    if name:
+        names[cc] = name
+    else:
+        names.pop(cc, None)
+    try:
+        os.makedirs(os.path.dirname(NAMES_FILE), exist_ok=True)
+        tmp = NAMES_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(names, f, ensure_ascii=False)
+        os.replace(tmp, NAMES_FILE)
+        _names_cache["mtime"] = -1.0
+        return True
+    except Exception:
+        return False
+
+
 def load_transcript_events(cc, cap=2000):
     """Parse a saved transcript into console events, for preload on --resume."""
     path = find_transcript(cc)
@@ -432,7 +476,8 @@ def list_resumable(cwd=None, limit=20):
             continue
         cc = os.path.splitext(os.path.basename(s["id"]))[0]
         out.append({"cc": cc, "cwd": scwd, "name": os.path.basename(scwd) or scwd,
-                    "title": s.get("title", ""), "mtime": s.get("mtime", 0)})
+                    "title": load_names().get(cc) or s.get("title", ""),
+                    "mtime": s.get("mtime", 0)})
         if len(out) >= limit:
             break
     return out
@@ -660,7 +705,11 @@ class ChatSession:
             self.log = load_transcript_events(self.resume_cc)
 
     def title(self):
-        """First user message, as a short label to disambiguate sessions."""
+        """Custom label if the user set one, else the first user message."""
+        if self.cc_id:
+            nm = load_names().get(self.cc_id)
+            if nm:
+                return nm
         for e in self.log:
             if e.get("kind") == "user_text" and (e.get("text") or "").strip():
                 return e["text"].strip().replace("\n", " ")[:60]
@@ -1025,6 +1074,12 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             res = trash_transcript(cc)
             self._say({"type": "resumable_deleted", "cc": cc,
                        "ok": bool(res.get("ok")), "error": res.get("error")})
+        elif mt == "rename":
+            # Sidebar ✎: set/clear a custom label for a session (by claude id).
+            cc = msg.get("cc")
+            ok = set_name(cc, msg.get("name") or "")
+            self._say({"type": "renamed", "cc": cc,
+                       "name": (msg.get("name") or "").strip()[:120], "ok": bool(ok)})
         elif mt == "end":
             # End a specific session by id (sidebar ✕) or the active one.
             # Ending a background session never disturbs the active stream.
@@ -1245,6 +1300,8 @@ pre code{background:none;border:none;padding:0}
 .srow .star:hover{color:var(--tool);filter:brightness(1.2)}
 .srow .strash{flex-shrink:0;font-size:12.5px;padding:0 3px;cursor:pointer;opacity:0}
 .srow:hover .strash{opacity:.5}.srow .strash:hover{opacity:1;filter:brightness(1.3) saturate(1.4)}
+.srow .spen{flex-shrink:0;font-size:12px;padding:0 2px;color:var(--mut);cursor:pointer;opacity:0}
+.srow:hover .spen{opacity:.5}.srow .spen:hover{opacity:1;color:var(--acc)}
 .fscope{font-size:10px;color:var(--mut);font-family:ui-monospace,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:130px}
 #sb-backdrop{display:none}
 @media(max-width:860px){
@@ -1314,7 +1371,7 @@ pre code{background:none;border:none;padding:0}
 const $=s=>document.querySelector(s);
 const stream=$('#stream'), ta=$('#ta'), sendBtn=$('#send');
 let ws=null, running=false, ready=false, cwd='', tools={};
-let sid=null, editCount=0, pendingStart=false, reconnectT=0;
+let sid=null, curCC=null, editCount=0, pendingStart=false, reconnectT=0;
 let showThink=false;
 let liveCCs=new Set(), recentData=[], folderData=[], HOMEDIR='';
 const EDIT_TOOLS=new Set(['Edit','MultiEdit','Write','NotebookEdit']);
@@ -1448,7 +1505,7 @@ function resolveQuestionCard(aid,ans){const c=stream.querySelector('.question[da
   if(bt)bt.insertAdjacentHTML('afterend','<div class="qdone">'+(has?'✓ '+vals.map(esc).join(' · '):'✕ dismissed')+'</div>');}
 function route(ev){
   if(ev.kind==='user_text')addUser(ev.text);
-  else if(ev.kind==='ready'){ready=true;cwd=ev.cwd||cwd;addNotice('● session ready · '+(ev.model||'')+' · '+(ev.cwd||''));}
+  else if(ev.kind==='ready'){ready=true;cwd=ev.cwd||cwd;curCC=ev.session_id||curCC;addNotice('● session ready · '+(ev.model||'')+' · '+(ev.cwd||''));}
   else if(ev.kind==='assistant_text')addAsst(ev.text);
   else if(ev.kind==='thinking')addThink(ev.text);
   else if(ev.kind==='tool_use'){if(EDIT_TOOLS.has(ev.tool)){addEditCard(ev);addMarker(ev);}else addTool(ev);}
@@ -1468,7 +1525,7 @@ function onMsg(e){const m=JSON.parse(e.data);
   if(m.type==='started'){pendingStart=false;sid=m.id;cwd=m.cwd;bindProject(m.cwd);localStorage.setItem(SKEY,sid);
     ready=true;setBusy(false);ta.focus();setCurname(m.name||'session');syncPickers(m.model,m.mode);renderCtx(null);statset('ready');
     addNotice('new session « '+(m.name||'')+' » in '+m.cwd+' — type your first message to begin');reqList();loadPast();}
-  else if(m.type==='attached'){clearUI();pendingStart=false;sid=m.id;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
+  else if(m.type==='attached'){clearUI();pendingStart=false;sid=m.id;curCC=m.cc||null;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
     ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));syncPickers(m.model,m.mode);renderCtx(m.ctx);statset(m.ended?'ended':'ready');
     m.events.forEach(route);setBusy(!!m.busy);
     if(m.ended){markEnded('— this session has ended (history shown · you can resume it from disk) —');}
@@ -1482,6 +1539,7 @@ function onMsg(e){const m=JSON.parse(e.data);
   else if(m.type==='exit'){if(!pendingStart){markEnded('session process exited (code '+m.code+')');setCurname('');}reqList();loadPast();}
   else if(m.type==='ended'){if(m.id&&m.id===sid){sid=null;setCurname('');markEnded('session ended');}reqList();loadPast();}
   else if(m.type==='resumable_deleted'){addNotice(m.ok?'🗑 session moved to trash':('delete failed: '+(m.error||'?')));loadPast();}
+  else if(m.type==='renamed'){if(m.ok){if(m.cc&&m.cc===curCC&&m.name)setCurname(m.name);addNotice('✎ renamed');reqList();loadPast();}else addNotice('rename failed');}
   else if(m.type==='sessions')renderLive(m.sessions);
   else if(m.type==='context')renderCtx(m.ctx);
 }
@@ -1529,9 +1587,11 @@ function renderLive(list){const box=$('#liveList');
     r.innerHTML='<span class="sdot '+dot+'"></span><div class="smeta">'+
       '<div class="sname">'+esc(s.title||s.name||'new session')+(s.ended?' · ended':'')+'</div>'+
       '<div class="ssub">'+esc(proj)+' · '+s.n+(s.busy?' · working…':'')+'</div></div>'+
+      '<span class="spen" title="rename">✎</span>'+
       '<span class="sx" title="end session">✕</span>';
     r.querySelector('.smeta').onclick=()=>switchSession(s.id);
     r.querySelector('.sdot').onclick=()=>switchSession(s.id);
+    r.querySelector('.spen').onclick=ev=>{ev.stopPropagation();renameSession(s.cc,s.title||s.name);};
     r.querySelector('.sx').onclick=ev=>{ev.stopPropagation();endSessionById(s.id,s.name);};
     box.appendChild(r);});}
   renderPast();
@@ -1552,13 +1612,20 @@ function pastRow(s,fav){const r=document.createElement('div');r.className='srow'
   const sub=(fav?'':'↺ ')+esc(proj)+(s.mtime?(' · '+reltime(s.mtime)):'');
   r.innerHTML='<span class="sdot"></span><div class="smeta">'+
     '<div class="sname">'+esc(s.title||proj||'session')+'</div><div class="ssub">'+sub+'</div></div>'+
+    '<span class="spen" title="rename">✎</span>'+
     '<span class="star'+(fav?' on':'')+'" title="'+(fav?'unfavorite':'favorite')+'">'+(fav?'★':'☆')+'</span>'+
     '<span class="strash" title="delete from disk (moves to trash)">🗑</span>';
   r.querySelector('.smeta').onclick=()=>resumeSession(s);
   r.querySelector('.sdot').onclick=()=>resumeSession(s);
+  r.querySelector('.spen').onclick=ev=>{ev.stopPropagation();renameSession(s.cc,s.title);};
   r.querySelector('.star').onclick=ev=>{ev.stopPropagation();toggleFav(s);};
   r.querySelector('.strash').onclick=ev=>{ev.stopPropagation();delResumable(s);};
   return r;}
+function renameSession(cc,cur){
+  if(!cc){alert('This session is still starting — try again in a moment.');return;}
+  const nm=prompt('Rename session (leave empty to reset to the auto name):',cur||'');
+  if(nm===null)return;
+  wsSend({type:'rename',cc:cc,name:nm});}
 function delResumable(s){
   if(!confirm('Delete this session from disk?\n\n'+(s.title||s.name||s.cc||'session')+
     '\n\nIt is moved to the trash (recoverable), not permanently deleted.'))return;
