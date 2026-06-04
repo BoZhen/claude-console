@@ -464,8 +464,9 @@ def load_prefs():
     return _prefs_cache["v"]
 
 
-def save_pref(cc, mode=None, model=None, effort=None):
-    """Persist a session's mode/model/effort. No-op write when unchanged."""
+def save_pref(cc, mode=None, model=None, effort=None, fav=None):
+    """Persist a session's mode/model/effort/favorite. No-op write when unchanged.
+    fav: a dict {cwd,name,title,ts} stars the session; a falsy value unstars it."""
     if not _valid_cc(cc):
         return
     prefs = load_prefs()
@@ -476,9 +477,18 @@ def save_pref(cc, mode=None, model=None, effort=None):
         cur["model"] = model
     if effort is not None:
         cur["effort"] = effort
+    if fav is not None:
+        if fav:
+            cur["fav"] = fav
+        else:
+            cur.pop("fav", None)
     if cur == prefs.get(cc):
         return
-    prefs = dict(prefs); prefs[cc] = cur
+    prefs = dict(prefs)
+    if cur:
+        prefs[cc] = cur
+    else:
+        prefs.pop(cc, None)   # don't leave an empty entry behind
     try:
         os.makedirs(os.path.dirname(PREFS_FILE), exist_ok=True)
         tmp = PREFS_FILE + ".tmp"
@@ -488,6 +498,20 @@ def save_pref(cc, mode=None, model=None, effort=None):
         _prefs_cache["mtime"] = -1.0
     except Exception:
         pass
+
+
+def list_favorites():
+    """All starred sessions across every device, newest-starred first."""
+    out = []
+    for cc, p in load_prefs().items():
+        f = p.get("fav") if isinstance(p, dict) else None
+        if isinstance(f, dict):
+            out.append({"cc": cc, "cwd": f.get("cwd", ""), "name": f.get("name", ""),
+                        "title": f.get("title", ""), "ts": f.get("ts", 0)})
+    out.sort(key=lambda x: x.get("ts", 0), reverse=True)
+    for x in out:
+        x.pop("ts", None)
+    return out
 
 
 _usage_cache = {"t": 0.0, "v": None}
@@ -1221,17 +1245,26 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
     def check_origin(self, origin):
         return True
 
+    clients = set()          # every open socket — for cross-device favorite sync
+
     def open(self):
         if AUTH and not self._ok_auth():
             self.close(4401, "Unauthorized")
             return
         self.session = None
+        ChatSocket.clients.add(self)
+        self._say({"type": "favorites", "favorites": list_favorites()})
 
     def _say(self, obj):
         try:
             self.write_message(json.dumps(obj))
         except Exception:
             pass
+
+    def _broadcast_favorites(self):
+        favs = list_favorites()
+        for ws in list(ChatSocket.clients):
+            ws._say({"type": "favorites", "favorites": favs})
 
     async def on_message(self, raw):
         try:
@@ -1371,8 +1404,23 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                     s.terminate()
                     CHAT_SESSIONS.pop(s.id, None)
             res = trash_transcript(cc)
+            save_pref(cc, fav=False)       # a trashed session can't stay starred
             self._say({"type": "resumable_deleted", "cc": cc,
                        "ok": bool(res.get("ok")), "error": res.get("error")})
+            self._broadcast_favorites()
+        elif mt == "set_favorite":
+            # Star/unstar a session; persisted server-side and broadcast so every
+            # device shares one favorites list. Starring carries a metadata snapshot.
+            cc = msg.get("cc")
+            if _valid_cc(cc):
+                if msg.get("fav"):
+                    save_pref(cc, fav={"cwd": msg.get("cwd") or "",
+                                       "name": (msg.get("name") or "")[:120],
+                                       "title": (msg.get("title") or "")[:200],
+                                       "ts": time.time()})
+                else:
+                    save_pref(cc, fav=False)
+                self._broadcast_favorites()
         elif mt == "rename":
             # Sidebar ✎: set/clear a custom label for a session (by claude id).
             cc = msg.get("cc")
@@ -1406,6 +1454,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
     def on_close(self):
         if self.session:
             self.session.detach(self)   # keep the claude process alive
+        ChatSocket.clients.discard(self)
 
 
 class ConsoleHandler(AuthMixin, tornado.web.RequestHandler):
@@ -1828,7 +1877,7 @@ let sid=null, curCC=null, editCount=0, pendingStart=false, reconnectT=0;
 const EFFORTS=['low','medium','high','xhigh','max'];
 let curEffort=localStorage.getItem('al_effort')||'max';
 let showThink=false;
-let liveCCs=new Set(), recentData=[], folderData=[], HOMEDIR='';
+let liveCCs=new Set(), recentData=[], folderData=[], favData=[], HOMEDIR='';
 const EDIT_TOOLS=new Set(['Edit','MultiEdit','Write','NotebookEdit']);
 const SKEY='al_session';
 
@@ -2056,10 +2105,11 @@ function onMsg(e){const m=JSON.parse(e.data);
   else if(m.type==='renamed'){if(m.ok){if(m.cc&&m.cc===curCC&&m.name)setCurname(m.name);addNotice('✎ renamed');reqList();loadPast();}else addNotice('rename failed');}
   else if(m.type==='sessions')renderLive(m.sessions);
   else if(m.type==='context')renderCtx(m.ctx);
+  else if(m.type==='favorites'){favData=m.favorites||[];renderPast();}
 }
 function openWs(cb){const proto=location.protocol==='https:'?'wss:':'ws:';
   ws=new WebSocket(proto+'//'+location.host+'/ws/chat');
-  ws.onopen=()=>{clearTimeout(reconnectT);$('#dot').className='dot '+(ready?'on':'');if(cb)cb();reqList();
+  ws.onopen=()=>{clearTimeout(reconnectT);$('#dot').className='dot '+(ready?'on':'');if(cb)cb();reqList();maybeMigrateFavs();
     const saved=localStorage.getItem(SKEY);if(saved&&!sid&&!pendingStart){statset('reattaching…');ws.send(JSON.stringify({type:'attach',id:saved}));}};
   ws.onclose=()=>{$('#dot').className='dot';statset('disconnected');ta.disabled=true;sendBtn.disabled=true;
     clearTimeout(reconnectT);reconnectT=setTimeout(()=>openWs(),1800);};
@@ -2183,14 +2233,25 @@ function renderLive(list){const box=$('#liveList');
   renderPast();
 }
 
-/* favorites: starred sessions, persisted in localStorage by claude session id */
-const FKEY='al_favs';
-function getFavs(){try{return JSON.parse(localStorage.getItem(FKEY)||'[]');}catch(e){return [];}}
-function isFav(cc){return getFavs().some(f=>f.cc===cc);}
-function toggleFav(s){let a=getFavs();
-  if(a.some(f=>f.cc===s.cc))a=a.filter(f=>f.cc!==s.cc);
-  else a.unshift({cc:s.cc,cwd:s.cwd,name:s.name||'',title:s.title||''});
-  localStorage.setItem(FKEY,JSON.stringify(a));renderPast();}
+/* favorites: starred sessions, persisted SERVER-SIDE by claude session id so every
+   device shares one list. favData mirrors the server; the server pushes it on connect
+   and re-broadcasts on every change. */
+const FKEY='al_favs';   /* legacy per-device store — read once to migrate, then ignored */
+function getFavs(){return favData;}
+function isFav(cc){return favData.some(f=>f.cc===cc);}
+function toggleFav(s){
+  if(isFav(s.cc)){favData=favData.filter(f=>f.cc!==s.cc);
+    wsSend({type:'set_favorite',cc:s.cc,fav:false});}
+  else{favData=[{cc:s.cc,cwd:s.cwd||'',name:s.name||'',title:s.title||''},...favData];
+    wsSend({type:'set_favorite',cc:s.cc,fav:true,cwd:s.cwd||'',name:s.name||'',title:s.title||''});}
+  renderPast();}
+function maybeMigrateFavs(){   /* one-time: lift this device's old localStorage stars to the server */
+  if(localStorage.getItem('al_favs_migrated'))return;
+  if(!ws||ws.readyState!==1)return;        /* need the socket open; onopen retries */
+  let old=[];try{old=JSON.parse(localStorage.getItem(FKEY)||'[]');}catch(e){}
+  old.forEach(f=>{if(f&&f.cc)wsSend({type:'set_favorite',cc:f.cc,fav:true,
+    cwd:f.cwd||'',name:f.name||'',title:f.title||''});});
+  localStorage.setItem('al_favs_migrated','1');}
 
 /* a past-session row: click to resume; star toggles favorite */
 function pastRow(s,fav){const r=document.createElement('div');r.className='srow';
@@ -2216,7 +2277,7 @@ function delResumable(s){
     '\n\nIt is moved to the trash (recoverable), not permanently deleted.'))return;
   wsSend({type:'del_resumable',cc:s.cc});
   /* optimistic: drop it from favorites + cached lists so it vanishes at once */
-  localStorage.setItem(FKEY,JSON.stringify(getFavs().filter(f=>f.cc!==s.cc)));
+  favData=favData.filter(f=>f.cc!==s.cc);
   recentData=(recentData||[]).filter(x=>x.cc!==s.cc);
   folderData=(folderData||[]).filter(x=>x.cc!==s.cc);
   renderPast();}
