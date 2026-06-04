@@ -563,7 +563,7 @@ def fetch_usage():
         return _usage_cache["v"]
 
 
-def load_transcript_events(cc, cap=2000):
+def load_transcript_events(cc, cap=1000):
     """Parse a saved transcript into console events, for preload on --resume."""
     path = find_transcript(cc)
     if not path:
@@ -1227,8 +1227,8 @@ class ChatSession:
 
     def _push(self, evs):
         self.log.extend(evs)
-        if len(self.log) > 5000:
-            self.log = self.log[-5000:]
+        if len(self.log) > 1500:
+            self.log = self.log[-1500:]
         self._emit({"type": "events", "events": evs})
 
     def terminate(self):
@@ -1915,15 +1915,25 @@ function md(src){
   return h;
 }
 /* render protected LaTeX spans with KaTeX (textContent decodes the escaped TeX) */
+/* lazy KaTeX: defer typesetting until a math node scrolls near the viewport — a big
+   win when replaying a long, math-heavy transcript on attach/switch (no up-front burst). */
+let _mathObs=null;
+function _mathObserver(){if(_mathObs)return _mathObs;
+  _mathObs=new IntersectionObserver(es=>{es.forEach(en=>{if(en.isIntersecting){_renderMathEl(en.target);_mathObs.unobserve(en.target);}});},
+    {root:$('#chat'),rootMargin:'1200px 0px'});return _mathObs;}
+function _renderMathEl(el){if(!window.katex||el.dataset.done)return;el.dataset.done='1';
+  try{katex.render(el.textContent,el,{displayMode:el.dataset.d==='1',throwOnError:false,errorColor:'#f85149'});}catch(e){}}
 function typesetMath(root){if(!window.katex)return;
-  root.querySelectorAll('.math').forEach(el=>{if(el.dataset.done)return;el.dataset.done='1';
-    try{katex.render(el.textContent,el,{displayMode:el.dataset.d==='1',throwOnError:false,errorColor:'#f85149'});}catch(e){}});}
+  root.querySelectorAll('.math:not([data-done])').forEach(el=>_mathObserver().observe(el));}
 function diffHtml(t){return t.split('\n').map(l=>{let c='dl-ctx';
   if(l.startsWith('@@')||l.startsWith('diff ')||l.startsWith('+++')||l.startsWith('---'))c='dl-hdr';
   else if(l.startsWith('+'))c='dl-add';else if(l.startsWith('-'))c='dl-del';
   return '<div class="diffline '+c+'">'+esc(l||' ')+'</div>';}).join('');}
-function atBottom(){const c=$('#chat');return c.scrollHeight-c.scrollTop-c.clientHeight<140;}
-function scroll(){const c=$('#chat');c.scrollTop=c.scrollHeight;}
+let replaying=false;   /* true while bulk-replaying a session log on attach — suppresses
+                          per-event atBottom/scroll so we don't force 1000s of reflows;
+                          a single scroll-to-bottom runs once at the end instead. */
+function atBottom(){if(replaying)return false;const c=$('#chat');return c.scrollHeight-c.scrollTop-c.clientHeight<140;}
+function scroll(){if(replaying)return;const c=$('#chat');c.scrollTop=c.scrollHeight;}
 
 const ICON={Edit:'✏️',MultiEdit:'✏️',Write:'📝',Bash:'▶',Read:'📖',Glob:'🔍',Grep:'🔍',Task:'🤖',
   WebFetch:'🌐',WebSearch:'🌐',TodoWrite:'☑️',NotebookEdit:'📓'};
@@ -1956,8 +1966,10 @@ function addTool(ev){const s=atBottom();const c=document.createElement('div');c.
   const cn=counts(ev);const cnt=cn?('<span class="a">+'+cn.a+'</span> <span class="d">−'+cn.d+'</span>'):'';
   c.innerHTML='<div class="th"><span class="ico">'+(ICON[ev.tool]||'🔧')+'</span><span class="tn">'+esc(ev.tool)+'</span>'+
     '<span class="tp">'+esc(primaryArg(ev.input))+'</span><span class="cnt">'+cnt+'</span><span class="chev">▸</span></div>'+
-    '<div class="tb">'+toolBody(ev)+'<div class="res"></div></div>';
-  c.querySelector('.th').onclick=()=>c.classList.toggle('open');
+    '<div class="tb"><div class="res"></div></div>';
+  c._ev=ev;   /* lazy: build the (maybe large) body only on first expand */
+  c.querySelector('.th').onclick=()=>{const open=c.classList.toggle('open');
+    if(open&&!c._bodyDone){c._bodyDone=1;c.querySelector('.res').insertAdjacentHTML('beforebegin',toolBody(c._ev));}};
   stream.appendChild(c);if(ev.toolId)tools[ev.toolId]=c;if(s)scroll();}
 function addResult(ev){const c=tools[ev.toolId];if(!c)return;if(ev.isError)c.classList.add('err');
   const b=(ev.content||'').trim();c.querySelector('.res').innerHTML='<div class="reslabel">'+(ev.isError?'error ⤵':'output ⤵')+
@@ -2015,9 +2027,13 @@ function addEditCard(ev){if(editCount===0)$('#edits').innerHTML='';
   const c=document.createElement('div');c.className='ecard';const cn=counts(ev);
   const cnt=cn?('<span class="cnt"><span class="a">+'+cn.a+'</span> <span class="d">−'+cn.d+'</span></span>'):'';
   c.innerHTML='<div class="eh"><span>'+(ICON[ev.tool]||'✏️')+'</span><span class="ef">'+esc(primaryArg(ev.input)||ev.tool)+'</span>'+cnt+'</div>'+
-    '<div class="ed">'+toolBody(ev)+'</div><div class="res"></div>';
+    '<div class="ed"></div><div class="res"></div>';
+  c._ev=ev;   /* lazy: build the diff only when the Changes drawer is actually shown */
+  if(drawerOpen()&&!gitTab()){c._bodyDone=1;c.querySelector('.ed').innerHTML=toolBody(ev);}
   $('#edits').appendChild(c);if(ev.toolId)tools[ev.toolId]=c;editCount++;updateEditBadge();
-  const ed=$('#edits');ed.scrollTop=ed.scrollHeight;}
+  if(!replaying){const ed=$('#edits');ed.scrollTop=ed.scrollHeight;}}
+function buildPendingEdits(){$('#edits').querySelectorAll('.ecard').forEach(c=>{
+  if(c._ev&&!c._bodyDone){c._bodyDone=1;c.querySelector('.ed').innerHTML=toolBody(c._ev);}});}
 function addMarker(ev){const s=atBottom();const cn=counts(ev);const m=document.createElement('div');m.className='emark';
   m.innerHTML=(ICON[ev.tool]||'✏️')+'<span>'+esc(primaryArg(ev.input)||ev.tool)+'</span>'+
     (cn?'<span><span class="a">+'+cn.a+'</span> <span class="d">−'+cn.d+'</span></span>':'')+'<span class="mut">— see Changes</span>';
@@ -2104,10 +2120,11 @@ function onMsg(e){const m=JSON.parse(e.data);
     addNotice('new session « '+(m.name||'')+' »'+(m.effort?' · '+m.effort+' effort':'')+' in '+m.cwd+' — type your first message to begin');reqList();loadPast();}
   else if(m.type==='attached'){clearUI();pendingStart=false;sid=m.id;curCC=m.cc||null;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
     ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));syncPickers(m.model,m.mode);setEffortPill(m.effort);renderCtx(m.ctx);statset(m.ended?'ended':'ready');
-    m.events.forEach(route);compacting=!!m.compacting;setBusy(!!m.busy,m.word,(m.turn_age||0)*1000);
+    replaying=true;m.events.forEach(route);replaying=false;
+    compacting=!!m.compacting;setBusy(!!m.busy,m.word,(m.turn_age||0)*1000);
     if(m.ended){markEnded('— this session has ended (history shown · you can resume it from disk) —');}
     else{ta.disabled=false;sendBtn.disabled=false;addNotice('— '+(m.resumed?'resumed':'reattached to')+' « '+(m.name||'')+' » ('+m.events.length+' events)'+(m.effort?' with '+m.effort+' effort':'')+' —');}
-    reqList();loadPast();}
+    scroll();requestAnimationFrame(scroll);reqList();loadPast();}
   else if(m.type==='no_session'){localStorage.removeItem(SKEY);sid=null;ready=false;setBusy(false);setCurname('');renderCtx(null);statset('idle');
     addNotice('that session is no longer running — pick it under “Resume from disk”, or ＋ New.');reqList();loadPast();}
   else if(m.type==='events')m.events.forEach(route);
@@ -2409,7 +2426,7 @@ function toggleSidebar(){const sb=$('#sidebar');
 function drawerOpen(){return $('#drawer').classList.contains('open');}
 function gitTab(){return $('#tabGit').classList.contains('on');}
 function showTab(w){const e=w==='edits';$('#tabEdits').classList.toggle('on',e);$('#tabGit').classList.toggle('on',!e);
-  $('#edits').style.display=e?'':'none';$('#gitc').style.display=e?'none':'';if(e)showAllEdits();else refreshGit();}
+  $('#edits').style.display=e?'':'none';$('#gitc').style.display=e?'none':'';if(e){buildPendingEdits();showAllEdits();}else refreshGit();}
 /* clicking "see Changes" focuses the drawer on just that one file's edit;
    the Edits tab header (or "show all") brings the full list back */
 function showAllEdits(){const ed=$('#edits');const fb=ed.querySelector('.efocus');if(fb)fb.remove();
