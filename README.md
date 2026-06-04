@@ -1,49 +1,62 @@
 # Claude Console
 
-An interactive, browser-driven GUI for Claude Code that separates the two things
-that get tangled together in a raw terminal:
+An interactive, browser-driven GUI for **Claude Code** that separates the two
+things a raw terminal tangles together:
 
-- **Discussion** — what the agent said / what you asked (prose only)
+- **Discussion** — what you asked / what the agent said (prose only)
 - **Code & file changes** — every tool call (edits, writes, commands) rendered as
   **collapsed cards** (`✏️ Edit server.py  +12 −3`) you expand on demand, plus the
   live `git diff` of the working directory (ground truth)
 
-It spawns the real `claude` CLI in headless stream-json mode
-(`claude -p --input-format stream-json --output-format stream-json --verbose`),
-keeps one process alive per chat, feeds your messages on stdin, and renders the
-typed event stream back — a Claude-Code-style chat where code and conversation
-stay visually separated, exactly the point of this project.
+<p align="center">
+  <img src="figs/dark-theme.png" alt="Claude Console — dark theme" width="49%">
+  <img src="figs/light-theme.png" alt="Claude Console — light theme" width="49%">
+</p>
 
-Pick the **project dir**, **model** (default/opus/sonnet/haiku), and **permission
-mode** in the header; tap **± Changes** for the live `git diff` drawer.
+It drives Claude Code through the **Claude Agent SDK** (which runs the real
+`claude` CLI in headless stream-json mode), keeps one process alive per chat,
+feeds your messages on stdin, and renders the typed event stream back — a
+Claude-Code-style chat where code and conversation stay visually separated,
+which is the whole point.
 
-- Permission mode defaults to `acceptEdits` (tools run without prompts — smooth,
-  appropriate on your own machine over a private mesh). `plan` / `default` /
-  `bypass` are selectable.
-- Sessions are **resumable**: reopen a project and pick up a previous Claude Code
-  conversation (transcripts under `~/.claude/projects` are read to restore
-  history and target the right `cwd`).
-- The console can read/write files and run commands in the chosen directory —
-  that's the point, but keep it mesh-only / behind auth.
+## Features
 
-Why a separate change view? Because the authoritative record of *what changed in
-files* is the working tree, not the agent's narration — the `git diff` drawer is
-correct regardless of how the agent edited.
+- **Chat / code split** — prose in the stream; tool calls as collapsible change
+  cards. Click **see Changes** on any edit to open the drawer focused on *just
+  that file*, or switch to the live **Git diff** tab for the whole working tree.
+- **Multi-session sidebar** — Live / Favorites / Recent / In-folder sections
+  (each collapsible). Each card has a `⋮` menu: rename, favorite, delete, end.
+  Drag the sidebar's right edge to resize (double-click to reset).
+- **Resumable sessions** — reopen a project and pick up a previous Claude Code
+  conversation (transcripts under `~/.claude/projects` restore history and the
+  right `cwd`).
+- **Interactive round-trips** — per-action Approve/Deny prompts (in 🔐 Approve
+  mode) and in-browser **AskUserQuestion** cards; your pick is fed back to the
+  agent.
+- **Image paste** — paste a screenshot (`Ctrl/Cmd+V`) into the composer to send
+  it as a multimodal message.
+- **LaTeX rendering** — `$…$`, `$$…$$`, `\(…\)`, `\[…\]` in replies render with
+  KaTeX (vendored, offline).
+- **13 color themes** — light & dark (Dark, Dracula, Nord, Tokyo Night,
+  Catppuccin, Gruvbox, Light, Solarized Light, Rosé Pine Dawn, One Light, Ayu
+  Light, …), switchable from the sidebar; choice persists per device.
+- **At-a-glance meters** — context-window usage and the rolling 5-hour usage
+  limit in the header; a persistent ready / working status bar above the composer.
+- Pick **project dir**, **model** (default/opus/sonnet/haiku) and **permission
+  mode** when starting a session.
 
 ## Run
 
 ```bash
-# uses tornado from an existing env; any python with tornado works
-# defaults to localhost-only (safe):
-~/miniforge3/envs/webterminal/bin/python server.py
+# any python with tornado + claude-agent-sdk works; defaults to localhost-only (safe):
+python server.py
 
 # to reach it from your phone/iPad on the LAN, expose it WITH auth:
-CLAUDE_CONSOLE_BIND=0.0.0.0 CLAUDE_CONSOLE_AUTH=me:secret \
-  ~/miniforge3/envs/webterminal/bin/python server.py
+CLAUDE_CONSOLE_BIND=0.0.0.0 CLAUDE_CONSOLE_AUTH=me:secret python server.py
 ```
 
-Open `http://<host>:7703`. Pick a project dir and start chatting; the change
-cards and the `± Changes` drawer update live as the agent works.
+Open `http://<host>:7703`, pick a project dir, and start chatting; the change
+cards and the **Git diff** drawer update live as the agent works.
 
 | Env | Default | Meaning |
 |---|---|---|
@@ -56,22 +69,15 @@ The legacy `AGENTLENS_*` names are still honored as a fallback.
 > [!WARNING]
 > This **drives Claude Code** in the directory you pick — it can read/write files
 > and run commands there — and it exposes your **chat history and source diffs**.
-> It reads transcripts under `~/.claude/projects` and runs `git diff` under
-> `$HOME`. Do not expose it on an untrusted network without `CLAUDE_CONSOLE_AUTH`
-> and a trusted boundary (VPN / SSH tunnel / reverse proxy + TLS).
+> Do not expose it on an untrusted network without `CLAUDE_CONSOLE_AUTH` and a
+> trusted boundary (VPN / SSH tunnel / reverse proxy + TLS).
 
-## Status
+## Notes
 
-- ✅ **Console**: interactive Claude Code driver (stream-json), collapsed change
-  cards, model/permission pickers, live-diff drawer, folder-scoped session resume
-- ✅ **Interactive round-trips**: per-action Approve/Deny prompts (in 🔐 Approve
-  mode) and in-browser **AskUserQuestion** (the agent's multiple-choice questions
-  render as clickable cards; your pick is fed back to the agent)
-- ⏭️ Next: **Codex console** (drive `codex` too), interrupt mid-turn, Codex
-  `apply_patch` diffs, inotify push instead of diff polling.
+- Intentionally a single `server.py` with inline HTML/CSS/JS — **no build step**.
+- [KaTeX](https://katex.org/) is vendored under `static/katex/` (MIT) for offline
+  math rendering.
 
-## How it fits
+## License
 
-This is sibling to the author's other local services (`7700` web-terminal,
-`7701` web-file-manager, `7702` local-cdn). It's intentionally a single
-`server.py` with inline HTML — no build step — matching that style.
+[MIT](LICENSE) © 2026 BoZhen
