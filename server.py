@@ -1236,7 +1236,7 @@ html,body{height:100%;background:var(--bg);color:var(--fg);overflow:hidden;
 body{display:flex;flex-direction:column}
 header{display:flex;gap:6px;align-items:center;padding:6px 10px;background:var(--bg2);
   border-bottom:1px solid var(--line);flex-shrink:0;flex-wrap:wrap}
-header .brand{font-weight:600;color:var(--acc);white-space:nowrap}
+.sb-brand{font-weight:700;color:var(--acc);font-size:15px;padding:11px 12px 9px;border-bottom:1px solid var(--line);white-space:nowrap}
 header select,header input{background:var(--bg3);color:var(--fg);border:1px solid var(--line);
   border-radius:5px;padding:4px 7px;font-size:12.5px}
 header select#project{flex:1;min-width:120px;max-width:380px}
@@ -1439,7 +1439,6 @@ pre code{background:none;border:none;padding:0}
 <body>
 <header>
   <button class="iconbtn" id="navtoggle" title="sessions">☰</button>
-  <span class="brand">⬡ Claude Console</span>
   <span class="curname" id="curname">— no session —</span>
   <span class="ctx" id="ctx" title="context-window usage"></span>
   <span class="usage" id="usage" title="5-hour usage limit"></span>
@@ -1449,6 +1448,7 @@ pre code{background:none;border:none;padding:0}
 
 <div id="shell">
   <aside id="sidebar">
+    <div class="sb-brand">⬡ Claude Console</div>
     <div class="sb-new">
       <select id="project" title="working directory for a new session"></select>
       <div class="cwdwrap" id="cwdwrap"><input id="cwd" placeholder="type a path…  ↑↓ to pick" autocomplete="off"><div id="cwdac"></div></div>
@@ -1653,7 +1653,7 @@ function resolveQuestionCard(aid,ans){const c=stream.querySelector('.question[da
   if(bt)bt.insertAdjacentHTML('afterend','<div class="qdone">'+(has?'✓ '+vals.map(esc).join(' · '):'✕ dismissed')+'</div>');}
 function route(ev){
   if(ev.kind==='user_text')addUser(ev.text);
-  else if(ev.kind==='ready'){ready=true;cwd=ev.cwd||cwd;curCC=ev.session_id||curCC;addNotice('● session ready · '+(ev.model||'')+' · '+(ev.cwd||''));}
+  else if(ev.kind==='ready'){ready=true;cwd=ev.cwd||cwd;curCC=ev.session_id||curCC;if(ev.model)setResolvedModel(ev.model);addNotice('● session ready · '+(ev.model||'')+' · '+(ev.cwd||''));}
   else if(ev.kind==='assistant_text')addAsst(ev.text);
   else if(ev.kind==='thinking')addThink(ev.text);
   else if(ev.kind==='tool_use'){if(EDIT_TOOLS.has(ev.tool)){addEditCard(ev);addMarker(ev);}else addTool(ev);}
@@ -1714,7 +1714,8 @@ function renderCtx(c){const el=$('#ctx');
   el.style.display='inline-flex';
   el.innerHTML='<span class="ulabel">Context</span><span class="bar"><span class="fill" style="width:'+Math.min(100,pct)+'%"></span></span>'+
     '<span>'+pct+'%</span>';
-  el.title='context '+(c.totalTokens||'?')+' / '+(c.maxTokens||'?')+' tokens ('+pct+'%)'+(c.model?' · '+c.model:'');}
+  el.title='context '+(c.totalTokens||'?')+' / '+(c.maxTokens||'?')+' tokens ('+pct+'%)'+(c.model?' · '+c.model:'');
+  setResolvedModel(c.model, c.maxTokens);}
 /* rolling 5-hour usage limit (Claude-Code-CLI style: Usage ░░░ 2% (4h 38m / 5h)) */
 function fmtDur(ms){if(ms==null||ms<=0)return '0m';const m=Math.floor(ms/60000),h=Math.floor(m/60);
   return h>0?(h+'h '+(m%60)+'m'):(m+'m');}
@@ -1737,6 +1738,26 @@ function syncPickers(model,mode){
   if(model){const o=$('#model');for(const x of o.options){if(x.value===model){o.value=model;break;}}}
   if(mode){const o=$('#mode');for(const x of o.options){if(x.value===mode){o.value=mode;break;}}}
 }
+/* show what the live session's model actually resolves to in the picker's default
+   option, e.g. "model: opus 4.8 [1M]" — family+version from the model id, the
+   [ctx] window from maxTokens. Fed by the ready event and the context usage. */
+let _rmodel='', _rmax=0;
+function modelLabel(real,maxTok){
+  if(!real)return '';
+  const s=(''+real).toLowerCase();
+  const fam=s.includes('opus')?'opus':s.includes('sonnet')?'sonnet':s.includes('haiku')?'haiku':'';
+  if(!fam)return ''+real;
+  const m=s.match(new RegExp(fam+'-(\\d+)-(\\d+)'))||s.match(new RegExp('(\\d+)-(\\d+)-'+fam));
+  let lbl=fam+(m?(' '+m[1]+'.'+m[2]):'');
+  if(maxTok)lbl+='['+fmtTok(maxTok)+']';
+  return lbl;}
+function setResolvedModel(real,maxTok){
+  if(real)_rmodel=real;
+  if(maxTok)_rmax=maxTok;
+  const lbl=modelLabel(_rmodel,_rmax);
+  const o=$('#model');if(!o)return;
+  for(const x of o.options){if(x.value==='default'){
+    x.textContent=lbl||'model: default';break;}}}
 
 /* sidebar: live sessions (in-RAM) + resume-from-disk (past transcripts) */
 function renderLive(list){const box=$('#liveList');
