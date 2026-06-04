@@ -110,6 +110,14 @@ def _cap_input(inp):
     return inp
 
 
+_PLUMBING_TAGS = ("<command-name>", "<command-message>", "<command-args>",
+                  "<local-command-stdout>", "<local-command-caveat>", "<system-reminder>")
+def _is_plumbing(s):
+    """CLI-injected user content (slash-command markup, local-command stdout/caveats,
+    system reminders) — recorded in transcripts but never real chat to display."""
+    return isinstance(s, str) and s.lstrip().startswith(_PLUMBING_TAGS)
+
+
 def parse_claude(rec, idx):
     t = rec.get("type")
     base = {"ts": rec.get("timestamp"), "id": rec.get("uuid") or ("L%d" % idx)}
@@ -135,16 +143,20 @@ def parse_claude(rec, idx):
                     evs.append({**base, "kind": "tool_use", "tool": b.get("name", ""),
                                 "input": _cap_input(b.get("input")), "toolId": b.get("id", "")})
     elif t == "user":
+        if rec.get("isMeta") or rec.get("isCompactSummary"):
+            return []          # harness/CLI-injected, never real chat: "Continue from where
+                               # you left off." + tool-error retries + caveats (isMeta), and
+                               # the post-compaction summary continuation (isCompactSummary)
         content = msg.get("content")
         if isinstance(content, str):
-            if content.strip():
+            if content.strip() and not _is_plumbing(content):
                 evs.append({**base, "kind": "user_text", "role": "user", "text": _cap(content)})
         elif isinstance(content, list):
             for b in content:
                 if not isinstance(b, dict):
                     continue
                 bt = b.get("type")
-                if bt == "text" and b.get("text", "").strip():
+                if bt == "text" and b.get("text", "").strip() and not _is_plumbing(b["text"]):
                     evs.append({**base, "kind": "user_text", "role": "user", "text": _cap(b["text"])})
                 elif bt == "tool_result":
                     evs.append({**base, "kind": "tool_result", "toolId": b.get("tool_use_id", ""),
@@ -255,7 +267,7 @@ def _peek_claude(path):
                 if not cwd:
                     cwd = rec.get("cwd", "") or cwd
                     branch = rec.get("gitBranch", "") or branch
-                if not title and rec.get("type") == "user":
+                if not title and rec.get("type") == "user" and not rec.get("isCompactSummary"):
                     msg = (rec.get("message") or {}).get("content")
                     s = msg if isinstance(msg, str) else _txt(msg)
                     s = (s or "").strip()
