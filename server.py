@@ -954,21 +954,48 @@ class ChatSession:
                         "cost": msg.total_cost_usd})
         return evs
 
-    def send_user(self, text):
-        if not text.strip() or not self.client or self.ended:
+    def send_user(self, text, images=None):
+        images = [im for im in (images or []) if im.get("data")]
+        if (not text.strip() and not images) or not self.client or self.ended:
             return
         self.busy = True
         # Echo the prompt into the shared log so every viewer (and a later
         # reattach) sees it — the SDK stream never replays the user's own text.
-        self._push([{"kind": "user_text", "text": _cap(text)}])
+        ev = {"kind": "user_text", "text": _cap(text)}
+        if images:
+            ev["images"] = len(images)
+        self._push([ev])
         client = self.client
-        async def _q():
-            try:
-                await client.query(text)
-            except Exception as ex:
-                self.busy = False
-                self._push([{"kind": "notice", "text": "send failed: %r" % ex}])
-        tornado.ioloop.IOLoop.current().spawn_callback(_q)
+        if images:
+            # multimodal: pass an Anthropic-format user message (text + image
+            # blocks) through query()'s async-iterable path (the string path only
+            # carries text).
+            content = []
+            if text.strip():
+                content.append({"type": "text", "text": text})
+            for im in images:
+                content.append({"type": "image", "source": {
+                    "type": "base64",
+                    "media_type": im.get("media_type") or "image/png",
+                    "data": im["data"]}})
+            async def _gen():
+                yield {"type": "user", "parent_tool_use_id": None,
+                       "message": {"role": "user", "content": content}}
+            async def _q():
+                try:
+                    await client.query(_gen())
+                except Exception as ex:
+                    self.busy = False
+                    self._push([{"kind": "notice", "text": "send failed: %r" % ex}])
+            tornado.ioloop.IOLoop.current().spawn_callback(_q)
+        else:
+            async def _q():
+                try:
+                    await client.query(text)
+                except Exception as ex:
+                    self.busy = False
+                    self._push([{"kind": "notice", "text": "send failed: %r" % ex}])
+            tornado.ioloop.IOLoop.current().spawn_callback(_q)
 
     def interrupt(self):
         if self.client and not self.ended:
@@ -1167,7 +1194,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
         elif mt == "set_mode" and self.session:
             self.session.set_mode(msg.get("mode") or "")
         elif mt == "user" and self.session:
-            self.session.send_user(msg.get("text", ""))
+            self.session.send_user(msg.get("text", ""), msg.get("images"))
         elif mt == "del_resumable":
             # Sidebar 🗑: move a resumable session's transcript to the trash.
             cc = msg.get("cc")
@@ -1301,6 +1328,14 @@ pre code{background:none;border:none;padding:0}
 #composer{flex-shrink:0;border-top:1px solid var(--line);background:var(--bg2);padding:8px 10px;
   padding-bottom:calc(8px + env(safe-area-inset-bottom));display:flex;gap:8px;align-items:flex-end}
 #composer .wrap2{max-width:820px;margin:0 auto;width:100%;display:flex;gap:8px;align-items:flex-end}
+#attach{max-width:820px;margin:0 auto;display:none;flex-wrap:wrap;gap:7px;padding:0 0 8px}
+#attach.on{display:flex}
+#attach .att{position:relative;width:54px;height:54px;border-radius:8px;overflow:hidden;border:1px solid var(--line);background:var(--bg3)}
+#attach .att img{width:100%;height:100%;object-fit:cover;display:block}
+#attach .att .rm{position:absolute;top:1px;right:1px;width:17px;height:17px;border-radius:50%;border:none;
+  background:rgba(0,0,0,.6);color:#fff;cursor:pointer;font-size:12px;line-height:17px;text-align:center;padding:0}
+#attach .att .rm:hover{background:var(--del)}
+.msg.user .imgs{margin-top:5px;font-size:11.5px;color:var(--mut)}
 #ta{flex:1;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:10px;
   padding:9px 12px;font-size:14px;font-family:inherit;resize:none;max-height:160px;line-height:1.4}
 #ta:focus{outline:1px solid var(--acc)}
@@ -1479,8 +1514,10 @@ pre code{background:none;border:none;padding:0}
   <div id="mainCol">
     <div id="chat"><div class="wrap" id="stream"></div></div>
     <div id="thinking" title="click or press Esc to interrupt"><div class="twrap"><span class="glyph">✶</span><span class="word">Thinking</span><span class="meta"></span></div></div>
-    <div id="composer"><div class="wrap2">
-      <textarea id="ta" rows="1" placeholder="Type a message…  (Enter to send · Shift+Enter newline)" disabled></textarea>
+    <div id="composer">
+      <div id="attach"></div>
+      <div class="wrap2">
+      <textarea id="ta" rows="1" placeholder="Type a message…  (Enter to send · Shift+Enter newline · paste an image)" disabled></textarea>
       <button id="stop" title="interrupt / stop" style="display:none">⏹</button>
       <button id="send" disabled>➤</button>
     </div></div>
@@ -1542,8 +1579,9 @@ function toolBody(ev){const i=ev.input||{},t=ev.tool;
   if(typeof i==='string')return '<pre><code>'+esc(i)+'</code></pre>';
   return '<pre><code>'+esc(JSON.stringify(i,null,2))+'</code></pre>';}
 
-function addUser(text){const s=atBottom();const d=document.createElement('div');d.className='msg user';
-  d.innerHTML='<div class="b">'+esc(text)+'</div>';stream.appendChild(d);scroll();}
+function addUser(text,nImg){const s=atBottom();const d=document.createElement('div');d.className='msg user';
+  d.innerHTML='<div class="b">'+esc(text)+'</div>'+(nImg?'<div class="imgs">🖼 '+nImg+' image'+(nImg>1?'s':'')+' attached</div>':'');
+  stream.appendChild(d);scroll();}
 function addAsst(text){const s=atBottom();const d=document.createElement('div');d.className='msg asst';
   d.innerHTML='<div class="b bubble">'+md(text)+'</div>';stream.appendChild(d);if(s)scroll();}
 function addThink(text){const s=atBottom();const d=document.createElement('div');d.className='think'+(showThink?'':' hide');d.dataset.t=1;
@@ -1652,7 +1690,7 @@ function resolveQuestionCard(aid,ans){const c=stream.querySelector('.question[da
   const bt=c.querySelector('.qbtns');const has=vals&&vals.length;
   if(bt)bt.insertAdjacentHTML('afterend','<div class="qdone">'+(has?'✓ '+vals.map(esc).join(' · '):'✕ dismissed')+'</div>');}
 function route(ev){
-  if(ev.kind==='user_text')addUser(ev.text);
+  if(ev.kind==='user_text')addUser(ev.text,ev.images);
   else if(ev.kind==='ready'){ready=true;cwd=ev.cwd||cwd;curCC=ev.session_id||curCC;if(ev.model)setResolvedModel(ev.model);addNotice('● session ready · '+(ev.model||'')+' · '+(ev.cwd||''));}
   else if(ev.kind==='assistant_text')addAsst(ev.text);
   else if(ev.kind==='thinking')addThink(ev.text);
@@ -1879,8 +1917,26 @@ function endSessionById(id,name){if(!id)return;
   wsSend({type:'end',id:id});
   if(id===sid){sid=null;setCurname('');markEnded('session ended');}
   reqList();loadPast();}
-function sendMsg(){const t=ta.value.trim();if(!t||!ready||running||!sid||!ws||ws.readyState!==1)return;
-  wsSend({type:'user',text:t});ta.value='';ta.style.height='auto';setBusy(true);}
+/* image attachments: paste (Ctrl/Cmd+V) an image into the composer */
+let pendingImages=[];
+const MAX_IMG=8, MAX_IMG_BYTES=5*1024*1024, OK_IMG=['image/png','image/jpeg','image/gif','image/webp'];
+function renderAttach(){const a=$('#attach');a.classList.toggle('on',pendingImages.length>0);
+  a.innerHTML=pendingImages.map((im,i)=>'<div class="att"><img src="'+im.url+'"><button class="rm" data-i="'+i+'" title="remove">✕</button></div>').join('');
+  a.querySelectorAll('.rm').forEach(b=>b.onclick=()=>{pendingImages.splice(+b.dataset.i,1);renderAttach();});}
+function addImageFile(file){
+  if(pendingImages.length>=MAX_IMG){addNotice('⚠ up to '+MAX_IMG+' images at once');return;}
+  if(OK_IMG.indexOf(file.type)<0){addNotice('⚠ unsupported image type: '+(file.type||'?'));return;}
+  if(file.size>MAX_IMG_BYTES){addNotice('⚠ image too large ('+Math.round(file.size/1048576)+'MB, max 5MB)');return;}
+  const r=new FileReader();
+  r.onload=()=>{const url=''+r.result;pendingImages.push({media_type:file.type,data:url.split(',')[1]||'',url:url});renderAttach();};
+  r.readAsDataURL(file);}
+function handlePaste(e){const items=(e.clipboardData||{}).items||[];let got=false;
+  for(const it of items){if(it.kind==='file'&&it.type.indexOf('image/')===0){const f=it.getAsFile();if(f){addImageFile(f);got=true;}}}
+  if(got)e.preventDefault();}
+function sendMsg(){const t=ta.value.trim();
+  if((!t&&!pendingImages.length)||!ready||running||!sid||!ws||ws.readyState!==1)return;
+  wsSend({type:'user',text:t,images:pendingImages.map(im=>({media_type:im.media_type,data:im.data}))});
+  ta.value='';ta.style.height='auto';pendingImages=[];renderAttach();setBusy(true);}
 
 /* sidebar open/close (mobile drawer; desktop collapse) */
 function openSidebar(){$('#sidebar').classList.add('open');$('#sb-backdrop').classList.add('show');}
@@ -1905,6 +1961,7 @@ async function refreshGit(){if(!cwd){$('#gitc').innerHTML='<div class="empty">no
 /* bindings */
 ta.addEventListener('input',()=>{ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,160)+'px';});
 ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMsg();}});
+window.addEventListener('paste',handlePaste);
 sendBtn.onclick=sendMsg;
 $('#stop').onclick=doInterrupt;
 $('#thinking').onclick=doInterrupt;
