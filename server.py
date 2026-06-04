@@ -1232,7 +1232,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             self._say({"type": "sessions", "sessions": [
                 {"id": s.id, "cwd": s.cwd, "name": os.path.basename(s.cwd) or s.cwd,
                  "cc": s.cc_id, "model": s.model or "default", "title": s.title(),
-                 "busy": s.busy, "ended": s.ended, "n": len(s.log)}
+                 "busy": s.busy, "ended": s.ended}
                 for s in CHAT_SESSIONS.values()]})
 
     def on_close(self):
@@ -1273,16 +1273,18 @@ header input#cwd{flex:1;min-width:120px;display:none}
 .dot.on{background:var(--add);box-shadow:0 0 6px var(--add)}
 .dot.busy{background:var(--tool);box-shadow:0 0 6px var(--tool);animation:pulse 1s infinite}
 @keyframes pulse{50%{opacity:.35}}
-/* in-chat "thinking" indicator (Claude-Code-CLI style) — aligned to the composer */
-#thinking{display:none;padding:7px 10px;flex-shrink:0;border-top:1px solid var(--line);
-  background:var(--bg2);cursor:pointer;user-select:none}
-#thinking.on{display:block}
-#thinking:hover{background:var(--bg3)}
+/* persistent status bar above the composer — a coloured "ready/idle" light, or
+   the animated working indicator (glyph + word + elapsed) while a turn runs */
+#thinking{display:block;padding:7px 10px;flex-shrink:0;border-top:1px solid var(--line);
+  background:var(--bg2);user-select:none}
 #thinking .twrap{max-width:820px;margin:0 auto;display:flex;align-items:center;gap:9px;font-size:13px}
-#thinking .glyph{font-size:15px;color:var(--tool);width:1.1em;text-align:center;
+#thinking .dot{flex:none}
+#thinking.busy .dot{display:none}
+#thinking .glyph{display:none;font-size:15px;color:var(--tool);width:1.1em;text-align:center;
   text-shadow:0 0 8px var(--tool);animation:thinkpulse 1.4s ease-in-out infinite}
+#thinking.busy .glyph{display:inline-block}
 #thinking .word{color:var(--fg);font-weight:600}
-#thinking .word::after{content:'…'}
+#thinking.busy .word::after{content:'…'}
 #thinking .meta{color:var(--mut);font-size:12px;margin-left:auto;font-variant-numeric:tabular-nums}
 @keyframes thinkpulse{0%,100%{opacity:.45}50%{opacity:1}}
 .btn{background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:5px;
@@ -1351,7 +1353,6 @@ pre code{background:none;border:none;padding:0}
 .gfile{font-family:ui-monospace,monospace;font-size:12px;padding:1px 0}.gfile .st{display:inline-block;width:24px;color:var(--tool);font-weight:700}
 .empty{color:var(--mut);padding:18px;text-align:center}
 /* edits-out-of-chat */
-#chBadge{font-size:10px;padding:0 5px;border-radius:8px;background:#444;color:#bbb;margin-left:3px}
 .dh .tab{cursor:pointer;padding:3px 9px;border-radius:5px;color:var(--mut);font-size:12.5px;user-select:none}
 .dh .tab.on{background:var(--bg3);color:var(--fg)}
 .dh .tab span{font-size:10px;opacity:.8}
@@ -1364,6 +1365,8 @@ pre code{background:none;border:none;padding:0}
 .ecard .ef{color:var(--tool);font-family:ui-monospace,monospace;font-size:12px;font-weight:600;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ecard .cnt{font-size:11px;font-family:ui-monospace,monospace}.ecard .cnt .a{color:#7ee787}.ecard .cnt .d{color:#ffa198}
 .ecard.flash{outline:2px solid var(--acc);outline-offset:-2px}
+.efocus{font-size:11.5px;color:var(--mut);margin:0 0 9px;padding:5px 8px;background:var(--bg2);border:1px solid var(--line);border-radius:6px}
+.efocus .showall{color:var(--acc);cursor:pointer;text-decoration:underline}
 .ecard .ed{max-height:320px;overflow:auto;padding:6px 9px}
 .ecard .res{padding:0 9px}
 /* approval prompts */
@@ -1477,8 +1480,6 @@ pre code{background:none;border:none;padding:0}
   <span class="curname" id="curname">— no session —</span>
   <span class="ctx" id="ctx" title="context-window usage"></span>
   <span class="usage" id="usage" title="5-hour usage limit"></span>
-  <button class="btn" id="chgbtn">± Changes<span id="chBadge">0</span></button>
-  <span class="status"><span class="dot" id="dot"></span><span id="statxt">idle</span></span>
 </header>
 
 <div id="shell">
@@ -1513,7 +1514,7 @@ pre code{background:none;border:none;padding:0}
   <div id="sb-backdrop"></div>
   <div id="mainCol">
     <div id="chat"><div class="wrap" id="stream"></div></div>
-    <div id="thinking" title="click or press Esc to interrupt"><div class="twrap"><span class="glyph">✶</span><span class="word">Thinking</span><span class="meta"></span></div></div>
+    <div id="thinking"><div class="twrap"><span class="dot" id="dot"></span><span class="glyph">✶</span><span class="word">idle</span><span class="meta"></span></div></div>
     <div id="composer">
       <div id="attach"></div>
       <div class="wrap2">
@@ -1599,13 +1600,16 @@ function addResult(ev){const c=tools[ev.toolId];if(!c)return;if(ev.isError)c.cla
   const b=(ev.content||'').trim();c.querySelector('.res').innerHTML='<div class="reslabel">'+(ev.isError?'error ⤵':'output ⤵')+
     '</div><pre><code>'+esc(b.length>2200?b.slice(0,2200)+'\n…':b)+'</code></pre>';}
 
-function statset(t){$('#statxt').textContent=t;}
+function statset(t){const el=$('#thinking');if(!el)return;
+  const w=el.querySelector('.word');if(w)w.textContent=t;
+  if(!running){const m=el.querySelector('.meta');if(m)m.textContent='';}}
 function bindProject(p){if(!p)return;const sel=$('#project');let ok=false;
   for(const o of sel.options){if(o.value===p){ok=true;break;}}
   if(!ok){const o=document.createElement('option');o.value=p;o.textContent='● '+p.split('/').slice(-2).join('/');sel.insertBefore(o,sel.firstChild);}
   sel.value=p;}
 function setBusy(b){running=b;$('#dot').className='dot '+(b?'busy':(ready?'on':''));
-  if(b)statset('working…');else if(ready)statset('ready');
+  $('#thinking').classList.toggle('busy',b);
+  if(!b&&ready)statset('ready');      /* busy: startThinking owns the word + timer */
   sendBtn.disabled=b||!ready;ta.disabled=!ready;
   $('#stop').style.display=b?'':'none';sendBtn.style.display=b?'none':'';
   if(b)startThinking();else stopThinking();}
@@ -1621,21 +1625,20 @@ function startThinking(){const el=$('#thinking');if(!el)return;
     thinkWi=Math.floor(Math.random()*THINK_WORDS.length);
     el.querySelector('.word').textContent=THINK_WORDS[thinkWi];
   }
-  el.classList.add('on');if(atBottom())scroll();
+  if(atBottom())scroll();
   clearInterval(thinkTimer);
   thinkTimer=setInterval(()=>{     /* during the turn only the glyph + timer move */
     thinkGi=(thinkGi+1)%THINK_GLYPHS.length;
     el.querySelector('.glyph').textContent=THINK_GLYPHS[thinkGi];
     el.querySelector('.meta').textContent=Math.floor((Date.now()-thinkStart)/1000)+'s · esc to interrupt';
   },130);}
-function stopThinking(){clearInterval(thinkTimer);thinkTimer=0;const el=$('#thinking');if(el)el.classList.remove('on');}
+function stopThinking(){clearInterval(thinkTimer);thinkTimer=0;}
 function doInterrupt(){if(!running)return;wsSend({type:'interrupt'});addNotice('⏹ interrupt sent');}
 function clearUI(){stream.innerHTML='';$('#edits').innerHTML='<div class="empty">no file changes yet</div>';
   $('#gitc').innerHTML='<div class="empty">—</div>';tools={};editCount=0;updateEditBadge();renderCtx(null);ready=false;}
 
 /* file edits → out of chat, into the Changes drawer */
-function updateEditBadge(){$('#editN').textContent=editCount;const b=$('#chBadge');b.textContent=editCount;
-  b.style.background=editCount?'#d4a017':'#444';b.style.color=editCount?'#000':'#bbb';}
+function updateEditBadge(){$('#editN').textContent=editCount;}
 function addEditCard(ev){if(editCount===0)$('#edits').innerHTML='';
   const c=document.createElement('div');c.className='ecard';const cn=counts(ev);
   const cnt=cn?('<span class="cnt"><span class="a">+'+cn.a+'</span> <span class="d">−'+cn.d+'</span></span>'):'';
@@ -1646,7 +1649,7 @@ function addEditCard(ev){if(editCount===0)$('#edits').innerHTML='';
 function addMarker(ev){const s=atBottom();const cn=counts(ev);const m=document.createElement('div');m.className='emark';
   m.innerHTML=(ICON[ev.tool]||'✏️')+'<span>'+esc(primaryArg(ev.input)||ev.tool)+'</span>'+
     (cn?'<span><span class="a">+'+cn.a+'</span> <span class="d">−'+cn.d+'</span></span>':'')+'<span class="mut">— see Changes</span>';
-  m.onclick=()=>{openDrawer('edits');const c=ev.toolId&&tools[ev.toolId];if(c){c.classList.add('flash');c.scrollIntoView({block:'center'});setTimeout(()=>c.classList.remove('flash'),1200);}};
+  m.onclick=()=>{openDrawer('edits');focusEdit(ev.toolId);};
   stream.appendChild(m);if(s)scroll();}
 
 function addApproval(ev){const c=document.createElement('div');c.className='approval';c.dataset.aid=ev.aid;
@@ -1809,7 +1812,7 @@ function renderLive(list){const box=$('#liveList');
     const dot=s.busy?'busy':(s.ended?'':'on');
     r.innerHTML='<span class="sdot '+dot+'"></span><div class="smeta">'+
       '<div class="sname">'+esc(s.title||s.name||'new session')+(s.ended?' · ended':'')+'</div>'+
-      '<div class="ssub">'+esc(proj)+' · '+s.n+(s.busy?' · working…':'')+'</div></div>'+
+      '<div class="ssub">'+esc(proj)+(s.busy?' · working…':'')+'</div></div>'+
       '<span class="spen" title="rename">✎</span>'+
       '<span class="sx" title="end session">✕</span>';
     r.querySelector('.smeta').onclick=()=>switchSession(s.id);
@@ -1949,7 +1952,19 @@ function toggleSidebar(){const sb=$('#sidebar');
 function drawerOpen(){return $('#drawer').classList.contains('open');}
 function gitTab(){return $('#tabGit').classList.contains('on');}
 function showTab(w){const e=w==='edits';$('#tabEdits').classList.toggle('on',e);$('#tabGit').classList.toggle('on',!e);
-  $('#edits').style.display=e?'':'none';$('#gitc').style.display=e?'none':'';if(!e)refreshGit();}
+  $('#edits').style.display=e?'':'none';$('#gitc').style.display=e?'none':'';if(e)showAllEdits();else refreshGit();}
+/* clicking "see Changes" focuses the drawer on just that one file's edit;
+   the Edits tab header (or "show all") brings the full list back */
+function showAllEdits(){const ed=$('#edits');const fb=ed.querySelector('.efocus');if(fb)fb.remove();
+  ed.querySelectorAll('.ecard').forEach(c=>c.style.display='');}
+function focusEdit(toolId){const ed=$('#edits'),target=toolId&&tools[toolId];
+  if(!target){showAllEdits();return;}
+  ed.querySelectorAll('.ecard').forEach(c=>{c.style.display=(c===target)?'':'none';});
+  let fb=ed.querySelector('.efocus');
+  if(!fb){fb=document.createElement('div');fb.className='efocus';ed.insertBefore(fb,ed.firstChild);}
+  fb.innerHTML='showing one file · <span class="showall">show all changes</span>';
+  fb.querySelector('.showall').onclick=showAllEdits;
+  target.classList.add('flash');target.scrollIntoView({block:'start'});setTimeout(()=>target.classList.remove('flash'),1200);}
 function openDrawer(w){$('#drawer').classList.add('open');showTab(w||'edits');}
 async function refreshGit(){if(!cwd){$('#gitc').innerHTML='<div class="empty">no session</div>';return;}
   try{const r=await fetch('api/diff?cwd='+encodeURIComponent(cwd));const j=await r.json();
@@ -1964,7 +1979,6 @@ ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefa
 window.addEventListener('paste',handlePaste);
 sendBtn.onclick=sendMsg;
 $('#stop').onclick=doInterrupt;
-$('#thinking').onclick=doInterrupt;
 document.addEventListener('keydown',e=>{
   if(e.key==='Escape'&&running&&!$('#cwdac').classList.contains('on')){e.preventDefault();doInterrupt();}});
 $('#newbtn').onclick=newSession;
@@ -1976,7 +1990,6 @@ $('#model').onchange=()=>{if(sid&&ws&&ws.readyState===1)wsSend({type:'set_model'
 $('#mode').onchange=()=>{if(sid&&ws&&ws.readyState===1)wsSend({type:'set_mode',mode:$('#mode').value});};
 $('#tabEdits').onclick=()=>showTab('edits');
 $('#tabGit').onclick=()=>showTab('git');
-$('#chgbtn').onclick=()=>{if(drawerOpen())$('#drawer').classList.remove('open');else openDrawer('edits');};
 $('#dclose').onclick=()=>$('#drawer').classList.remove('open');
 $('#grefresh').onclick=refreshGit;
 $('#project').onchange=()=>{const c=$('#project').value==='__custom__';
