@@ -9,8 +9,11 @@ things a raw terminal tangles together:
   live `git diff` of the working directory (ground truth)
 
 <p align="center">
-  <img src="figs/dark-theme.png" alt="Claude Console — dark theme" width="49%">
-  <img src="figs/light-theme.png" alt="Claude Console — light theme" width="49%">
+  <img src="figs/light-theme.png" alt="Claude Console — One Light theme, AskUserQuestion" width="49%">
+  <img src="figs/approve.png" alt="Claude Console — per-action approval (Approve / Always / Deny)" width="49%">
+</p>
+<p align="center">
+  <img src="figs/dark-theme.png" alt="Claude Console — Dracula theme, LaTeX rendering" width="49%">
 </p>
 
 It drives Claude Code through the **Claude Agent SDK** (which runs the real
@@ -30,9 +33,16 @@ which is the whole point.
 - **Resumable sessions** — reopen a project and pick up a previous Claude Code
   conversation (transcripts under `~/.claude/projects` restore history and the
   right `cwd`).
-- **Interactive round-trips** — per-action Approve/Deny prompts (in 🔐 Approve
-  mode) and in-browser **AskUserQuestion** cards; your pick is fed back to the
-  agent.
+- **Interactive round-trips** — per-action approval with three choices
+  (**Approve** / **Approve & don't ask again this session** / **Deny**) in 🔐
+  Approve mode, plus in-browser **AskUserQuestion** cards; your pick is fed back
+  to the agent.
+- **Message queue** — type while the agent is busy and the message queues; it is
+  injected into the running turn at the next tool boundary (steering). Click a
+  queued chip (or press ↑) to withdraw it back into the editor and edit it.
+- **Thinking effort** — a `🧠` pill (low / medium / high / xhigh / max) to set
+  reasoning depth, switchable on the fly (the session relaunches with the new
+  `--effort`).
 - **Image paste** — paste a screenshot (`Ctrl/Cmd+V`) into the composer to send
   it as a multimodal message.
 - **LaTeX rendering** — `$…$`, `$$…$$`, `\(…\)`, `\[…\]` in replies render with
@@ -40,8 +50,9 @@ which is the whole point.
 - **13 color themes** — light & dark (Dark, Dracula, Nord, Tokyo Night,
   Catppuccin, Gruvbox, Light, Solarized Light, Rosé Pine Dawn, One Light, Ayu
   Light, …), switchable from the sidebar; choice persists per device.
-- **At-a-glance meters** — context-window usage and the rolling 5-hour usage
-  limit in the header; a persistent ready / working status bar above the composer.
+- **At-a-glance status** — context-window and rolling 5-hour usage meters in the
+  header; a floating status pill (ready / working timer) plus the effort pill
+  above a full-width composer.
 - Pick **project dir**, **model** (default/opus/sonnet/haiku) and **permission
   mode** when starting a session.
 
