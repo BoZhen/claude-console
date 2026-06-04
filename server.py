@@ -793,6 +793,10 @@ class ChatSession:
         self._pending = {}       # approval_id -> asyncio.Future
         self._aid = 0
         self.ctx = None          # latest context-window usage (get_context_usage)
+        self.queue = []          # messages typed while busy; dispatched on turn_done
+        self._qid = 0
+        self.turn_started = None  # wall time the current turn began (for the timer)
+        self.turn_word = 0        # seed for the "thinking" word, stable across reattach
 
     def preload(self):
         """Populate history from the on-disk transcript before resuming."""
@@ -891,6 +895,7 @@ class ChatSession:
                 for e in evs:
                     if e["kind"] == "turn_done":
                         self.busy = False
+                        self.turn_started = None
                     elif e["kind"] == "ready":
                         self.cc_id = e.get("session_id") or self.cc_id
                         if self.cc_id:   # record this session's mode/model once
@@ -900,6 +905,13 @@ class ChatSession:
                 # refresh context-window usage after a turn settles or on init
                 if any(e["kind"] in ("turn_done", "ready") for e in evs):
                     await self._refresh_context()
+                # a turn just settled → send the next queued message, if any
+                if any(e["kind"] == "turn_done" for e in evs):
+                    self._drain_queue()
+                # steering: at a tool boundary, inject queued messages into the
+                # running turn so Claude sees them at its next step (like the CLI)
+                elif self.busy and self.queue and any(e["kind"] == "tool_use" for e in evs):
+                    self._flush_queue_midturn()
         except Exception as ex:
             self._emit({"type": "stderr", "text": "stream ended: %r" % ex})
         self.busy = False
@@ -954,51 +966,120 @@ class ChatSession:
                         "cost": msg.total_cost_usd})
         return evs
 
+    def turn_age(self):
+        """Seconds the current turn has been running (0 if idle) — lets a
+        re-attaching viewer resume the elapsed-time display instead of resetting."""
+        return (time.time() - self.turn_started) if (self.busy and self.turn_started) else 0
+
     def send_user(self, text, images=None):
         images = [im for im in (images or []) if im.get("data")]
         if (not text.strip() and not images) or not self.client or self.ended:
             return
-        self.busy = True
-        # Echo the prompt into the shared log so every viewer (and a later
-        # reattach) sees it — the SDK stream never replays the user's own text.
-        ev = {"kind": "user_text", "text": _cap(text)}
+        if self.busy:
+            # a turn is running — queue it. It's injected into the live turn at
+            # the next tool boundary (steering), or dispatched when the turn ends.
+            self._qid += 1
+            qid = "q%d" % self._qid
+            self.queue.append({"qid": qid, "text": text, "images": images})
+            ev = {"kind": "queued", "qid": qid, "text": _cap(text)}
+            if images:
+                ev["images"] = len(images)
+            self._push([ev])
+            return
+        self._dispatch(text, images)
+
+    def _make_payload(self, text, images):
+        """A string (text-only) or an Anthropic-format async-iterable (multimodal)
+        for client.query(); the string path can't carry image blocks."""
+        if not images:
+            return text
+        content = []
+        if text.strip():
+            content.append({"type": "text", "text": text})
+        for im in images:
+            content.append({"type": "image", "source": {
+                "type": "base64",
+                "media_type": im.get("media_type") or "image/png",
+                "data": im["data"]}})
+        async def _gen():
+            yield {"type": "user", "parent_tool_use_id": None,
+                   "message": {"role": "user", "content": content}}
+        return _gen()
+
+    def _echo_user(self, text, images, qid=None, start=False):
+        """Push the console events for one outgoing user message."""
+        evs = []
+        if qid:                       # came off the queue — drop its chip
+            evs.append({"kind": "dequeued", "qid": qid})
+        if start:                     # begins a fresh turn (vs mid-turn injection)
+            evs.append({"kind": "turn_start", "word": self.turn_word})
+        ue = {"kind": "user_text", "text": _cap(text)}
         if images:
-            ev["images"] = len(images)
-        self._push([ev])
+            ue["images"] = len(images)
+        evs.append(ue)
+        self._push(evs)
+
+    def _dispatch(self, text, images, qid=None, start=True):
+        """Send one message to the live client. start=True begins a new turn;
+        start=False injects into the running turn without flipping busy."""
+        if start:
+            self.busy = True
+            self.turn_started = time.time()
+            self.turn_word = secrets.randbelow(100000)
+        self._echo_user(text, images, qid=qid, start=start)
         client = self.client
-        if images:
-            # multimodal: pass an Anthropic-format user message (text + image
-            # blocks) through query()'s async-iterable path (the string path only
-            # carries text).
-            content = []
-            if text.strip():
-                content.append({"type": "text", "text": text})
-            for im in images:
-                content.append({"type": "image", "source": {
-                    "type": "base64",
-                    "media_type": im.get("media_type") or "image/png",
-                    "data": im["data"]}})
-            async def _gen():
-                yield {"type": "user", "parent_tool_use_id": None,
-                       "message": {"role": "user", "content": content}}
-            async def _q():
-                try:
-                    await client.query(_gen())
-                except Exception as ex:
+        payload = self._make_payload(text, images)
+        async def _q():
+            try:
+                await client.query(payload)
+            except Exception as ex:
+                if start:
                     self.busy = False
-                    self._push([{"kind": "notice", "text": "send failed: %r" % ex}])
-            tornado.ioloop.IOLoop.current().spawn_callback(_q)
-        else:
-            async def _q():
-                try:
-                    await client.query(text)
-                except Exception as ex:
-                    self.busy = False
-                    self._push([{"kind": "notice", "text": "send failed: %r" % ex}])
-            tornado.ioloop.IOLoop.current().spawn_callback(_q)
+                self._push([{"kind": "notice", "text": "send failed: %r" % ex}])
+                self._drain_queue()    # don't strand the rest of the queue
+        tornado.ioloop.IOLoop.current().spawn_callback(_q)
+
+    def _flush_queue_midturn(self):
+        """Steering: inject every pending queued message into the running turn
+        now (write to the CLI), so Claude sees them at its next step. Echoes are
+        emitted immediately; the writes are serialized in one coroutine."""
+        if not self.queue or not self.client or self.ended:
+            return
+        items, self.queue = self.queue, []
+        payloads = []
+        for it in items:
+            self._echo_user(it["text"], it["images"], qid=it["qid"], start=False)
+            payloads.append(self._make_payload(it["text"], it["images"]))
+        client = self.client
+        async def _q():
+            try:
+                for p in payloads:
+                    await client.query(p)
+            except Exception as ex:
+                self._push([{"kind": "notice", "text": "steer failed: %r" % ex}])
+        tornado.ioloop.IOLoop.current().spawn_callback(_q)
+
+    def _drain_queue(self):
+        """Dispatch the next queued message as a fresh turn (used once a turn has
+        fully settled and anything still queued needs its own turn)."""
+        if self.busy or self.ended or not self.client or not self.queue:
+            return
+        item = self.queue.pop(0)
+        self._dispatch(item["text"], item["images"], qid=item["qid"], start=True)
+
+    def unqueue(self, qid):
+        """Withdraw a still-pending queued message (user is editing it)."""
+        for i, it in enumerate(self.queue):
+            if it["qid"] == qid:
+                self.queue.pop(i)
+                self._push([{"kind": "unqueued", "qid": qid}])
+                return
 
     def interrupt(self):
         if self.client and not self.ended:
+            if self.queue:        # interrupting also cancels pending queued messages
+                self._push([{"kind": "unqueued", "qid": it["qid"]} for it in self.queue])
+                self.queue = []
             client = self.client
             async def _i():
                 try:
@@ -1146,7 +1227,8 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "name": os.path.basename(sess.cwd) or sess.cwd, "cc": sess.cc_id,
                        "title": sess.title(), "ctx": sess.ctx,
                        "model": sess.model or "default", "mode": sess.mode,
-                       "busy": sess.busy, "ended": sess.ended, "events": sess.log})
+                       "busy": sess.busy, "ended": sess.ended, "events": sess.log,
+                       "turn_age": sess.turn_age(), "word": sess.turn_word})
         elif mt == "resume":
             if not CLAUDE_BIN or not os.path.exists(CLAUDE_BIN):
                 self._say({"type": "error", "error": "claude CLI not found"})
@@ -1182,6 +1264,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "title": sess.title(), "ctx": sess.ctx,
                        "model": sess.model or "default", "mode": sess.mode,
                        "busy": sess.busy, "ended": sess.ended, "events": sess.log,
+                       "turn_age": sess.turn_age(), "word": sess.turn_word,
                        "resumed": True})
         elif mt == "approve" and self.session:
             self.session.resolve_approval(msg.get("aid"), bool(msg.get("allow")))
@@ -1195,6 +1278,8 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             self.session.set_mode(msg.get("mode") or "")
         elif mt == "user" and self.session:
             self.session.send_user(msg.get("text", ""), msg.get("images"))
+        elif mt == "unqueue" and self.session:
+            self.session.unqueue(msg.get("qid"))
         elif mt == "del_resumable":
             # Sidebar 🗑: move a resumable session's transcript to the trash.
             cc = msg.get("cc")
@@ -1326,19 +1411,20 @@ header input#cwd{flex:1;min-width:120px;display:none}
 .dot.on{background:var(--add);box-shadow:0 0 6px var(--add)}
 .dot.busy{background:var(--tool);box-shadow:0 0 6px var(--tool);animation:pulse 1s infinite}
 @keyframes pulse{50%{opacity:.35}}
-/* persistent status bar above the composer — a coloured "ready/idle" light, or
-   the animated working indicator (glyph + word + elapsed) while a turn runs */
-#thinking{display:block;padding:7px 10px;flex-shrink:0;border-top:1px solid var(--line);
-  background:var(--bg2);user-select:none}
-#thinking .twrap{max-width:820px;margin:0 auto;display:flex;align-items:center;gap:9px;font-size:13px}
+/* floating status pill above the composer — a "ready/idle" light, or the
+   animated working indicator (glyph + word + elapsed) while a turn runs */
+#thinking{align-self:flex-start;flex:none;max-width:100%;margin:0 0 7px;padding:3px 12px;
+  background:var(--bg3);border:1px solid var(--line);border-radius:9px;
+  box-shadow:0 2px 10px rgba(0,0,0,.28);user-select:none}
+#thinking .twrap{display:flex;align-items:center;gap:8px;font-size:13px;line-height:1.1}
 #thinking .dot{flex:none}
 #thinking.busy .dot{display:none}
-#thinking .glyph{display:none;font-size:15px;color:var(--tool);width:1.1em;text-align:center;
+#thinking .glyph{display:none;font-size:13px;color:var(--tool);width:1.1em;text-align:center;
   text-shadow:0 0 8px var(--tool);animation:thinkpulse 1.4s ease-in-out infinite}
 #thinking.busy .glyph{display:inline-block}
 #thinking .word{color:var(--fg);font-weight:600}
 #thinking.busy .word::after{content:'…'}
-#thinking .meta{color:var(--mut);font-size:12px;margin-left:auto;font-variant-numeric:tabular-nums}
+#thinking .meta{color:var(--mut);font-size:12px;font-variant-numeric:tabular-nums}
 @keyframes thinkpulse{0%,100%{opacity:.45}50%{opacity:1}}
 .btn{background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:5px;
   padding:4px 9px;font-size:12.5px;cursor:pointer;white-space:nowrap}
@@ -1381,9 +1467,9 @@ pre code{background:none;border:none;padding:0}
 .reslabel{font-size:11px;color:var(--mut);margin:6px 0 2px}
 
 #composer{flex-shrink:0;border-top:1px solid var(--line);background:var(--bg2);padding:8px 10px;
-  padding-bottom:calc(8px + env(safe-area-inset-bottom));display:flex;gap:8px;align-items:flex-end}
-#composer .wrap2{max-width:820px;margin:0 auto;width:100%;display:flex;gap:8px;align-items:flex-end}
-#attach{max-width:820px;margin:0 auto;display:none;flex-wrap:wrap;gap:7px;padding:0 0 8px}
+  padding-bottom:calc(8px + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:0;align-items:stretch}
+#composer .wrap2{width:100%;display:flex;gap:8px;align-items:flex-end}
+#attach{display:none;flex-wrap:wrap;gap:7px;padding:0 0 8px}
 #attach.on{display:flex}
 #attach .att{position:relative;width:54px;height:54px;border-radius:8px;overflow:hidden;border:1px solid var(--line);background:var(--bg3)}
 #attach .att img{width:100%;height:100%;object-fit:cover;display:block}
@@ -1391,10 +1477,19 @@ pre code{background:none;border:none;padding:0}
   background:rgba(0,0,0,.6);color:#fff;cursor:pointer;font-size:12px;line-height:17px;text-align:center;padding:0}
 #attach .att .rm:hover{background:var(--del)}
 .msg.user .imgs{margin-top:5px;font-size:11.5px;color:var(--mut)}
+/* queued messages (typed while the agent is busy) */
+#queue{width:100%;display:none;flex-direction:column;gap:5px;padding:0 0 8px}
+#queue.on{display:flex}
+#queue .qmsg{display:flex;align-items:center;gap:8px;background:var(--bg3);border:1px solid var(--line);border-radius:8px;padding:5px 9px;font-size:12.5px;color:var(--fg);cursor:pointer}
+#queue .qmsg:hover{border-color:var(--acc)}
+#queue .qmsg .qicon{flex:none;color:var(--tool);font-size:12px}
+#queue .qmsg .qtext{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#queue .qmsg .qx{flex:none;color:var(--mut);font-size:13px;padding:0 2px}
+#queue .qmsg:hover .qx{color:var(--del)}
 #ta{flex:1;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:10px;
   padding:9px 12px;font-size:14px;font-family:inherit;resize:none;max-height:160px;line-height:1.4}
 #ta:focus{outline:1px solid var(--acc)}
-#send{background:var(--acc);color:var(--onacc);border:none;border-radius:10px;padding:9px 14px;font-size:16px;font-weight:700;cursor:pointer}
+#send{background:var(--acc);color:var(--onacc);border:none;border-radius:10px;width:38px;height:38px;flex:none;display:inline-flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;cursor:pointer}
 #send:disabled{background:var(--line);color:var(--mut);cursor:default}
 
 #drawer{position:fixed;top:0;right:0;width:min(560px,92vw);height:100%;background:var(--bg);border-left:1px solid var(--line);
@@ -1454,7 +1549,7 @@ pre code{background:none;border:none;padding:0}
 .question.done .qbtns{display:none}
 .question.done .qopt,.question.done .qother{pointer-events:none;opacity:.7}
 .question .qdone{padding:8px 10px;border-top:1px solid var(--infoln);color:var(--addfg);font-weight:600}
-#stop{background:var(--nobg);color:var(--delfg);border:1px solid var(--del);border-radius:10px;padding:9px 14px;font-size:16px;font-weight:700;cursor:pointer}
+#stop{background:var(--nobg);color:var(--delfg);border:1px solid var(--del);border-radius:10px;width:38px;height:38px;flex:none;display:inline-flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;cursor:pointer}
 
 /* sessions sidebar + shell layout */
 .iconbtn{background:none;border:none;color:var(--fg);font-size:17px;cursor:pointer;padding:2px 5px;line-height:1}
@@ -1607,8 +1702,9 @@ pre code{background:none;border:none;padding:0}
   <div id="sb-backdrop"></div>
   <div id="mainCol">
     <div id="chat"><div class="wrap" id="stream"></div></div>
-    <div id="thinking"><div class="twrap"><span class="dot" id="dot"></span><span class="glyph">✶</span><span class="word">idle</span><span class="meta"></span></div></div>
     <div id="composer">
+      <div id="thinking"><div class="twrap"><span class="dot" id="dot"></span><span class="glyph">✶</span><span class="word">idle</span><span class="meta"></span></div></div>
+      <div id="queue"></div>
       <div id="attach"></div>
       <div class="wrap2">
       <textarea id="ta" rows="1" placeholder="Type a message…  (Enter to send · Shift+Enter newline · paste an image)" disabled></textarea>
@@ -1713,25 +1809,28 @@ function bindProject(p){if(!p)return;const sel=$('#project');let ok=false;
   for(const o of sel.options){if(o.value===p){ok=true;break;}}
   if(!ok){const o=document.createElement('option');o.value=p;o.textContent='● '+p.split('/').slice(-2).join('/');sel.insertBefore(o,sel.firstChild);}
   sel.value=p;}
-function setBusy(b){running=b;$('#dot').className='dot '+(b?'busy':(ready?'on':''));
+function setBusy(b,wordSeed,elapsedMs){running=b;$('#dot').className='dot '+(b?'busy':(ready?'on':''));
   $('#thinking').classList.toggle('busy',b);
   if(!b&&ready)statset('ready');      /* busy: startThinking owns the word + timer */
-  sendBtn.disabled=b||!ready;ta.disabled=!ready;
-  $('#stop').style.display=b?'':'none';sendBtn.style.display=b?'none':'';
-  if(b)startThinking();else stopThinking();}
+  ta.disabled=!ready;
+  sendBtn.disabled=!ready;            /* send stays available while busy → queues */
+  $('#stop').style.display=b?'':'none';   /* interrupt button only while busy */
+  sendBtn.style.display='';               /* send always visible */
+  if(b)startThinking(wordSeed,elapsedMs);else stopThinking();}
 
 /* in-chat "thinking" indicator — animated glyph + cycling word + elapsed timer */
 const THINK_WORDS=['Thinking','Pondering','Cogitating','Brewing','Conjuring','Percolating',
   'Ruminating','Noodling','Mulling','Synthesizing','Computing','Untangling','Divining','Tinkering'];
 const THINK_GLYPHS=['✶','✷','✸','✹','✺','✹','✸','✷'];
 let thinkTimer=0,thinkStart=0,thinkGi=0,thinkWi=0;
-function startThinking(){const el=$('#thinking');if(!el)return;
-  if(!thinkTimer){                 /* new turn: fresh clock + ONE word, fixed for this turn */
-    thinkStart=Date.now();
-    thinkWi=Math.floor(Math.random()*THINK_WORDS.length);
+function startThinking(wordSeed,elapsedMs){const el=$('#thinking');if(!el)return;
+  const fresh=!thinkTimer;         /* new turn, or reattaching to a running one */
+  if(fresh||elapsedMs!=null)thinkStart=Date.now()-(elapsedMs||0);
+  if(fresh||wordSeed!=null){       /* server-provided seed keeps the word stable across reattach */
+    thinkWi=(wordSeed!=null)?(wordSeed%THINK_WORDS.length):Math.floor(Math.random()*THINK_WORDS.length);
     el.querySelector('.word').textContent=THINK_WORDS[thinkWi];
   }
-  if(atBottom())scroll();
+  if(fresh&&atBottom())scroll();
   clearInterval(thinkTimer);
   thinkTimer=setInterval(()=>{     /* during the turn only the glyph + timer move */
     thinkGi=(thinkGi+1)%THINK_GLYPHS.length;
@@ -1741,7 +1840,8 @@ function startThinking(){const el=$('#thinking');if(!el)return;
 function stopThinking(){clearInterval(thinkTimer);thinkTimer=0;}
 function doInterrupt(){if(!running)return;wsSend({type:'interrupt'});addNotice('⏹ interrupt sent');}
 function clearUI(){stream.innerHTML='';$('#edits').innerHTML='<div class="empty">no file changes yet</div>';
-  $('#gitc').innerHTML='<div class="empty">—</div>';tools={};editCount=0;updateEditBadge();renderCtx(null);ready=false;}
+  $('#gitc').innerHTML='<div class="empty">—</div>';tools={};editCount=0;updateEditBadge();renderCtx(null);ready=false;
+  queued={};renderQueue();stopThinking();}
 
 /* file edits → out of chat, into the Changes drawer */
 function updateEditBadge(){$('#editN').textContent=editCount;}
@@ -1799,6 +1899,9 @@ function resolveQuestionCard(aid,ans){const c=stream.querySelector('.question[da
   const bt=c.querySelector('.qbtns');const has=vals&&vals.length;
   if(bt)bt.insertAdjacentHTML('afterend','<div class="qdone">'+(has?'✓ '+vals.map(esc).join(' · '):'✕ dismissed')+'</div>');}
 function route(ev){
+  /* if activity resumes while we think we're idle (e.g. the CLI ran an injected
+     queued message as its own turn), step back into the busy state */
+  if(!running&&(ev.kind==='assistant_text'||ev.kind==='thinking'||ev.kind==='tool_use'))setBusy(true);
   if(ev.kind==='user_text')addUser(ev.text,ev.images);
   else if(ev.kind==='ready'){ready=true;cwd=ev.cwd||cwd;curCC=ev.session_id||curCC;if(ev.model)setResolvedModel(ev.model);addNotice('● session ready · '+(ev.model||'')+' · '+(ev.cwd||''));}
   else if(ev.kind==='assistant_text')addAsst(ev.text);
@@ -1809,7 +1912,10 @@ function route(ev){
   else if(ev.kind==='approval_resolved')resolveApprovalCard(ev.aid,ev.allow);
   else if(ev.kind==='question')addQuestion(ev);
   else if(ev.kind==='question_resolved')resolveQuestionCard(ev.aid,ev.answers);
+  else if(ev.kind==='turn_start')setBusy(true,ev.word,0);
   else if(ev.kind==='turn_done'){setBusy(false);if(drawerOpen()&&gitTab())refreshGit();}
+  else if(ev.kind==='queued')addQueued(ev);
+  else if(ev.kind==='dequeued'||ev.kind==='unqueued')removeQueued(ev.qid);
   else if(ev.kind==='notice')addNotice(ev.text);
 }
 
@@ -1822,9 +1928,9 @@ function onMsg(e){const m=JSON.parse(e.data);
     addNotice('new session « '+(m.name||'')+' » in '+m.cwd+' — type your first message to begin');reqList();loadPast();}
   else if(m.type==='attached'){clearUI();pendingStart=false;sid=m.id;curCC=m.cc||null;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
     ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));syncPickers(m.model,m.mode);renderCtx(m.ctx);statset(m.ended?'ended':'ready');
-    m.events.forEach(route);setBusy(!!m.busy);
+    m.events.forEach(route);setBusy(!!m.busy,m.word,(m.turn_age||0)*1000);
     if(m.ended){markEnded('— this session has ended (history shown · you can resume it from disk) —');}
-    else{ta.disabled=false;sendBtn.disabled=!!m.busy;addNotice('— '+(m.resumed?'resumed':'reattached to')+' « '+(m.name||'')+' » ('+m.events.length+' events) —');}
+    else{ta.disabled=false;sendBtn.disabled=false;addNotice('— '+(m.resumed?'resumed':'reattached to')+' « '+(m.name||'')+' » ('+m.events.length+' events) —');}
     reqList();loadPast();}
   else if(m.type==='no_session'){localStorage.removeItem(SKEY);sid=null;ready=false;setBusy(false);setCurname('');renderCtx(null);statset('idle');
     addNotice('that session is no longer running — pick it under “Resume from disk”, or ＋ New.');reqList();loadPast();}
@@ -2069,9 +2175,32 @@ function handlePaste(e){const items=(e.clipboardData||{}).items||[];let got=fals
   for(const it of items){if(it.kind==='file'&&it.type.indexOf('image/')===0){const f=it.getAsFile();if(f){addImageFile(f);got=true;}}}
   if(got)e.preventDefault();}
 function sendMsg(){const t=ta.value.trim();
-  if((!t&&!pendingImages.length)||!ready||running||!sid||!ws||ws.readyState!==1)return;
+  if((!t&&!pendingImages.length)||!ready||!sid||!ws||ws.readyState!==1)return;
   wsSend({type:'user',text:t,images:pendingImages.map(im=>({media_type:im.media_type,data:im.data}))});
-  ta.value='';ta.style.height='auto';pendingImages=[];renderAttach();setBusy(true);}
+  ta.value='';ta.style.height='auto';pendingImages=[];renderAttach();}
+  /* busy state (and the thinking word/timer) is driven by the server's
+     turn_start, so it stays correct across reattach — no optimistic flip here */
+
+/* queued messages: chips above the composer while the agent is busy. Click a
+   chip (or press ↑ on an empty box) to withdraw it back into the editor. */
+let queued={};
+function renderQueue(){const q=$('#queue');if(!q)return;const ids=Object.keys(queued);
+  q.classList.toggle('on',ids.length>0);
+  q.innerHTML=ids.map(id=>'<div class="qmsg" data-q="'+id+'" title="click to edit · ✕ to discard">'+
+    '<span class="qicon">⏳</span><span class="qtext">'+esc(queued[id].text||'')+
+    (queued[id].images?(' 🖼×'+queued[id].images):'')+'</span><span class="qx" title="discard">✕</span></div>').join('');
+  q.querySelectorAll('.qmsg').forEach(el=>{const id=el.dataset.q;
+    el.querySelector('.qx').onclick=ev=>{ev.stopPropagation();discardQueued(id);};
+    el.onclick=()=>editQueued(id);});}
+function addQueued(ev){queued[ev.qid]={text:ev.text||'',images:ev.images||0};renderQueue();}
+function removeQueued(qid){if(queued[qid]){delete queued[qid];renderQueue();}}
+function discardQueued(id){if(ws&&ws.readyState===1)wsSend({type:'unqueue',qid:id});removeQueued(id);}
+function editQueued(id){const it=queued[id];if(!it)return;
+  const draft=ta.value;
+  ta.value=draft.trim()?(it.text+'\n'+draft):it.text;   /* keep any in-progress draft */
+  ta.dispatchEvent(new Event('input'));ta.focus();
+  if(it.images)addNotice('⚠ image(s) on the withdrawn message were dropped — re-paste if needed');
+  discardQueued(id);}
 
 /* sidebar open/close (mobile drawer; desktop collapse) */
 function openSidebar(){$('#sidebar').classList.add('open');$('#sb-backdrop').classList.add('show');}
@@ -2107,7 +2236,9 @@ async function refreshGit(){if(!cwd){$('#gitc').innerHTML='<div class="empty">no
 
 /* bindings */
 ta.addEventListener('input',()=>{ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,160)+'px';});
-ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMsg();}});
+ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMsg();}
+  else if(e.key==='ArrowUp'&&!ta.value&&Object.keys(queued).length){
+    e.preventDefault();const ids=Object.keys(queued);editQueued(ids[ids.length-1]);}});
 window.addEventListener('paste',handlePaste);
 sendBtn.onclick=sendMsg;
 $('#stop').onclick=doInterrupt;
