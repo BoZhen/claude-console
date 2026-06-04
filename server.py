@@ -1421,8 +1421,12 @@ pre code{background:none;border:none;padding:0}
 @media(max-width:680px){.usage{display:none!important}}
 #shell{flex:1;display:flex;min-height:0;position:relative}
 #mainCol{flex:1;display:flex;flex-direction:column;min-width:0}
-#sidebar{width:250px;flex-shrink:0;background:var(--bg2);border-right:1px solid var(--line);display:flex;flex-direction:column;overflow-y:auto}
+#sidebar{width:var(--sbw,270px);flex-shrink:0;background:var(--bg2);border-right:1px solid var(--line);display:flex;flex-direction:column;overflow-y:auto}
 #sidebar.collapsed{display:none}
+/* desktop: drag handle on the sidebar's right edge to resize */
+#sbresize{flex-shrink:0;width:5px;cursor:col-resize;background:transparent;transition:background .12s;z-index:5}
+#sbresize:hover,#sbresize.drag{background:var(--acc)}
+#sidebar.collapsed + #sbresize{display:none}
 .sb-new{padding:8px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:6px}
 .sb-new select,.sb-new input{width:100%;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:5px;padding:5px 7px;font-size:12.5px}
 .cwdwrap{position:relative;display:none}
@@ -1455,15 +1459,20 @@ pre code{background:none;border:none;padding:0}
 .srow .smeta{flex:1;min-width:0}
 .srow .sname{font-size:12.5px;color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .srow .ssub{font-size:11px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.srow .sx{color:var(--mut);flex-shrink:0;font-size:13px;padding:0 3px;opacity:0}
-.srow:hover .sx{opacity:.6}.srow .sx:hover{opacity:1;color:var(--del)}
-.srow .star{flex-shrink:0;font-size:13px;padding:0 3px;color:var(--mut);cursor:pointer}
-.srow .star.on{color:var(--tool)}
-.srow .star:hover{color:var(--tool);filter:brightness(1.2)}
-.srow .strash{flex-shrink:0;font-size:12.5px;padding:0 3px;cursor:pointer;opacity:0}
-.srow:hover .strash{opacity:.5}.srow .strash:hover{opacity:1;filter:brightness(1.3) saturate(1.4)}
-.srow .spen{flex-shrink:0;font-size:12px;padding:0 2px;color:var(--mut);cursor:pointer;opacity:0}
-.srow:hover .spen{opacity:.5}.srow .spen:hover{opacity:1;color:var(--acc)}
+.srow .skebab{flex-shrink:0;font-size:18px;line-height:1;padding:1px 6px;color:var(--fg);cursor:pointer;opacity:.9;border-radius:5px;user-select:none}
+.srow:hover .skebab{opacity:1}.srow .skebab:hover{color:var(--acc);background:var(--bg3)}
+/* collapsible past-session sections */
+.sb-h.sb-toggle{cursor:pointer;user-select:none}
+.sb-h .caret{font-size:9px;line-height:1;display:inline-block;width:9px;transition:transform .15s;color:var(--mut)}
+.sb-sec.collapsed .caret{transform:rotate(-90deg)}
+.sb-sec.collapsed .seclist{display:none}
+.seclist{max-height:266px;overflow-y:auto}
+/* shared per-card action menu (⋯) */
+#cardMenu{position:fixed;z-index:60;min-width:152px;background:var(--bg2);border:1px solid var(--line);border-radius:8px;box-shadow:0 8px 26px rgba(0,0,0,.55);padding:4px;display:none}
+#cardMenu.on{display:block}
+#cardMenu .mi{padding:7px 10px;font-size:12.5px;color:var(--fg);cursor:pointer;border-radius:5px;white-space:nowrap}
+#cardMenu .mi:hover{background:var(--bg3)}
+#cardMenu .mi.danger{color:#ffb4a8}#cardMenu .mi.danger:hover{background:#3a1d1d}
 .fscope{font-size:10px;color:var(--mut);font-family:ui-monospace,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:130px}
 #sb-backdrop{display:none}
 @media(max-width:860px){
@@ -1471,8 +1480,13 @@ pre code{background:none;border:none;padding:0}
   #sidebar.open{transform:none}
   #sidebar.collapsed{display:flex}
   #sb-backdrop.show{display:block;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:35}
+  #sbresize{display:none}
 }
+.bubble .math.display{display:block;margin:6px 0;overflow-x:auto;overflow-y:hidden;max-width:100%}
+.katex-display{margin:.35em 0!important}
 </style>
+<link rel="stylesheet" href="/static/katex/katex.min.css">
+<script src="/static/katex/katex.min.js"></script>
 </head>
 <body>
 <header>
@@ -1498,19 +1512,20 @@ pre code{background:none;border:none;padding:0}
       <div class="sb-h">Live <span id="liveN" class="cnt">0</span></div>
       <div id="liveList"><div class="sb-empty">none running</div></div>
     </div>
-    <div class="sb-sec">
-      <div class="sb-h">★ Favorites <span id="favN" class="cnt">0</span></div>
-      <div id="favList"><div class="sb-empty">star a session to pin it here</div></div>
+    <div class="sb-sec" id="secFav">
+      <div class="sb-h sb-toggle"><span class="caret">▾</span>★ Favorites <span id="favN" class="cnt">0</span></div>
+      <div id="favList" class="seclist"><div class="sb-empty">star a session to pin it here</div></div>
     </div>
-    <div class="sb-sec">
-      <div class="sb-h">🕘 Recent <span class="grow"></span><span class="sb-ref" id="resumeRef" title="refresh">↻</span></div>
-      <div id="recentList"><div class="sb-empty">—</div></div>
+    <div class="sb-sec" id="secRecent">
+      <div class="sb-h sb-toggle"><span class="caret">▾</span>🕘 Recent <span class="grow"></span><span class="sb-ref" id="resumeRef" title="refresh">↻</span></div>
+      <div id="recentList" class="seclist"><div class="sb-empty">—</div></div>
     </div>
-    <div class="sb-sec">
-      <div class="sb-h">📁 In folder <span class="grow"></span><span id="folderScope" class="fscope"></span></div>
-      <div id="folderList"><div class="sb-empty">—</div></div>
+    <div class="sb-sec" id="secFolder">
+      <div class="sb-h sb-toggle"><span class="caret">▾</span>📁 In folder <span class="grow"></span><span id="folderScope" class="fscope"></span></div>
+      <div id="folderList" class="seclist"><div class="sb-empty">—</div></div>
     </div>
   </aside>
+  <div id="sbresize"></div>
   <div id="sb-backdrop"></div>
   <div id="mainCol">
     <div id="chat"><div class="wrap" id="stream"></div></div>
@@ -1530,6 +1545,7 @@ pre code{background:none;border:none;padding:0}
   <div class="dc" id="edits"><div class="empty">no file changes yet</div></div>
   <div class="dc" id="gitc" style="display:none"><div class="empty">—</div></div>
 </div>
+<div id="cardMenu"></div>
 
 <script>
 const $=s=>document.querySelector(s);
@@ -1543,8 +1559,15 @@ const SKEY='al_session';
 
 function esc(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function md(src){
-  src=src||''; const bl=[];
+  src=src||''; const bl=[], ml=[];
   src=src.replace(/```(\w*)\n?([\s\S]*?)```/g,(m,l,c)=>{bl.push('<pre><code>'+esc(c.replace(/\n$/,''))+'</code></pre>');return ' %%CB'+(bl.length-1)+'%% ';});
+  /* protect LaTeX from the markdown passes; KaTeX renders it after insert.
+     display ($$…$$, \[…\]) before inline (\(…\), $…$). */
+  const mj=(t,d)=>{ml.push({t:t,d:d});return '%%MJ'+(ml.length-1)+'%%';};
+  src=src.replace(/\$\$([\s\S]+?)\$\$/g,(m,c)=>mj(c,1));
+  src=src.replace(/\\\[([\s\S]+?)\\\]/g,(m,c)=>mj(c,1));
+  src=src.replace(/\\\(([\s\S]+?)\\\)/g,(m,c)=>mj(c,0));
+  src=src.replace(/\$(?!\s)([^\n$]*?[^\s$])\$(?!\d)/g,(m,c)=>mj(c,0));
   let h=esc(src);
   h=h.replace(/`([^`\n]+)`/g,(m,c)=>'<code>'+c+'</code>');
   h=h.replace(/\*\*([^*\n]+)\*\*/g,'<b>$1</b>');
@@ -1553,8 +1576,13 @@ function md(src){
   h=h.replace(/^[\-\*] (.*)$/gm,'<li>$1</li>').replace(/(<li>[\s\S]*?<\/li>)/g,'<ul>$1</ul>');
   h=h.replace(/\n/g,'<br>').replace(/<br>(<(?:pre|h2|h3|ul)>)/g,'$1').replace(/(<\/(?:pre|h2|h3|ul)>)<br>/g,'$1');
   h=h.replace(/%%CB(\d+)%%/g,(m,i)=>bl[+i]);
+  h=h.replace(/%%MJ(\d+)%%/g,(m,i)=>'<span class="math'+(ml[+i].d?' display':'')+'" data-d="'+ml[+i].d+'">'+esc(ml[+i].t)+'</span>');
   return h;
 }
+/* render protected LaTeX spans with KaTeX (textContent decodes the escaped TeX) */
+function typesetMath(root){if(!window.katex)return;
+  root.querySelectorAll('.math').forEach(el=>{if(el.dataset.done)return;el.dataset.done='1';
+    try{katex.render(el.textContent,el,{displayMode:el.dataset.d==='1',throwOnError:false,errorColor:'#f85149'});}catch(e){}});}
 function diffHtml(t){return t.split('\n').map(l=>{let c='dl-ctx';
   if(l.startsWith('@@')||l.startsWith('diff ')||l.startsWith('+++')||l.startsWith('---'))c='dl-hdr';
   else if(l.startsWith('+'))c='dl-add';else if(l.startsWith('-'))c='dl-del';
@@ -1584,7 +1612,7 @@ function addUser(text,nImg){const s=atBottom();const d=document.createElement('d
   d.innerHTML='<div class="b">'+esc(text)+'</div>'+(nImg?'<div class="imgs">🖼 '+nImg+' image'+(nImg>1?'s':'')+' attached</div>':'');
   stream.appendChild(d);scroll();}
 function addAsst(text){const s=atBottom();const d=document.createElement('div');d.className='msg asst';
-  d.innerHTML='<div class="b bubble">'+md(text)+'</div>';stream.appendChild(d);if(s)scroll();}
+  d.innerHTML='<div class="b bubble">'+md(text)+'</div>';typesetMath(d);stream.appendChild(d);if(s)scroll();}
 function addThink(text){const s=atBottom();const d=document.createElement('div');d.className='think'+(showThink?'':' hide');d.dataset.t=1;
   d.textContent=text;stream.appendChild(d);if(s)scroll();}
 function addNotice(t){const d=document.createElement('div');d.className='notice';d.textContent=t;stream.appendChild(d);}
@@ -1801,6 +1829,31 @@ function setResolvedModel(real,maxTok){
     x.textContent=lbl||'model: default';break;}}}
 
 /* sidebar: live sessions (in-RAM) + resume-from-disk (past transcripts) */
+/* shared per-card action menu (⋯): a fixed popover anchored to the clicked
+   kebab, so it is never clipped by the sidebar's overflow */
+function closeCardMenu(){const m=$('#cardMenu');m.classList.remove('on');m.innerHTML='';m._anchor=null;}
+/* clicking the same ⋯ again closes the menu (toggle); a different one re-anchors */
+function toggleCardMenu(anchor,items){const m=$('#cardMenu');
+  if(m.classList.contains('on')&&m._anchor===anchor){closeCardMenu();return;}
+  openCardMenu(anchor,items);}
+function openCardMenu(anchor,items){const m=$('#cardMenu');m.innerHTML='';m._anchor=anchor;
+  items.forEach(it=>{const d=document.createElement('div');d.className='mi'+(it.danger?' danger':'');
+    d.textContent=it.label;d.onclick=ev=>{ev.stopPropagation();closeCardMenu();it.fn();};m.appendChild(d);});
+  m.classList.add('on');
+  const r=anchor.getBoundingClientRect(),mw=m.offsetWidth,mh=m.offsetHeight;
+  let left=r.right-mw,top=r.bottom+4;
+  if(left<6)left=6;
+  if(top+mh>window.innerHeight-6)top=Math.max(6,r.top-mh-4);
+  m.style.left=left+'px';m.style.top=top+'px';}
+
+/* collapsible sidebar sections (Favorites / Recent / In folder) */
+const SECKEY='al_seccol';
+function toggleSec(id){const el=$('#'+id);if(!el)return;el.classList.toggle('collapsed');
+  let c={};try{c=JSON.parse(localStorage.getItem(SECKEY)||'{}');}catch(e){}
+  c[id]=el.classList.contains('collapsed');localStorage.setItem(SECKEY,JSON.stringify(c));}
+function applySecCollapse(){let c={};try{c=JSON.parse(localStorage.getItem(SECKEY)||'{}');}catch(e){}
+  ['secFav','secRecent','secFolder'].forEach(id=>{const el=$('#'+id);if(el)el.classList.toggle('collapsed',!!c[id]);});}
+
 function renderLive(list){const box=$('#liveList');
   liveCCs=new Set(list.map(s=>s.cc).filter(Boolean));
   $('#liveN').textContent=list.length;
@@ -1813,12 +1866,14 @@ function renderLive(list){const box=$('#liveList');
     r.innerHTML='<span class="sdot '+dot+'"></span><div class="smeta">'+
       '<div class="sname">'+esc(s.title||s.name||'new session')+(s.ended?' · ended':'')+'</div>'+
       '<div class="ssub">'+esc(proj)+(s.busy?' · working…':'')+'</div></div>'+
-      '<span class="spen" title="rename">✎</span>'+
-      '<span class="sx" title="end session">✕</span>';
+      '<span class="skebab" title="more">⋮</span>';
     r.querySelector('.smeta').onclick=()=>switchSession(s.id);
     r.querySelector('.sdot').onclick=()=>switchSession(s.id);
-    r.querySelector('.spen').onclick=ev=>{ev.stopPropagation();renameSession(s.cc,s.title||s.name);};
-    r.querySelector('.sx').onclick=ev=>{ev.stopPropagation();endSessionById(s.id,s.name);};
+    r.querySelector('.skebab').onclick=ev=>{ev.stopPropagation();const items=[
+      {label:'✎ Rename',fn:()=>renameSession(s.cc,s.title||s.name)}];
+      if(s.cc)items.push({label:isFav(s.cc)?'★ Unfavorite':'☆ Favorite',fn:()=>toggleFav(s)});
+      items.push({label:'✕ End session',danger:true,fn:()=>endSessionById(s.id,s.name)});
+      toggleCardMenu(ev.currentTarget,items);};
     box.appendChild(r);});}
   renderPast();
 }
@@ -1838,14 +1893,13 @@ function pastRow(s,fav){const r=document.createElement('div');r.className='srow'
   const sub=(fav?'':'↺ ')+esc(proj)+(s.mtime?(' · '+reltime(s.mtime)):'');
   r.innerHTML='<span class="sdot"></span><div class="smeta">'+
     '<div class="sname">'+esc(s.title||proj||'session')+'</div><div class="ssub">'+sub+'</div></div>'+
-    '<span class="spen" title="rename">✎</span>'+
-    '<span class="star'+(fav?' on':'')+'" title="'+(fav?'unfavorite':'favorite')+'">'+(fav?'★':'☆')+'</span>'+
-    '<span class="strash" title="delete from disk (moves to trash)">🗑</span>';
+    '<span class="skebab" title="more">⋮</span>';
   r.querySelector('.smeta').onclick=()=>resumeSession(s);
   r.querySelector('.sdot').onclick=()=>resumeSession(s);
-  r.querySelector('.spen').onclick=ev=>{ev.stopPropagation();renameSession(s.cc,s.title);};
-  r.querySelector('.star').onclick=ev=>{ev.stopPropagation();toggleFav(s);};
-  r.querySelector('.strash').onclick=ev=>{ev.stopPropagation();delResumable(s);};
+  r.querySelector('.skebab').onclick=ev=>{ev.stopPropagation();toggleCardMenu(ev.currentTarget,[
+    {label:'✎ Rename',fn:()=>renameSession(s.cc,s.title)},
+    {label:fav?'★ Unfavorite':'☆ Favorite',fn:()=>toggleFav(s)},
+    {label:'🗑 Delete (to trash)',danger:true,fn:()=>delResumable(s)}]);};
   return r;}
 function renameSession(cc,cur){
   if(!cc){alert('This session is still starting — try again in a moment.');return;}
@@ -1867,11 +1921,11 @@ function renderPast(){
   const fb=$('#favList');$('#favN').textContent=favs.length;
   if(!favs.length)fb.innerHTML='<div class="sb-empty">star a session to pin it here</div>';
   else{fb.innerHTML='';favs.forEach(f=>fb.appendChild(pastRow(f,true)));}
-  const rec=(recentData||[]).filter(s=>!liveCCs.has(s.cc)&&!favCC.has(s.cc)).slice(0,8);
+  const rec=(recentData||[]).filter(s=>!liveCCs.has(s.cc)&&!favCC.has(s.cc)).slice(0,30);
   const rb=$('#recentList');
   if(!rec.length)rb.innerHTML='<div class="sb-empty">no recent sessions</div>';
   else{rb.innerHTML='';rec.forEach(s=>rb.appendChild(pastRow(s,false)));}
-  const fol=(folderData||[]).filter(s=>!liveCCs.has(s.cc)&&!favCC.has(s.cc)).slice(0,15);
+  const fol=(folderData||[]).filter(s=>!liveCCs.has(s.cc)&&!favCC.has(s.cc)).slice(0,30);
   const ob=$('#folderList');
   if(!fol.length)ob.innerHTML='<div class="sb-empty">no past sessions in this folder</div>';
   else{ob.innerHTML='';fol.forEach(s=>ob.appendChild(pastRow(s,false)));}
@@ -1984,7 +2038,29 @@ document.addEventListener('keydown',e=>{
 $('#newbtn').onclick=newSession;
 $('#navtoggle').onclick=toggleSidebar;
 $('#sb-backdrop').onclick=closeSidebar;
-$('#resumeRef').onclick=loadPast;
+/* desktop: drag the sidebar's right edge to resize (clamped + persisted) */
+const SBW_KEY='al_sbw',SBW_MIN=200,SBW_MAX=560;
+function setSidebarW(w,save){w=Math.max(SBW_MIN,Math.min(SBW_MAX,Math.round(w)));
+  document.documentElement.style.setProperty('--sbw',w+'px');
+  if(save)localStorage.setItem(SBW_KEY,w);}
+(function(){const saved=parseInt(localStorage.getItem(SBW_KEY)||'',10);if(saved)setSidebarW(saved,false);
+  const h=$('#sbresize');if(!h)return;let on=false;
+  h.addEventListener('mousedown',e=>{on=true;h.classList.add('drag');document.body.style.userSelect='none';e.preventDefault();});
+  window.addEventListener('mousemove',e=>{if(!on)return;setSidebarW(e.clientX-$('#sidebar').getBoundingClientRect().left,false);});
+  window.addEventListener('mouseup',()=>{if(!on)return;on=false;h.classList.remove('drag');document.body.style.userSelect='';
+    setSidebarW($('#sidebar').getBoundingClientRect().width,true);});
+  h.addEventListener('dblclick',()=>setSidebarW(270,true));   /* double-click: reset to default */
+})();
+$('#resumeRef').onclick=e=>{e.stopPropagation();loadPast();};
+/* collapsible sections: clicking the header toggles; restore saved state */
+['secFav','secRecent','secFolder'].forEach(id=>{
+  const h=$('#'+id+' .sb-h');if(h)h.onclick=()=>toggleSec(id);});
+applySecCollapse();
+/* dismiss the ⋯ card menu on outside-click, Escape, scroll or resize */
+document.addEventListener('click',e=>{if(!e.target.closest('#cardMenu')&&!e.target.closest('.skebab'))closeCardMenu();});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeCardMenu();});
+window.addEventListener('resize',closeCardMenu);
+window.addEventListener('scroll',closeCardMenu,true);
 /* model/mode: apply live to the active session; otherwise just seed the next New */
 $('#model').onchange=()=>{if(sid&&ws&&ws.readyState===1)wsSend({type:'set_model',model:$('#model').value});};
 $('#mode').onchange=()=>{if(sid&&ws&&ws.readyState===1)wsSend({type:'set_mode',mode:$('#mode').value});};
@@ -2042,6 +2118,8 @@ def main():
         (r"/api/diff", DiffHandler),
         (r"/api/usage", UsageHandler),
         (r"/ws/chat", ChatSocket),
+        (r"/static/(.*)", tornado.web.StaticFileHandler,
+         {"path": os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")}),
     ])
     loopback = BIND in ("127.0.0.1", "localhost", "::1")
     app.listen(PORT, address=BIND)
