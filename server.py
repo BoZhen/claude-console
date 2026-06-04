@@ -965,10 +965,24 @@ class ChatSession:
                             "model": d.get("model"), "cwd": d.get("cwd"),
                             "effort": self.effort})
             elif msg.subtype == "compact_boundary":
-                cm = (msg.data or {}).get("compactMetadata") or {}
-                evs.append({"kind": "compacted", "trigger": cm.get("trigger"),
-                            "pre": cm.get("preTokens"), "post": cm.get("postTokens"),
-                            "ms": cm.get("durationMs")})
+                d = msg.data or {}
+                # On-disk transcript uses camelCase (compactMetadata/preTokens);
+                # the stream-json the SDK delivers uses snake_case — accept both.
+                cm = d.get("compactMetadata") or d.get("compact_metadata") or {}
+                def g(*ks):
+                    for k in ks:
+                        v = cm.get(k)
+                        if v is None:
+                            v = d.get(k)
+                        if v is not None:
+                            return v
+                    return None
+                print(f"[compact_boundary] data_keys={sorted(d.keys())} "
+                      f"meta_keys={sorted(cm.keys())}", flush=True)
+                evs.append({"kind": "compacted", "trigger": g("trigger"),
+                            "pre": g("preTokens", "pre_tokens"),
+                            "post": g("postTokens", "post_tokens"),
+                            "ms": g("durationMs", "duration_ms")})
         elif isinstance(msg, AssistantMessage):
             if not self.cc_id and getattr(msg, "session_id", None):
                 self.cc_id = msg.session_id
@@ -1990,9 +2004,11 @@ function resolveQuestionCard(aid,ans){const c=stream.querySelector('.question[da
   else if(ans&&typeof ans==='object')vals=Object.values(ans);
   const bt=c.querySelector('.qbtns');const has=vals&&vals.length;
   if(bt)bt.insertAdjacentHTML('afterend','<div class="qdone">'+(has?'✓ '+vals.map(esc).join(' · '):'✕ dismissed')+'</div>');}
-function fmtTok(n){return n==null?'?':(n>=1000?(n/1000).toFixed(1)+'k':''+n);}
-function fmtCompacted(ev){return '🗜 context compacted · '+fmtTok(ev.pre)+' → '+fmtTok(ev.post)+' tokens'+
-  (ev.trigger?' · '+(ev.trigger==='auto'?'auto':'manual'):'')+(ev.ms?' · '+Math.round(ev.ms/1000)+'s':'');}
+function fmtCompacted(ev){let s='🗜 context compacted';
+  if(ev.pre!=null||ev.post!=null)s+=' · '+fmtTok(ev.pre)+' → '+fmtTok(ev.post)+' tokens';
+  if(ev.trigger)s+=' · '+(ev.trigger==='auto'?'auto':'manual');
+  if(ev.ms)s+=' · '+Math.round(ev.ms/1000)+'s';
+  return s;}
 function route(ev){
   /* if activity resumes while we think we're idle (e.g. the CLI ran an injected
      queued message as its own turn), step back into the busy state */
