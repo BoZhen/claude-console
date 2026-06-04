@@ -804,6 +804,7 @@ class ChatSession:
         self._qid = 0
         self.turn_started = None  # wall time the current turn began (for the timer)
         self.turn_word = 0        # seed for the "thinking" word, stable across reattach
+        self.compacting = False   # True while a manual /compact is running
 
     def preload(self):
         """Populate history from the on-disk transcript before resuming."""
@@ -915,14 +916,18 @@ class ChatSession:
                     if e["kind"] == "turn_done":
                         self.busy = False
                         self.turn_started = None
+                        self.compacting = False
+                    elif e["kind"] == "compacted":
+                        self.compacting = False
                     elif e["kind"] == "ready":
                         self.cc_id = e.get("session_id") or self.cc_id
                         if self.cc_id:   # record this session's mode/model once
                             save_pref(self.cc_id, mode=self.mode, model=self.model, effort=self.effort)
                 if evs:
                     self._push(evs)
-                # refresh context-window usage after a turn settles or on init
-                if any(e["kind"] in ("turn_done", "ready") for e in evs):
+                # refresh context-window usage after a turn settles, on init, or
+                # after a compaction (which slashes the token count)
+                if any(e["kind"] in ("turn_done", "ready", "compacted") for e in evs):
                     await self._refresh_context()
                 # a turn just settled → send the next queued message, if any
                 if any(e["kind"] == "turn_done" for e in evs):
@@ -959,6 +964,11 @@ class ChatSession:
                 evs.append({"kind": "ready", "session_id": d.get("session_id"),
                             "model": d.get("model"), "cwd": d.get("cwd"),
                             "effort": self.effort})
+            elif msg.subtype == "compact_boundary":
+                cm = (msg.data or {}).get("compactMetadata") or {}
+                evs.append({"kind": "compacted", "trigger": cm.get("trigger"),
+                            "pre": cm.get("preTokens"), "post": cm.get("postTokens"),
+                            "ms": cm.get("durationMs")})
         elif isinstance(msg, AssistantMessage):
             if not self.cc_id and getattr(msg, "session_id", None):
                 self.cc_id = msg.session_id
@@ -1046,7 +1056,11 @@ class ChatSession:
             self.busy = True
             self.turn_started = time.time()
             self.turn_word = secrets.randbelow(100000)
+            cmd0 = text.strip().split(None, 1)[0] if text.strip() else ""
+            self.compacting = (cmd0 == "/compact")
         self._echo_user(text, images, qid=qid, start=start)
+        if start and self.compacting:   # surface the otherwise-silent long compaction
+            self._push([{"kind": "compacting", "word": self.turn_word}])
         client = self.client
         payload = self._make_payload(text, images)
         async def _q():
@@ -1249,7 +1263,8 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "title": sess.title(), "ctx": sess.ctx,
                        "model": sess.model or "default", "mode": sess.mode,
                        "busy": sess.busy, "ended": sess.ended, "events": sess.log,
-                       "turn_age": sess.turn_age(), "word": sess.turn_word, "effort": sess.effort})
+                       "turn_age": sess.turn_age(), "word": sess.turn_word, "effort": sess.effort,
+                       "compacting": sess.compacting})
         elif mt == "resume":
             if not CLAUDE_BIN or not os.path.exists(CLAUDE_BIN):
                 self._say({"type": "error", "error": "claude CLI not found"})
@@ -1287,7 +1302,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "model": sess.model or "default", "mode": sess.mode,
                        "busy": sess.busy, "ended": sess.ended, "events": sess.log,
                        "turn_age": sess.turn_age(), "word": sess.turn_word, "effort": sess.effort,
-                       "resumed": True})
+                       "compacting": sess.compacting, "resumed": True})
         elif mt == "approve" and self.session:
             self.session.resolve_approval(msg.get("aid"), bool(msg.get("allow")), bool(msg.get("always")))
         elif mt == "answer" and self.session:
@@ -1329,7 +1344,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                                "model": new.model or "default", "mode": new.mode,
                                "busy": new.busy, "ended": new.ended, "events": new.log,
                                "turn_age": new.turn_age(), "word": new.turn_word,
-                               "effort": new.effort, "resumed": True})
+                               "effort": new.effort, "compacting": new.compacting, "resumed": True})
         elif mt == "user" and self.session:
             self.session.send_user(msg.get("text", ""), msg.get("images"))
         elif mt == "unqueue" and self.session:
@@ -1675,8 +1690,14 @@ pre code{background:none;border:none;padding:0}
 .srow:hover .skebab{opacity:1}.srow .skebab:hover{color:var(--acc);background:var(--bg3)}
 /* collapsible past-session sections */
 .sb-h.sb-toggle{cursor:pointer;user-select:none}
-.sb-h .caret{font-size:9px;line-height:1;display:inline-block;width:9px;transition:transform .15s;color:var(--mut)}
-.sb-sec.collapsed .caret{transform:rotate(-90deg)}
+.sb-h .caret{display:inline-flex;align-items:center;justify-content:center;flex:none;
+  width:18px;height:18px;margin-left:-3px;border-radius:6px;color:var(--fg);opacity:.72;
+  transition:background .15s,opacity .15s}
+.sb-h .caret::before{content:"";width:7px;height:7px;border-right:2px solid currentColor;
+  border-bottom:2px solid currentColor;border-radius:1.5px;
+  transform:translate(-1px,-2px) rotate(45deg);transition:transform .2s ease}
+.sb-sec.collapsed .caret::before{transform:translate(-2px,0) rotate(-45deg)}
+.sb-h.sb-toggle:hover .caret{opacity:1;background:var(--bg3)}
 .sb-sec.collapsed .seclist{display:none}
 .seclist{max-height:266px;overflow-y:auto}
 /* shared per-card action menu (⋯) */
@@ -1725,15 +1746,15 @@ pre code{background:none;border:none;padding:0}
       <div id="liveList"><div class="sb-empty">none running</div></div>
     </div>
     <div class="sb-sec" id="secFav">
-      <div class="sb-h sb-toggle"><span class="caret">▾</span>★ Favorites <span id="favN" class="cnt">0</span></div>
+      <div class="sb-h sb-toggle"><span class="caret"></span>★ Favorites <span id="favN" class="cnt">0</span></div>
       <div id="favList" class="seclist"><div class="sb-empty">star a session to pin it here</div></div>
     </div>
     <div class="sb-sec" id="secRecent">
-      <div class="sb-h sb-toggle"><span class="caret">▾</span>🕘 Recent <span class="grow"></span><span class="sb-ref" id="resumeRef" title="refresh">↻</span></div>
+      <div class="sb-h sb-toggle"><span class="caret"></span>🕘 Recent <span class="grow"></span><span class="sb-ref" id="resumeRef" title="refresh">↻</span></div>
       <div id="recentList" class="seclist"><div class="sb-empty">—</div></div>
     </div>
     <div class="sb-sec" id="secFolder">
-      <div class="sb-h sb-toggle"><span class="caret">▾</span>📁 In folder <span class="grow"></span><span id="folderScope" class="fscope"></span></div>
+      <div class="sb-h sb-toggle"><span class="caret"></span>📁 In folder <span class="grow"></span><span id="folderScope" class="fscope"></span></div>
       <div id="folderList" class="seclist"><div class="sb-empty">—</div></div>
     </div>
     <div class="sb-foot">
@@ -1788,7 +1809,7 @@ pre code{background:none;border:none;padding:0}
 <script>
 const $=s=>document.querySelector(s);
 const stream=$('#stream'), ta=$('#ta'), sendBtn=$('#send');
-let ws=null, running=false, ready=false, cwd='', tools={};
+let ws=null, running=false, ready=false, compacting=false, cwd='', tools={};
 let sid=null, curCC=null, editCount=0, pendingStart=false, reconnectT=0;
 const EFFORTS=['low','medium','high','xhigh','max'];
 let curEffort=localStorage.getItem('al_effort')||'max';
@@ -1892,7 +1913,8 @@ let thinkTimer=0,thinkStart=0,thinkGi=0,thinkWi=0;
 function startThinking(wordSeed,elapsedMs){const el=$('#thinking');if(!el)return;
   const fresh=!thinkTimer;         /* new turn, or reattaching to a running one */
   if(fresh||elapsedMs!=null)thinkStart=Date.now()-(elapsedMs||0);
-  if(fresh||wordSeed!=null){       /* server-provided seed keeps the word stable across reattach */
+  if(compacting){el.querySelector('.word').textContent='Compacting';}
+  else if(fresh||wordSeed!=null){  /* server-provided seed keeps the word stable across reattach */
     thinkWi=(wordSeed!=null)?(wordSeed%THINK_WORDS.length):Math.floor(Math.random()*THINK_WORDS.length);
     el.querySelector('.word').textContent=THINK_WORDS[thinkWi];
   }
@@ -1901,7 +1923,8 @@ function startThinking(wordSeed,elapsedMs){const el=$('#thinking');if(!el)return
   thinkTimer=setInterval(()=>{     /* during the turn only the glyph + timer move */
     thinkGi=(thinkGi+1)%THINK_GLYPHS.length;
     el.querySelector('.glyph').textContent=THINK_GLYPHS[thinkGi];
-    el.querySelector('.meta').textContent=Math.floor((Date.now()-thinkStart)/1000)+'s · esc to interrupt';
+    const s=Math.floor((Date.now()-thinkStart)/1000);
+    el.querySelector('.meta').textContent=compacting?(s+'s · compacting · esc to interrupt'):(s+'s · esc to interrupt');
   },130);}
 function stopThinking(){clearInterval(thinkTimer);thinkTimer=0;}
 function doInterrupt(){if(!running)return;wsSend({type:'interrupt'});addNotice('⏹ interrupt sent');}
@@ -1967,6 +1990,9 @@ function resolveQuestionCard(aid,ans){const c=stream.querySelector('.question[da
   else if(ans&&typeof ans==='object')vals=Object.values(ans);
   const bt=c.querySelector('.qbtns');const has=vals&&vals.length;
   if(bt)bt.insertAdjacentHTML('afterend','<div class="qdone">'+(has?'✓ '+vals.map(esc).join(' · '):'✕ dismissed')+'</div>');}
+function fmtTok(n){return n==null?'?':(n>=1000?(n/1000).toFixed(1)+'k':''+n);}
+function fmtCompacted(ev){return '🗜 context compacted · '+fmtTok(ev.pre)+' → '+fmtTok(ev.post)+' tokens'+
+  (ev.trigger?' · '+(ev.trigger==='auto'?'auto':'manual'):'')+(ev.ms?' · '+Math.round(ev.ms/1000)+'s':'');}
 function route(ev){
   /* if activity resumes while we think we're idle (e.g. the CLI ran an injected
      queued message as its own turn), step back into the busy state */
@@ -1982,7 +2008,9 @@ function route(ev){
   else if(ev.kind==='question')addQuestion(ev);
   else if(ev.kind==='question_resolved')resolveQuestionCard(ev.aid,ev.answers);
   else if(ev.kind==='turn_start')setBusy(true,ev.word,0);
-  else if(ev.kind==='turn_done'){setBusy(false);if(drawerOpen()&&gitTab())refreshGit();}
+  else if(ev.kind==='compacting'){compacting=true;setBusy(true,ev.word,0);}
+  else if(ev.kind==='compacted'){compacting=false;addNotice(fmtCompacted(ev));if(ev.trigger!=='auto')setBusy(false);}
+  else if(ev.kind==='turn_done'){compacting=false;setBusy(false);if(drawerOpen()&&gitTab())refreshGit();}
   else if(ev.kind==='queued')addQueued(ev);
   else if(ev.kind==='dequeued'||ev.kind==='unqueued')removeQueued(ev.qid);
   else if(ev.kind==='notice')addNotice(ev.text);
@@ -1997,7 +2025,7 @@ function onMsg(e){const m=JSON.parse(e.data);
     addNotice('new session « '+(m.name||'')+' »'+(m.effort?' · '+m.effort+' effort':'')+' in '+m.cwd+' — type your first message to begin');reqList();loadPast();}
   else if(m.type==='attached'){clearUI();pendingStart=false;sid=m.id;curCC=m.cc||null;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
     ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));syncPickers(m.model,m.mode);setEffortPill(m.effort);renderCtx(m.ctx);statset(m.ended?'ended':'ready');
-    m.events.forEach(route);setBusy(!!m.busy,m.word,(m.turn_age||0)*1000);
+    m.events.forEach(route);compacting=!!m.compacting;setBusy(!!m.busy,m.word,(m.turn_age||0)*1000);
     if(m.ended){markEnded('— this session has ended (history shown · you can resume it from disk) —');}
     else{ta.disabled=false;sendBtn.disabled=false;addNotice('— '+(m.resumed?'resumed':'reattached to')+' « '+(m.name||'')+' » ('+m.events.length+' events)'+(m.effort?' with '+m.effort+' effort':'')+' —');}
     reqList();loadPast();}

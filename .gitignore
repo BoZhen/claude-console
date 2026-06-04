@@ -6,3 +6,4 @@ __pycache__/
 .omx/
 .claude/
 .venv/
+docs/snapshot.md
