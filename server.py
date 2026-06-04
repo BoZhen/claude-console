@@ -464,8 +464,8 @@ def load_prefs():
     return _prefs_cache["v"]
 
 
-def save_pref(cc, mode=None, model=None):
-    """Persist a session's mode and/or model. No-op write when unchanged."""
+def save_pref(cc, mode=None, model=None, effort=None):
+    """Persist a session's mode/model/effort. No-op write when unchanged."""
     if not _valid_cc(cc):
         return
     prefs = load_prefs()
@@ -474,6 +474,8 @@ def save_pref(cc, mode=None, model=None):
         cur["mode"] = mode
     if model is not None:
         cur["model"] = model
+    if effort is not None:
+        cur["effort"] = effort
     if cur == prefs.get(cc):
         return
     prefs = dict(prefs); prefs[cc] = cur
@@ -772,17 +774,22 @@ def safe_cwd(cwd):
 def _sanitize_mode(m):
     return m if m in ("acceptEdits", "plan", "default", "bypassPermissions") else "acceptEdits"
 
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+def _sanitize_effort(e):
+    return e if e in EFFORTS else "max"   # default: deepest thinking
+
 
 class ChatSession:
     """A persistent Claude Agent SDK client, independent of any browser connection.
     Survives navigation/reload (viewers attach/detach); ends only on explicit end().
     Provides per-action approval (can_use_tool) and interrupt()."""
 
-    def __init__(self, sid, cwd, model, mode, resume_cc=None):
+    def __init__(self, sid, cwd, model, mode, resume_cc=None, effort="max"):
         self.id = sid
         self.cwd = cwd
         self.model = model
         self.mode = mode
+        self.effort = _sanitize_effort(effort)   # thinking depth (--effort, launch-time)
         self.client = None
         self.log = []          # full normalized-event history, for replay on reattach
         self.viewers = set()   # currently-attached ChatSockets
@@ -829,6 +836,8 @@ class ChatSession:
             extra_args={"dangerously-skip-permissions": None})
         if self.model and self.model != "default":
             opts.model = self.model
+        if self.effort:
+            opts.effort = self.effort       # SDK passes through as --effort
         if self.resume_cc:
             opts.resume = self.resume_cc
         self.client = ClaudeSDKClient(options=opts)
@@ -868,20 +877,30 @@ class ChatSession:
             new_input["answers"] = answers
             return PermissionResultAllow(updated_input=new_input)
 
+        # CLI-supplied "don't ask again" rules; enables the 3rd option when present
+        sugg = list(getattr(context, "suggestions", None) or [])
         self._push([{"kind": "approval", "aid": aid, "tool": tool_name,
                      "input": _cap_input(tool_input),
-                     "toolId": getattr(context, "tool_use_id", None)}])
+                     "toolId": getattr(context, "tool_use_id", None),
+                     "always": bool(sugg)}])
         try:
-            allow = await fut
+            res = await fut
         except Exception:
-            allow = False
-        self._push([{"kind": "approval_resolved", "aid": aid, "allow": bool(allow)}])
-        return PermissionResultAllow() if allow else PermissionResultDeny(message="Denied by user")
+            res = {"allow": False}
+        allow = bool(res.get("allow")) if isinstance(res, dict) else bool(res)
+        always = bool(isinstance(res, dict) and res.get("always") and sugg)
+        self._push([{"kind": "approval_resolved", "aid": aid, "allow": allow, "always": always}])
+        if not allow:
+            return PermissionResultDeny(message="Denied by user")
+        if always:
+            # allow now AND apply the CLI's suggested rules → won't ask again this session
+            return PermissionResultAllow(updated_permissions=sugg)
+        return PermissionResultAllow()
 
-    def resolve_approval(self, aid, allow):
+    def resolve_approval(self, aid, allow, always=False):
         fut = self._pending.pop(aid, None)
         if fut and not fut.done():
-            fut.set_result(bool(allow))
+            fut.set_result({"allow": bool(allow), "always": bool(always)})
 
     def resolve_answer(self, aid, answers):
         fut = self._pending.pop(aid, None)
@@ -899,7 +918,7 @@ class ChatSession:
                     elif e["kind"] == "ready":
                         self.cc_id = e.get("session_id") or self.cc_id
                         if self.cc_id:   # record this session's mode/model once
-                            save_pref(self.cc_id, mode=self.mode, model=self.model)
+                            save_pref(self.cc_id, mode=self.mode, model=self.model, effort=self.effort)
                 if evs:
                     self._push(evs)
                 # refresh context-window usage after a turn settles or on init
@@ -938,7 +957,8 @@ class ChatSession:
             if msg.subtype == "init":
                 d = msg.data or {}
                 evs.append({"kind": "ready", "session_id": d.get("session_id"),
-                            "model": d.get("model"), "cwd": d.get("cwd")})
+                            "model": d.get("model"), "cwd": d.get("cwd"),
+                            "effort": self.effort})
         elif isinstance(msg, AssistantMessage):
             if not self.cc_id and getattr(msg, "session_id", None):
                 self.cc_id = msg.session_id
@@ -1200,7 +1220,8 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                 self._say({"type": "error", "error": "invalid working directory"})
                 return
             sid = secrets.token_hex(6)
-            sess = ChatSession(sid, cwd, msg.get("model") or "", _sanitize_mode(msg.get("mode")))
+            sess = ChatSession(sid, cwd, msg.get("model") or "", _sanitize_mode(msg.get("mode")),
+                               effort=_sanitize_effort(msg.get("effort")))
             try:
                 await sess.start()
             except Exception as e:
@@ -1213,7 +1234,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             sess.attach(self)
             self._say({"type": "started", "id": sid, "cwd": cwd,
                        "name": os.path.basename(cwd) or cwd,
-                       "model": sess.model or "default", "mode": sess.mode})
+                       "model": sess.model or "default", "mode": sess.mode, "effort": sess.effort})
         elif mt == "attach":
             sess = CHAT_SESSIONS.get(msg.get("id"))
             if not sess:
@@ -1228,7 +1249,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "title": sess.title(), "ctx": sess.ctx,
                        "model": sess.model or "default", "mode": sess.mode,
                        "busy": sess.busy, "ended": sess.ended, "events": sess.log,
-                       "turn_age": sess.turn_age(), "word": sess.turn_word})
+                       "turn_age": sess.turn_age(), "word": sess.turn_word, "effort": sess.effort})
         elif mt == "resume":
             if not CLAUDE_BIN or not os.path.exists(CLAUDE_BIN):
                 self._say({"type": "error", "error": "claude CLI not found"})
@@ -1246,8 +1267,9 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                 pf = load_prefs().get(cc) or {}   # restore this session's own
                 r_mode = _sanitize_mode(pf.get("mode") or msg.get("mode"))
                 r_model = pf.get("model") or msg.get("model") or ""
+                r_effort = _sanitize_effort(pf.get("effort") or msg.get("effort"))
                 sess = ChatSession(secrets.token_hex(6), cwd, r_model,
-                                   r_mode, resume_cc=cc)
+                                   r_mode, resume_cc=cc, effort=r_effort)
                 sess.preload()
                 try:
                     await sess.start()
@@ -1264,10 +1286,10 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "title": sess.title(), "ctx": sess.ctx,
                        "model": sess.model or "default", "mode": sess.mode,
                        "busy": sess.busy, "ended": sess.ended, "events": sess.log,
-                       "turn_age": sess.turn_age(), "word": sess.turn_word,
+                       "turn_age": sess.turn_age(), "word": sess.turn_word, "effort": sess.effort,
                        "resumed": True})
         elif mt == "approve" and self.session:
-            self.session.resolve_approval(msg.get("aid"), bool(msg.get("allow")))
+            self.session.resolve_approval(msg.get("aid"), bool(msg.get("allow")), bool(msg.get("always")))
         elif mt == "answer" and self.session:
             self.session.resolve_answer(msg.get("aid"), msg.get("answers"))
         elif mt == "interrupt" and self.session:
@@ -1276,6 +1298,38 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             self.session.set_model(msg.get("model") or "")
         elif mt == "set_mode" and self.session:
             self.session.set_mode(msg.get("mode") or "")
+        elif mt == "set_effort" and self.session:
+            # --effort is launch-time only (no live SDK control), so changing it
+            # relaunches the session: resume the same cc with the new --effort.
+            eff = _sanitize_effort(msg.get("effort"))
+            sess = self.session
+            if not sess.ended and eff != sess.effort:
+                if sess.busy:
+                    sess._notice("⚙ finish or interrupt the current turn before changing effort")
+                elif not _valid_cc(sess.cc_id):
+                    sess.effort = eff      # not ready yet; will apply on its own start
+                else:
+                    cc, cwd, model, mode = sess.cc_id, sess.cwd, sess.model, sess.mode
+                    save_pref(cc, effort=eff)
+                    sess.terminate(); sess.detach(self); CHAT_SESSIONS.pop(sess.id, None)
+                    self.session = None
+                    new = ChatSession(secrets.token_hex(6), cwd, model, mode, resume_cc=cc, effort=eff)
+                    new.preload()
+                    try:
+                        await new.start()
+                    except Exception as e:
+                        self._say({"type": "error", "error": "effort relaunch failed: %s" % e})
+                        return
+                    CHAT_SESSIONS[new.id] = new
+                    self.session = new
+                    new.attach(self)
+                    self._say({"type": "attached", "id": new.id, "cwd": new.cwd,
+                               "name": os.path.basename(new.cwd) or new.cwd, "cc": new.cc_id,
+                               "title": new.title(), "ctx": new.ctx,
+                               "model": new.model or "default", "mode": new.mode,
+                               "busy": new.busy, "ended": new.ended, "events": new.log,
+                               "turn_age": new.turn_age(), "word": new.turn_word,
+                               "effort": new.effort, "resumed": True})
         elif mt == "user" and self.session:
             self.session.send_user(msg.get("text", ""), msg.get("images"))
         elif mt == "unqueue" and self.session:
@@ -1413,7 +1467,12 @@ header input#cwd{flex:1;min-width:120px;display:none}
 @keyframes pulse{50%{opacity:.35}}
 /* floating status pill above the composer — a "ready/idle" light, or the
    animated working indicator (glyph + word + elapsed) while a turn runs */
-#thinking{align-self:flex-start;flex:none;max-width:100%;margin:0 0 7px;padding:3px 12px;
+.pillrow{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:flex-end;gap:6px;margin:0 0 7px}
+#effort{flex:none;max-width:100%;padding:3px 11px;background:var(--bg3);border:1px solid var(--line);
+  border-radius:9px;box-shadow:0 2px 10px rgba(0,0,0,.28);user-select:none;cursor:pointer;
+  font-size:13px;line-height:1.1;color:var(--fg);white-space:nowrap}
+#effort:hover{border-color:var(--acc);color:var(--acc)}
+#thinking{flex:none;max-width:100%;padding:3px 12px;
   background:var(--bg3);border:1px solid var(--line);border-radius:9px;
   box-shadow:0 2px 10px rgba(0,0,0,.28);user-select:none}
 #thinking .twrap{display:flex;align-items:center;gap:8px;font-size:13px;line-height:1.1}
@@ -1525,7 +1584,9 @@ pre code{background:none;border:none;padding:0}
 .approval .abtns{display:flex;gap:8px;padding:8px 10px;border-top:1px solid var(--toolln)}
 .approval .abtns button{flex:1;padding:9px;border-radius:6px;cursor:pointer;font-size:14px;font-weight:700}
 .approval .appr{background:var(--okbg);color:var(--addfg);border:1px solid var(--add)}
+.approval .apprall{background:var(--infobg);color:var(--acc);border:1px solid var(--infoln)}
 .approval .deny{background:var(--nobg);color:var(--delfg);border:1px solid var(--del)}
+.approval .abtns button{white-space:nowrap}
 .approval.done .abtns{opacity:.85}
 .approval .ok{color:var(--addfg);font-weight:700}.approval .no{color:var(--delfg);font-weight:700}
 /* question prompts (AskUserQuestion) */
@@ -1703,7 +1764,10 @@ pre code{background:none;border:none;padding:0}
   <div id="mainCol">
     <div id="chat"><div class="wrap" id="stream"></div></div>
     <div id="composer">
-      <div id="thinking"><div class="twrap"><span class="dot" id="dot"></span><span class="glyph">✶</span><span class="word">idle</span><span class="meta"></span></div></div>
+      <div class="pillrow">
+        <div id="thinking"><div class="twrap"><span class="dot" id="dot"></span><span class="glyph">✶</span><span class="word">idle</span><span class="meta"></span></div></div>
+        <span id="effort" title="thinking effort — click to change">🧠 max</span>
+      </div>
       <div id="queue"></div>
       <div id="attach"></div>
       <div class="wrap2">
@@ -1726,6 +1790,8 @@ const $=s=>document.querySelector(s);
 const stream=$('#stream'), ta=$('#ta'), sendBtn=$('#send');
 let ws=null, running=false, ready=false, cwd='', tools={};
 let sid=null, curCC=null, editCount=0, pendingStart=false, reconnectT=0;
+const EFFORTS=['low','medium','high','xhigh','max'];
+let curEffort=localStorage.getItem('al_effort')||'max';
 let showThink=false;
 let liveCCs=new Set(), recentData=[], folderData=[], HOMEDIR='';
 const EDIT_TOOLS=new Set(['Edit','MultiEdit','Write','NotebookEdit']);
@@ -1861,14 +1927,17 @@ function addMarker(ev){const s=atBottom();const cn=counts(ev);const m=document.c
 function addApproval(ev){const c=document.createElement('div');c.className='approval';c.dataset.aid=ev.aid;
   c.innerHTML='<div class="ah">🔐 Approve <b>'+esc(ev.tool)+'</b> <span class="tp">'+esc(primaryArg(ev.input)||'')+'</span></div>'+
     '<div class="abody">'+toolBody(ev)+'</div>'+
-    '<div class="abtns"><button class="appr">✓ Approve</button><button class="deny">✕ Deny</button></div>';
-  c.querySelector('.appr').onclick=()=>decide(ev.aid,true);
-  c.querySelector('.deny').onclick=()=>decide(ev.aid,false);
+    '<div class="abtns"><button class="appr">✓ Approve</button>'+
+    (ev.always?'<button class="apprall" title="approve and don\'t ask again this session">✓✓ Always</button>':'')+
+    '<button class="deny">✕ Deny</button></div>';
+  c.querySelector('.appr').onclick=()=>decide(ev.aid,true,false);
+  const aa=c.querySelector('.apprall');if(aa)aa.onclick=()=>decide(ev.aid,true,true);
+  c.querySelector('.deny').onclick=()=>decide(ev.aid,false,false);
   stream.appendChild(c);scroll();}
-function decide(aid,allow){wsSend({type:'approve',aid:aid,allow:allow});resolveApprovalCard(aid,allow);}
-function resolveApprovalCard(aid,allow){const c=stream.querySelector('.approval[data-aid="'+aid+'"]');
+function decide(aid,allow,always){wsSend({type:'approve',aid:aid,allow:allow,always:!!always});resolveApprovalCard(aid,allow,always);}
+function resolveApprovalCard(aid,allow,always){const c=stream.querySelector('.approval[data-aid="'+aid+'"]');
   if(c&&!c.classList.contains('done')){c.classList.add('done');
-    const bt=c.querySelector('.abtns');if(bt)bt.innerHTML='<span class="'+(allow?'ok':'no')+'">'+(allow?'✓ Approved':'✕ Denied')+'</span>';}}
+    const bt=c.querySelector('.abtns');if(bt)bt.innerHTML='<span class="'+(allow?'ok':'no')+'">'+(allow?('✓ Approved'+(always?" · won't ask again this session":'')):'✕ Denied')+'</span>';}}
 function qval(bl){const other=bl.querySelector('.qother').value.trim();
   if(other)return other;
   return [...bl.querySelectorAll('.qopt.sel')].map(x=>x.dataset.label).join(', ');}
@@ -1903,13 +1972,13 @@ function route(ev){
      queued message as its own turn), step back into the busy state */
   if(!running&&(ev.kind==='assistant_text'||ev.kind==='thinking'||ev.kind==='tool_use'))setBusy(true);
   if(ev.kind==='user_text')addUser(ev.text,ev.images);
-  else if(ev.kind==='ready'){ready=true;cwd=ev.cwd||cwd;curCC=ev.session_id||curCC;if(ev.model)setResolvedModel(ev.model);addNotice('● session ready · '+(ev.model||'')+' · '+(ev.cwd||''));}
+  else if(ev.kind==='ready'){ready=true;cwd=ev.cwd||cwd;curCC=ev.session_id||curCC;if(ev.model)setResolvedModel(ev.model);addNotice('● session ready · '+(ev.model||'')+(ev.effort?' · '+ev.effort+' effort':'')+' · '+(ev.cwd||''));}
   else if(ev.kind==='assistant_text')addAsst(ev.text);
   else if(ev.kind==='thinking')addThink(ev.text);
   else if(ev.kind==='tool_use'){if(EDIT_TOOLS.has(ev.tool)){addEditCard(ev);addMarker(ev);}else addTool(ev);}
   else if(ev.kind==='tool_result')addResult(ev);
   else if(ev.kind==='approval')addApproval(ev);
-  else if(ev.kind==='approval_resolved')resolveApprovalCard(ev.aid,ev.allow);
+  else if(ev.kind==='approval_resolved')resolveApprovalCard(ev.aid,ev.allow,ev.always);
   else if(ev.kind==='question')addQuestion(ev);
   else if(ev.kind==='question_resolved')resolveQuestionCard(ev.aid,ev.answers);
   else if(ev.kind==='turn_start')setBusy(true,ev.word,0);
@@ -1924,13 +1993,13 @@ function markEnded(msg){ready=false;ta.disabled=true;sendBtn.disabled=true;$('#d
   localStorage.removeItem(SKEY);if(msg)addNotice(msg);}
 function onMsg(e){const m=JSON.parse(e.data);
   if(m.type==='started'){pendingStart=false;sid=m.id;cwd=m.cwd;bindProject(m.cwd);localStorage.setItem(SKEY,sid);
-    ready=true;setBusy(false);ta.focus();setCurname(m.name||'session');syncPickers(m.model,m.mode);renderCtx(null);statset('ready');
-    addNotice('new session « '+(m.name||'')+' » in '+m.cwd+' — type your first message to begin');reqList();loadPast();}
+    ready=true;setBusy(false);ta.focus();setCurname(m.name||'session');syncPickers(m.model,m.mode);setEffortPill(m.effort);renderCtx(null);statset('ready');
+    addNotice('new session « '+(m.name||'')+' »'+(m.effort?' · '+m.effort+' effort':'')+' in '+m.cwd+' — type your first message to begin');reqList();loadPast();}
   else if(m.type==='attached'){clearUI();pendingStart=false;sid=m.id;curCC=m.cc||null;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
-    ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));syncPickers(m.model,m.mode);renderCtx(m.ctx);statset(m.ended?'ended':'ready');
+    ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));syncPickers(m.model,m.mode);setEffortPill(m.effort);renderCtx(m.ctx);statset(m.ended?'ended':'ready');
     m.events.forEach(route);setBusy(!!m.busy,m.word,(m.turn_age||0)*1000);
     if(m.ended){markEnded('— this session has ended (history shown · you can resume it from disk) —');}
-    else{ta.disabled=false;sendBtn.disabled=false;addNotice('— '+(m.resumed?'resumed':'reattached to')+' « '+(m.name||'')+' » ('+m.events.length+' events) —');}
+    else{ta.disabled=false;sendBtn.disabled=false;addNotice('— '+(m.resumed?'resumed':'reattached to')+' « '+(m.name||'')+' » ('+m.events.length+' events)'+(m.effort?' with '+m.effort+' effort':'')+' —');}
     reqList();loadPast();}
   else if(m.type==='no_session'){localStorage.removeItem(SKEY);sid=null;ready=false;setBusy(false);setCurname('');renderCtx(null);statset('idle');
     addNotice('that session is no longer running — pick it under “Resume from disk”, or ＋ New.');reqList();loadPast();}
@@ -1991,6 +2060,14 @@ function syncPickers(model,mode){
   if(model){const o=$('#model');for(const x of o.options){if(x.value===model){o.value=model;break;}}}
   if(mode){const o=$('#mode');for(const x of o.options){if(x.value===mode){o.value=mode;break;}}}
 }
+/* thinking effort: a clickable pill on the right of the status row. --effort is
+   launch-time only, so changing it on a live session relaunches it (server-side
+   resume with the new --effort); the choice is remembered for new sessions. */
+function setEffortPill(e){if(e)curEffort=e;const el=$('#effort');if(el)el.textContent='🧠 '+curEffort;}
+function setEffort(e){if(!EFFORTS.includes(e)||e===curEffort)return;
+  if(running){addNotice('⚙ finish or interrupt the current turn before changing effort');return;}
+  curEffort=e;localStorage.setItem('al_effort',e);setEffortPill(e);
+  if(sid&&ready&&ws&&ws.readyState===1)wsSend({type:'set_effort',effort:e});}   /* live session → relaunch */
 /* show what the live session's model actually resolves to in the picker's default
    option, e.g. "model: opus 4.8 [1M]" — family+version from the model id, the
    [ctx] window from maxTokens. Fed by the ready event and the context usage. */
@@ -2150,7 +2227,7 @@ function newSession(){const proj=$('#project').value;const dir=proj==='__custom_
   if(!dir){addErr('pick a project directory first');return;}
   /* keep any current session alive in the background — just spin up another */
   clearUI();pendingStart=true;sid=null;
-  const start=()=>wsSend({type:'start',cwd:dir,model:$('#model').value,mode:$('#mode').value});
+  const start=()=>wsSend({type:'start',cwd:dir,model:$('#model').value,mode:$('#mode').value,effort:curEffort});
   if(ws&&ws.readyState===1)start();else openWs(start);statset('starting…');
   if(window.innerWidth<=860)closeSidebar();}
 function endSessionById(id,name){if(!id)return;
@@ -2253,6 +2330,10 @@ function applyTheme(t){if(t&&t!=='dark')document.documentElement.setAttribute('d
   applyTheme(t);})();
 $('#navtoggle').onclick=toggleSidebar;
 $('#sb-backdrop').onclick=closeSidebar;
+/* effort pill: click to pick thinking depth (low/medium/high/xhigh/max) */
+$('#effort').onclick=ev=>{ev.stopPropagation();toggleCardMenu(ev.currentTarget,
+  EFFORTS.map(e=>({label:(e===curEffort?'● ':'○ ')+e,fn:()=>setEffort(e)})));};
+setEffortPill(curEffort);
 /* desktop: drag the sidebar's right edge to resize (clamped + persisted) */
 const SBW_KEY='al_sbw',SBW_MIN=200,SBW_MAX=560;
 function setSidebarW(w,save){w=Math.max(SBW_MIN,Math.min(SBW_MAX,Math.round(w)));
