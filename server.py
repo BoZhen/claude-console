@@ -2288,11 +2288,10 @@ function maybeMigrateFavs(){   /* one-time: lift this device's old localStorage 
 function pastRow(s,fav){const r=document.createElement('div');r.className='srow';
   const proj=(s.cwd||'').split('/').slice(-2).join('/');
   const sub=(fav?'':'↺ ')+esc(proj)+(s.mtime?(' · '+reltime(s.mtime)):'');
-  r.innerHTML='<span class="sdot"></span><div class="smeta">'+
+  r.innerHTML='<div class="smeta">'+
     '<div class="sname">'+esc(s.title||proj||'session')+'</div><div class="ssub">'+sub+'</div></div>'+
     '<span class="skebab" title="more">⋮</span>';
   r.querySelector('.smeta').onclick=()=>resumeSession(s);
-  r.querySelector('.sdot').onclick=()=>resumeSession(s);
   r.querySelector('.skebab').onclick=ev=>{ev.stopPropagation();toggleCardMenu(ev.currentTarget,[
     {label:'✎ Rename',fn:()=>renameSession(s.cc,s.title)},
     {label:fav?'★ Unfavorite':'☆ Favorite',fn:()=>toggleFav(s)},
