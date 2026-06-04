@@ -1013,8 +1013,6 @@ class ChatSession:
                         if v is not None:
                             return v
                     return None
-                print(f"[compact_boundary] data_keys={sorted(d.keys())} "
-                      f"meta_keys={sorted(cm.keys())}", flush=True)
                 evs.append({"kind": "compacted", "trigger": g("trigger"),
                             "pre": g("preTokens", "pre_tokens"),
                             "post": g("postTokens", "post_tokens"),
@@ -1571,6 +1569,7 @@ header input#cwd{flex:1;min-width:120px;display:none}
 #thinking .glyph{display:none;font-size:13px;color:var(--tool);width:1.1em;text-align:center;
   text-shadow:0 0 8px var(--tool);animation:thinkpulse 1.4s ease-in-out infinite}
 #thinking.busy .glyph{display:inline-block}
+#thinking.compacting .glyph{width:2em;text-align:left;letter-spacing:1px;font-weight:700}
 #thinking .word{color:var(--fg);font-weight:600}
 #thinking.busy .word::after{content:'…'}
 #thinking .meta{color:var(--mut);font-size:12px;font-variant-numeric:tabular-nums}
@@ -1984,11 +1983,13 @@ function setBusy(b,wordSeed,elapsedMs){running=b;$('#dot').className='dot '+(b?'
 const THINK_WORDS=['Thinking','Pondering','Cogitating','Brewing','Conjuring','Percolating',
   'Ruminating','Noodling','Mulling','Synthesizing','Computing','Untangling','Divining','Tinkering'];
 const THINK_GLYPHS=['✶','✷','✸','✹','✺','✹','✸','✷'];
+const DREAM_GLYPHS=['z','z','zz','zz','zzz','zzz'];   /* compacting: a slow Zzz drifting up */
 let thinkTimer=0,thinkStart=0,thinkGi=0,thinkWi=0;
 function startThinking(wordSeed,elapsedMs){const el=$('#thinking');if(!el)return;
   const fresh=!thinkTimer;         /* new turn, or reattaching to a running one */
   if(fresh||elapsedMs!=null)thinkStart=Date.now()-(elapsedMs||0);
-  if(compacting){el.querySelector('.word').textContent='Compacting';}
+  el.classList.toggle('compacting',compacting);
+  if(compacting){el.querySelector('.word').textContent='Compacting';el.querySelector('.glyph').textContent='z';}
   else if(fresh||wordSeed!=null){  /* server-provided seed keeps the word stable across reattach */
     thinkWi=(wordSeed!=null)?(wordSeed%THINK_WORDS.length):Math.floor(Math.random()*THINK_WORDS.length);
     el.querySelector('.word').textContent=THINK_WORDS[thinkWi];
@@ -1996,12 +1997,13 @@ function startThinking(wordSeed,elapsedMs){const el=$('#thinking');if(!el)return
   if(fresh&&atBottom())scroll();
   clearInterval(thinkTimer);
   thinkTimer=setInterval(()=>{     /* during the turn only the glyph + timer move */
-    thinkGi=(thinkGi+1)%THINK_GLYPHS.length;
-    el.querySelector('.glyph').textContent=THINK_GLYPHS[thinkGi];
+    const arr=compacting?DREAM_GLYPHS:THINK_GLYPHS;
+    thinkGi=(thinkGi+1)%arr.length;
+    el.querySelector('.glyph').textContent=arr[thinkGi];
     const s=Math.floor((Date.now()-thinkStart)/1000);
     el.querySelector('.meta').textContent=compacting?(s+'s · compacting · esc to interrupt'):(s+'s · esc to interrupt');
   },130);}
-function stopThinking(){clearInterval(thinkTimer);thinkTimer=0;}
+function stopThinking(){clearInterval(thinkTimer);thinkTimer=0;const el=$('#thinking');if(el)el.classList.remove('compacting');}
 function doInterrupt(){if(!running)return;wsSend({type:'interrupt'});addNotice('⏹ interrupt sent');}
 function clearUI(){stream.innerHTML='';$('#edits').innerHTML='<div class="empty">no file changes yet</div>';
   $('#gitc').innerHTML='<div class="empty">—</div>';tools={};editCount=0;updateEditBadge();renderCtx(null);ready=false;
