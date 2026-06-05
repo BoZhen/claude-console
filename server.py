@@ -17,6 +17,7 @@ import base64
 import glob
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -118,6 +119,14 @@ def _is_plumbing(s):
     return isinstance(s, str) and s.lstrip().startswith(_PLUMBING_TAGS)
 
 
+_INJECTED_RE = re.compile(r"\s*<task-notification>.*?</task-notification>\s*", re.S)
+def _strip_injected(s):
+    """Remove harness-appended blocks (e.g. a background-task completion notice) that get
+    tacked onto an otherwise-real user message in the transcript. On resume-from-disk we
+    then render the user's actual text only, not the plumbing block."""
+    return _INJECTED_RE.sub("", s) if isinstance(s, str) else s
+
+
 def parse_claude(rec, idx):
     t = rec.get("type")
     base = {"ts": rec.get("timestamp"), "id": rec.get("uuid") or ("L%d" % idx)}
@@ -149,6 +158,7 @@ def parse_claude(rec, idx):
                                # the post-compaction summary continuation (isCompactSummary)
         content = msg.get("content")
         if isinstance(content, str):
+            content = _strip_injected(content)
             if content.strip() and not _is_plumbing(content):
                 evs.append({**base, "kind": "user_text", "role": "user", "text": _cap(content)})
         elif isinstance(content, list):
@@ -156,8 +166,10 @@ def parse_claude(rec, idx):
                 if not isinstance(b, dict):
                     continue
                 bt = b.get("type")
-                if bt == "text" and b.get("text", "").strip() and not _is_plumbing(b["text"]):
-                    evs.append({**base, "kind": "user_text", "role": "user", "text": _cap(b["text"])})
+                if bt == "text":
+                    txt = _strip_injected(b.get("text", ""))
+                    if txt.strip() and not _is_plumbing(txt):
+                        evs.append({**base, "kind": "user_text", "role": "user", "text": _cap(txt)})
                 elif bt == "tool_result":
                     evs.append({**base, "kind": "tool_result", "toolId": b.get("tool_use_id", ""),
                                 "content": _cap(_txt(b.get("content")), RESULT_CAP),
