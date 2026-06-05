@@ -615,7 +615,7 @@ def _projects_cached():
     return _proj_cache["v"]
 
 
-def dir_complete(q, limit=30):
+def dir_complete(q, limit=500):
     """Directory autocomplete for the console path box. If the typed path IS an
     existing directory, list its children (so you don't need a trailing '/');
     otherwise complete the last segment within its parent. A bare name fragment
