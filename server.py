@@ -1809,8 +1809,12 @@ header input#cwd{flex:1;min-width:120px;display:none}
 .tool .tp{color:var(--mut);font-family:ui-monospace,monospace;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
 .tool .cnt{font-size:11.5px;font-family:ui-monospace,monospace;flex-shrink:0}
 .tool .cnt .a{color:var(--addfg)}.tool .cnt .d{color:var(--delfg)}
-.tool .chev{color:var(--mut);flex-shrink:0;transition:transform .15s}
-.tool.open .chev{transform:rotate(90deg)}
+.tool .eye{color:var(--mut);flex-shrink:0;display:inline-flex;align-items:center;transition:color .15s}
+.tool .eye svg{width:16px;height:16px;display:block}
+.tool .eye .e-open{display:none}            /* collapsed → closed eye */
+.tool.open .eye .e-shut{display:none}
+.tool.open .eye .e-open{display:block}      /* expanded → open eye */
+.tool .th:hover .eye{color:var(--fg)}
 .tool .tb{display:none;border-top:1px solid var(--line);padding:8px 10px}
 .tool.open .tb{display:block}
 .tool.err .tn{color:var(--del)}
@@ -2215,7 +2219,7 @@ function addErr(t){const d=document.createElement('div');d.className='errline';d
 function addTool(ev){const s=atBottom();const c=document.createElement('div');c.className='tool';
   const cn=counts(ev);const cnt=cn?('<span class="a">+'+cn.a+'</span> <span class="d">−'+cn.d+'</span>'):'';
   c.innerHTML='<div class="th"><span class="ico">'+(ICON[ev.tool]||'🔧')+'</span><span class="tn">'+esc(ev.tool)+'</span>'+
-    '<span class="tp">'+esc(primaryArg(ev.input))+'</span><span class="cnt">'+cnt+'</span><span class="chev">▸</span></div>'+
+    '<span class="tp">'+esc(primaryArg(ev.input))+'</span><span class="cnt">'+cnt+'</span><span class="eye"><svg class="e-shut" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 11c3 4 7 6 10 6s7-2 10-6"/><line x1="5.5" y1="15.5" x2="4.3" y2="18"/><line x1="12" y1="17.5" x2="12" y2="20"/><line x1="18.5" y1="15.5" x2="19.7" y2="18"/></svg><svg class="e-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></span></div>'+
     '<div class="tb"><div class="res"></div></div>';
   c._ev=ev;   /* lazy: build the (maybe large) body only on first expand */
   c.querySelector('.th').onclick=()=>{const open=c.classList.toggle('open');
@@ -2401,13 +2405,13 @@ function route(ev){
 function markEnded(msg){ready=false;ta.disabled=true;sendBtn.disabled=true;$('#dot').className='dot';statset('ended');
   localStorage.removeItem(SKEY);if(msg)addNotice(msg);}
 function onMsg(e){const m=JSON.parse(e.data);
-  if(m.type==='started'){pendingStart=false;sid=m.id;cwd=m.cwd;bindProject(m.cwd);localStorage.setItem(SKEY,sid);
+  if(m.type==='started'){pendingStart=false;sid=m.id;cwd=m.cwd;bindProject(m.cwd);localStorage.setItem(SKEY,sid);loadDraft(sid);
     ready=true;setBusy(false);ta.focus();setCurname(m.name||'session');setEffortPill(m.effort);renderCtx(null);statset('ready');
     addNotice('new session « '+(m.name||'')+' »'+(m.effort?' · '+m.effort+' effort':'')+' in '+m.cwd+' — type your first message to begin');reqList();loadPast();}
   else if(m.type==='attached'){clearUI();pendingStart=false;sid=m.id;curCC=m.cc||null;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
     ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));setEffortPill(m.effort);renderCtx(m.ctx);statset(m.ended?'ended':'ready');
     replaying=true;m.events.forEach(route);replaying=false;
-    compacting=!!m.compacting;setBusy(!!m.busy,m.word,(m.turn_age||0)*1000);
+    compacting=!!m.compacting;setBusy(!!m.busy,m.word,(m.turn_age||0)*1000);loadDraft(sid);
     if(m.ended){markEnded('— this session has ended (history shown · you can resume it from disk) —');}
     else{ta.disabled=false;sendBtn.disabled=false;addNotice('— '+(m.resumed?'resumed':'reattached to')+' « '+(m.name||'')+' » ('+m.events.length+' events)'+(m.effort?' with '+m.effort+' effort':'')+' —');}
     scroll();requestAnimationFrame(scroll);reqList();loadPast();}
@@ -2417,7 +2421,7 @@ function onMsg(e){const m=JSON.parse(e.data);
   else if(m.type==='stderr')addErr(m.text);
   else if(m.type==='error'){pendingStart=false;addErr('⚠ '+m.error);}
   else if(m.type==='exit'){if(!pendingStart){markEnded('session process exited (code '+m.code+')');setCurname('');}reqList();loadPast();}
-  else if(m.type==='ended'){if(m.id&&m.id===sid){sid=null;setCurname('');markEnded('session ended');}reqList();loadPast();}
+  else if(m.type==='ended'){dropDraft(m.id);if(m.id&&m.id===sid){sid=null;setCurname('');markEnded('session ended');}reqList();loadPast();}
   else if(m.type==='resumable_deleted'){addNotice(m.ok?'🗑 session moved to trash':('delete failed: '+(m.error||'?')));loadPast();}
   else if(m.type==='renamed'){if(m.ok){if(m.cc&&m.cc===curCC&&m.name)setCurname(m.name);addNotice('✎ renamed');reqList();loadPast();}else addNotice('rename failed');}
   else if(m.type==='sessions')renderLive(m.sessions);
@@ -2662,16 +2666,16 @@ function acMove(d){const els=$('#cwdac').querySelectorAll('.acitem');if(!els.len
 function acQuery(){clearTimeout(acTimer);const q=$('#cwd').value;
   acTimer=setTimeout(()=>fetch('api/dircomplete?q='+encodeURIComponent(q)).then(r=>r.json()).then(acRender).catch(acClose),130);}
 
-function switchSession(id){if(!id||id===sid)return;clearUI();statset('switching…');wsSend({type:'attach',id:id});
+function switchSession(id){if(!id||id===sid)return;saveDraft();clearUI();statset('switching…');wsSend({type:'attach',id:id});
   if(window.innerWidth<=860)closeSidebar();}
-function resumeSession(s){if(!s||!s.cc)return;clearUI();pendingStart=true;sid=null;statset('resuming…');
+function resumeSession(s){if(!s||!s.cc)return;saveDraft();clearUI();pendingStart=true;sid=null;statset('resuming…');
   const go=()=>wsSend({type:'resume',cc:s.cc,cwd:s.cwd,model:$('#model').value,mode:$('#mode').value});
   if(ws&&ws.readyState===1)go();else openWs(go);
   if(window.innerWidth<=860)closeSidebar();}
 function newSession(){const proj=$('#project').value;const dir=proj==='__custom__'?$('#cwd').value.trim():proj;
   if(!dir){addErr('pick a project directory first');return;}
   /* keep any current session alive in the background — just spin up another */
-  clearUI();pendingStart=true;sid=null;
+  saveDraft();clearUI();pendingStart=true;sid=null;
   const start=()=>wsSend({type:'start',cwd:dir,model:$('#model').value,mode:$('#mode').value,effort:curEffort});
   if(ws&&ws.readyState===1)start();else openWs(start);statset('starting…');
   if(window.innerWidth<=860)closeSidebar();}
@@ -2696,10 +2700,23 @@ function addImageFile(file){
 function handlePaste(e){const items=(e.clipboardData||{}).items||[];let got=false;
   for(const it of items){if(it.kind==='file'&&it.type.indexOf('image/')===0){const f=it.getAsFile();if(f){addImageFile(f);got=true;}}}
   if(got)e.preventDefault();}
+/* per-session composer drafts — each session keeps its own unsent text (+ images),
+   so switching sessions swaps the draft with the chat. Text persists across reloads
+   via localStorage; attached images are kept in memory only. */
+const DKEY='al_drafts';
+let drafts={}, _dpT=0;
+try{const sv=JSON.parse(localStorage.getItem(DKEY)||'{}');for(const k in sv)drafts[k]={text:sv[k]||'',images:[]};}catch(e){}
+function persistDrafts(){const t={};for(const k in drafts){const v=drafts[k];if(v&&v.text&&v.text.trim())t[k]=v.text;}try{localStorage.setItem(DKEY,JSON.stringify(t));}catch(e){}}
+function schedulePersist(){clearTimeout(_dpT);_dpT=setTimeout(persistDrafts,500);}
+function saveDraft(){if(sid)drafts[sid]={text:ta.value,images:pendingImages.slice()};persistDrafts();}
+function loadDraft(id){const d=drafts[id]||{text:'',images:[]};ta.value=d.text||'';
+  ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,160)+'px';
+  pendingImages=(d.images||[]).slice();renderAttach();}
+function dropDraft(id){if(id&&drafts[id]){delete drafts[id];persistDrafts();}}
 function sendMsg(){const t=ta.value.trim();
   if((!t&&!pendingImages.length)||!ready||!sid||!ws||ws.readyState!==1)return;
   wsSend({type:'user',text:t,images:pendingImages.map(im=>({media_type:im.media_type,data:im.data}))});
-  ta.value='';ta.style.height='auto';pendingImages=[];renderAttach();}
+  ta.value='';ta.style.height='auto';pendingImages=[];renderAttach();dropDraft(sid);}
   /* busy state (and the thinking word/timer) is driven by the server's
      turn_start, so it stays correct across reattach — no optimistic flip here */
 
@@ -2757,7 +2774,8 @@ async function refreshGit(){if(!cwd){$('#gitc').innerHTML='<div class="empty">no
   }catch(e){}}
 
 /* bindings */
-ta.addEventListener('input',()=>{ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,160)+'px';});
+ta.addEventListener('input',()=>{ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,160)+'px';
+  if(sid){drafts[sid]={text:ta.value,images:pendingImages.slice()};schedulePersist();}});
 ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMsg();}
   else if(e.key==='ArrowUp'&&!ta.value&&Object.keys(queued).length){
     e.preventDefault();const ids=Object.keys(queued);editQueued(ids[ids.length-1]);}});
@@ -2812,6 +2830,12 @@ $('#mode').onchange=()=>localStorage.setItem('al_mode',$('#mode').value);
 $('#tabEdits').onclick=()=>showTab('edits');
 $('#tabGit').onclick=()=>showTab('git');
 $('#dclose').onclick=()=>$('#drawer').classList.remove('open');
+/* dismiss the Changes drawer on outside-click (chat, sidebar, composer…) or Escape,
+   so you don't have to aim for the ✕. The .emark "see Changes" markers are the
+   openers → excluded, else the opening click would immediately re-close it. */
+document.addEventListener('click',e=>{
+  if(drawerOpen()&&!e.target.closest('#drawer')&&!e.target.closest('.emark'))$('#drawer').classList.remove('open');});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&drawerOpen())$('#drawer').classList.remove('open');});
 $('#grefresh').onclick=refreshGit;
 $('#project').onchange=()=>{const c=$('#project').value==='__custom__';
   $('#cwdwrap').classList.toggle('show',c);
