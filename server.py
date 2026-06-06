@@ -34,7 +34,7 @@ import tornado.websocket
 
 try:
     from claude_agent_sdk import (
-        ClaudeSDKClient, ClaudeAgentOptions, AssistantMessage, UserMessage,
+        query, ClaudeSDKClient, ClaudeAgentOptions, AssistantMessage, UserMessage,
         SystemMessage, ResultMessage, StreamEvent, TextBlock, ThinkingBlock,
         ToolUseBlock, ToolResultBlock, PermissionResultAllow, PermissionResultDeny)
     HAVE_SDK = True
@@ -62,6 +62,20 @@ CLAUDE_BIN = (_env("CLAUDE") or shutil.which("claude")
 CAP = 12000          # cap per long string field sent to the browser
 RESULT_CAP = 6000    # cap per tool_result body
 POLL_MS = 800        # transcript tail interval
+
+# ── Session recap ("away summary") — a one-line Haiku summary of where an idle
+# session stands, shown when you return to it, like the CLI's awaySummary feature.
+RECAP_ENABLED  = (_env("RECAP", "1") or "1").lower() not in ("0", "false", "no", "off")
+RECAP_IDLE_SEC = int(_env("RECAP_IDLE_SEC", "300") or "300")   # idle seconds before a recap is due
+RECAP_MODEL    = _env("RECAP_MODEL", "haiku") or "haiku"       # fast + cheap; overridable
+RECAP_SYS = ("You write a one-line \"recap\" for a developer who stepped away from an "
+             "in-progress coding session and just came back. Given the transcript, reply with a "
+             "SINGLE plain-text line (no markdown, no quotes, under 160 characters) stating what "
+             "is being worked on and the immediate next step. "
+             "Example: Working on the auth refactor — just split the login handler; next: wire up the session cookie.")
+# turn-complete verbs — the CLI's curated past-tense set (independent of the live
+# spinner's present-participle word); one is stamped onto each finished turn.
+DONE_PAST = ["Baked", "Brewed", "Churned", "Cogitated", "Cooked", "Crunched", "Sautéed", "Worked"]
 
 
 # ───────────────────────── normalization ─────────────────────────
@@ -859,6 +873,12 @@ class ChatSession:
         self._tok_chars = 0       # streamed output chars, for the live estimate
         self._tok_exact = False   # True once message_delta gives the real output_tokens
         self._last_tok_emit = 0.0
+        self._step = 0            # agentic-step counter; bumps the spinner verb per step
+        # session-recap ("away summary") bookkeeping
+        self.last_activity = time.time()   # wall time of the last turn boundary (idle clock)
+        self.recap_for = None     # the last_activity value already recapped (dedup)
+        self.recap_busy = False   # True while a recap generation is in flight
+        self._compact_turn = False  # was the in-flight turn a manual /compact? (no "Baked" line)
 
     def preload(self):
         """Populate history from the on-disk transcript before resuming."""
@@ -971,9 +991,16 @@ class ChatSession:
                 evs = self._normalize(msg)
                 for e in evs:
                     if e["kind"] == "turn_done":
+                        if not self._compact_turn:   # a /compact turn isn't a "Baked" turn
+                            e["done_word"] = secrets.choice(DONE_PAST)
+                            e["done_at"] = time.time()   # UTC epoch of completion
+                            if self.turn_started:
+                                e["dur_ms"] = int((time.time() - self.turn_started) * 1000)
+                        self._compact_turn = False
                         self.busy = False
                         self.turn_started = None
                         self.compacting = False
+                        self.last_activity = time.time()   # idle clock starts now
                     elif e["kind"] == "compacted":
                         self.compacting = False
                     elif e["kind"] == "ready":
@@ -1012,6 +1039,81 @@ class ChatSession:
         self.ctx = {"totalTokens": u.get("totalTokens"), "maxTokens": u.get("maxTokens"),
                     "percentage": u.get("percentage"), "model": u.get("model")}
         self._emit({"type": "context", "ctx": self.ctx})
+
+    def _live_ctx(self, total):
+        """Live context-meter update from a request's input usage mid-turn (input +
+        cache_read + cache_creation ≈ the whole window the model sees, images
+        included). Needs a maxTokens from a prior get_context_usage; the exact
+        /context value snaps back in at the next turn boundary (_refresh_context)."""
+        if not total:
+            return
+        prev = self.ctx or {}
+        mx = prev.get("maxTokens")
+        if not mx:
+            return
+        self.ctx = {"totalTokens": total, "maxTokens": mx,
+                    "percentage": round(total * 100.0 / mx, 1),
+                    "model": prev.get("model")}
+        self._emit({"type": "context", "ctx": self.ctx})
+
+    def _recap_transcript(self):
+        """Compact text view of the recent conversation for the recap model.
+        Returns '' when there's nothing worth recapping yet (no assistant turn)."""
+        lines, has_asst = [], False
+        for e in self.log:
+            k = e.get("kind")
+            if k == "user_text":
+                t = (e.get("text") or "").strip()
+                if t:
+                    lines.append("User: " + t)
+            elif k == "assistant_text":
+                t = (e.get("text") or "").strip()
+                if t:
+                    lines.append("Assistant: " + t); has_asst = True
+            elif k == "tool_use":
+                lines.append("[tool: %s]" % (e.get("tool") or "?"))
+        if not has_asst:
+            return ""
+        return "\n".join(lines)[-6000:]   # tail keeps the most recent context
+
+    async def _make_recap(self):
+        """Generate a one-line 'away summary' and push it to viewers (logged, so it
+        also replays when you return). Isolated Haiku call: no tools, no settings /
+        CLAUDE.md, single turn — cheap and side-effect-free."""
+        if (not RECAP_ENABLED or self.busy or self.ended or self.compacting
+                or self.recap_busy or not self.client
+                or self.recap_for == self.last_activity):
+            return
+        transcript = self._recap_transcript()
+        if not transcript:
+            return
+        self.recap_busy = True
+        text = None
+        try:
+            opts = ClaudeAgentOptions(
+                model=RECAP_MODEL, cwd=self.cwd, cli_path=CLAUDE_BIN,
+                system_prompt=RECAP_SYS, allowed_tools=[], max_turns=1,
+                setting_sources=[])
+            chunks = []
+            async def _run():
+                async for m in query(
+                        prompt="Transcript so far:\n\n" + transcript + "\n\nRecap:",
+                        options=opts):
+                    if isinstance(m, AssistantMessage):
+                        for b in m.content:
+                            if isinstance(b, TextBlock):
+                                chunks.append(b.text)
+            await asyncio.wait_for(_run(), 30)
+            line = " ".join(chunks).strip()
+            text = line.splitlines()[0].strip() if line else None
+        except Exception:
+            text = None
+        finally:
+            self.recap_busy = False
+        # a turn may have started while we were generating — don't recap over it
+        if text and not self.busy and not self.ended:
+            self.recap_for = self.last_activity
+            self._push([{"kind": "recap", "text": _cap(text, 400)}])
 
     def _normalize(self, msg):
         evs = []
@@ -1074,14 +1176,30 @@ class ChatSession:
         e = getattr(msg, "event", None) or {}
         et = e.get("type")
         if et == "message_start":
+            # each model request = one agentic step. Re-pick the spinner verb on
+            # every step after the first (the first keeps turn_start's word), so the
+            # word changes per tool round like the CLI; pushed to viewers below.
+            self._step += 1
+            if self._step > 1:
+                self.turn_word = secrets.randbelow(100000)
             u = (e.get("message") or {}).get("usage") or {}
+            # ↑ = tokens actually sent/processed fresh THIS request: new uncached
+            # input + content newly written to cache. EXCLUDES cache_read (the prior
+            # context replayed from cache — not re-uploaded). So ↑ stays small each
+            # turn/step instead of always showing the whole ~100k cached context
+            # (which the header context meter already tracks).
             self._tok_up = ((u.get("input_tokens") or 0)
-                            + (u.get("cache_read_input_tokens") or 0)
                             + (u.get("cache_creation_input_tokens") or 0))
             self._tok_out = u.get("output_tokens") or 0
             self._tok_chars = 0
             self._tok_exact = False
             self._emit_tokens(force=True)
+            # live context meter: input + cache_read + cache_creation = the full
+            # context the model just received (images included) — replaces the stale
+            # turn-boundary snapshot; the exact /context value snaps back at turn end.
+            self._live_ctx((u.get("input_tokens") or 0)
+                           + (u.get("cache_read_input_tokens") or 0)
+                           + (u.get("cache_creation_input_tokens") or 0))
         elif et == "content_block_delta":
             if self._tok_exact:
                 return
@@ -1106,7 +1224,8 @@ class ChatSession:
             return
         self._last_tok_emit = now
         self._emit({"type": "tokens", "up": self._tok_up,
-                    "out": self._tok_out, "exact": self._tok_exact})
+                    "out": self._tok_out, "exact": self._tok_exact,
+                    "word": self.turn_word})
 
     def turn_age(self):
         """Seconds the current turn has been running (0 if idle) — lets a
@@ -1170,8 +1289,10 @@ class ChatSession:
             self.turn_word = secrets.randbelow(100000)
             self._tok_up = self._tok_out = self._tok_chars = 0
             self._tok_exact = False
+            self._step = 0
             cmd0 = text.strip().split(None, 1)[0] if text.strip() else ""
             self.compacting = (cmd0 == "/compact")
+            self._compact_turn = self.compacting
         self._echo_user(text, images, qid=qid, start=start)
         if start and self.compacting:   # surface the otherwise-silent long compaction
             self._push([{"kind": "compacting", "word": self.turn_word}])
@@ -1388,6 +1509,12 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "busy": sess.busy, "ended": sess.ended, "events": sess.log,
                        "turn_age": sess.turn_age(), "word": sess.turn_word, "effort": sess.effort,
                        "compacting": sess.compacting})
+            # returning to an idle session that's been quiet a while → recap it now
+            # (the periodic sweep may not have ticked yet); guarded against busy/dup
+            if (RECAP_ENABLED and not sess.busy and not sess.ended and not sess.compacting
+                    and sess.recap_for != sess.last_activity
+                    and (time.time() - sess.last_activity) >= RECAP_IDLE_SEC):
+                tornado.ioloop.IOLoop.current().spawn_callback(sess._make_recap)
         elif mt == "resume":
             if not CLAUDE_BIN or not os.path.exists(CLAUDE_BIN):
                 self._say({"type": "error", "error": "claude CLI not found"})
@@ -1436,6 +1563,16 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             self.session.set_model(msg.get("model") or "")
         elif mt == "set_mode" and self.session:
             self.session.set_mode(msg.get("mode") or "")
+        elif mt == "configure":
+            # ⚙ per-session model/permission from the kebab Configure popover,
+            # targeting a live session by id (the attached one or any other).
+            # Effort is NOT here — it stays on the pill's set_effort relaunch path.
+            sess = CHAT_SESSIONS.get(msg.get("id"))
+            if sess and not sess.ended:
+                if msg.get("model") is not None:
+                    sess.set_model(msg.get("model") or "")
+                if msg.get("mode") is not None:
+                    sess.set_mode(msg.get("mode") or "")
         elif mt == "set_effort" and self.session:
             # --effort is launch-time only (no live SDK control), so changing it
             # relaunches the session: resume the same cc with the new --effort.
@@ -1523,7 +1660,8 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
         elif mt == "list":
             self._say({"type": "sessions", "sessions": [
                 {"id": s.id, "cwd": s.cwd, "name": os.path.basename(s.cwd) or s.cwd,
-                 "cc": s.cc_id, "model": s.model or "default", "title": s.title(),
+                 "cc": s.cc_id, "model": s.model or "default", "mode": s.mode,
+                 "effort": s.effort, "title": s.title(),
                  "busy": s.busy, "ended": s.ended}
                 for s in CHAT_SESSIONS.values()]})
 
@@ -1635,7 +1773,9 @@ header input#cwd{flex:1;min-width:120px;display:none}
 #thinking .glyph{display:none;font-size:13px;color:var(--tool);width:1.1em;text-align:center;
   text-shadow:0 0 8px var(--tool);animation:thinkpulse 1.4s ease-in-out infinite}
 #thinking.busy .glyph{display:inline-block}
-#thinking.compacting .glyph{width:2em;text-align:left;letter-spacing:1px;font-weight:700}
+#thinking.compacting .glyph{width:2.6em;text-align:left;letter-spacing:1px;font-weight:700}
+#thinking .meta .mtx{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:1px}
+#thinking .meta .mtx span{text-shadow:0 0 5px currentColor}
 #thinking .word{color:var(--fg);font-weight:600}
 #thinking.busy .word::after{content:'…'}
 #thinking .meta{color:var(--mut);font-size:12px;font-variant-numeric:tabular-nums}
@@ -1654,6 +1794,11 @@ header input#cwd{flex:1;min-width:120px;display:none}
 .think.hide{display:none}
 .notice{color:var(--mut);font-size:11.5px;margin:6px 0}
 .errline{color:var(--del);font-size:12px;font-family:ui-monospace,monospace;margin:4px 0;white-space:pre-wrap}
+.recap{color:var(--mut);font-size:12px;margin:7px 0;line-height:1.45}
+.recap .rk{font-weight:600;letter-spacing:.2px}
+.recap .rt{font-style:italic;opacity:.92}
+.doneline{color:var(--mut);font-size:11.5px;margin:6px 0}
+.doneline .dg{color:var(--tool)}
 
 /* collapsed change/tool cards */
 .tool{border:1px solid var(--line);border-radius:8px;margin:6px 0 12px;background:var(--bg2);overflow:hidden}
@@ -1849,6 +1994,8 @@ pre code{background:none;border:none;padding:0}
 #cardMenu .mi{padding:7px 10px;font-size:12.5px;color:var(--fg);cursor:pointer;border-radius:5px;white-space:nowrap}
 #cardMenu .mi:hover{background:var(--bg3)}
 #cardMenu .mi.danger{color:var(--delfg)}#cardMenu .mi.danger:hover{background:var(--nobg)}
+#cardMenu .cfgrow{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:5px 9px;font-size:12.5px;color:var(--mut)}
+#cardMenu .cfgrow .cfgsel{background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:5px;padding:3px 6px;font-size:12px;cursor:pointer}
 .fscope{font-size:10px;color:var(--mut);font-family:ui-monospace,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:130px}
 #sb-backdrop{display:none}
 @media(max-width:860px){
@@ -2051,6 +2198,19 @@ function addAsst(text){const s=atBottom();const d=document.createElement('div');
 function addThink(text){const s=atBottom();const d=document.createElement('div');d.className='think'+(showThink?'':' hide');d.dataset.t=1;
   d.textContent=text;stream.appendChild(d);if(s)scroll();}
 function addNotice(t){const d=document.createElement('div');d.className='notice';d.textContent=t;stream.appendChild(d);}
+function addRecap(t){const s=atBottom();const d=document.createElement('div');d.className='recap';
+  d.innerHTML='<span class="rk">※ recap:</span> <span class="rt"></span>';
+  d.querySelector('.rt').textContent=t;stream.appendChild(d);if(s)scroll();}
+/* turn-complete footer line — ✻ {past verb} for {N}s · {YYYY-MM-DD HH:MM:SS} UTC (server-stamped) */
+function utcStamp(sec){const d=new Date(sec*1000),p=n=>String(n).padStart(2,'0');
+  return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+
+         p(d.getUTCHours())+':'+p(d.getUTCMinutes())+':'+p(d.getUTCSeconds())+' UTC';}
+function addDone(word,durMs,atSec){const s=atBottom();const d=document.createElement('div');d.className='doneline';
+  d.innerHTML='<span class="dg">✻</span> <span class="dw"></span>';
+  let t=word+(durMs>0?(' for '+fmtSecs(durMs)):'');
+  if(atSec)t+=' · '+utcStamp(atSec);
+  d.querySelector('.dw').textContent=t;
+  stream.appendChild(d);if(s)scroll();}
 function addErr(t){const d=document.createElement('div');d.className='errline';d.textContent=t;stream.appendChild(d);if(atBottom())scroll();}
 function addTool(ev){const s=atBottom();const c=document.createElement('div');c.className='tool';
   const cn=counts(ev);const cnt=cn?('<span class="a">+'+cn.a+'</span> <span class="d">−'+cn.d+'</span>'):'';
@@ -2084,31 +2244,63 @@ function setBusy(b,wordSeed,elapsedMs){running=b;$('#dot').className='dot '+(b?'
   if(b)startThinking(wordSeed,elapsedMs);else stopThinking();}
 
 /* in-chat "thinking" indicator — animated glyph + cycling word + elapsed timer */
-const THINK_WORDS=['Thinking','Pondering','Cogitating','Brewing','Conjuring','Percolating',
-  'Ruminating','Noodling','Mulling','Synthesizing','Computing','Untangling','Divining','Tinkering'];
+/* spinner verbs — the full Claude Code CLI set (187 present participles, incl. the
+   "Clauding" easter egg). A verb is picked per agentic step (see setWord). */
+const THINK_WORDS=['Accomplishing','Actioning','Actualizing','Architecting','Baking','Beaming','Beboppin\'','Befuddling','Billowing','Blanching','Bloviating','Boogieing','Boondoggling','Booping','Bootstrapping','Brewing','Bunning','Burrowing','Calculating','Canoodling','Caramelizing','Cascading','Catapulting','Cerebrating','Channeling','Channelling','Choreographing','Churning','Clauding','Coalescing','Cogitating','Combobulating','Composing','Computing','Concocting','Considering','Contemplating','Cooking','Crafting','Creating','Crunching','Crystallizing','Cultivating','Deciphering','Deliberating','Determining','Dilly-dallying','Discombobulating','Doing','Doodling','Drizzling','Ebbing','Effecting','Elucidating','Embellishing','Enchanting','Envisioning','Evaporating','Fermenting','Fiddle-faddling','Finagling','Flambéing','Flibbertigibbeting','Flowing','Flummoxing','Fluttering','Forging','Forming','Frolicking','Frosting','Gallivanting','Galloping','Garnishing','Generating','Gesticulating','Germinating','Gitifying','Grooving','Gusting','Harmonizing','Hashing','Hatching','Herding','Honking','Hullaballooing','Hyperspacing','Ideating','Imagining','Improvising','Incubating','Inferring','Infusing','Ionizing','Jitterbugging','Julienning','Kneading','Leavening','Levitating','Lollygagging','Manifesting','Marinating','Meandering','Metamorphosing','Misting','Moonwalking','Moseying','Mulling','Mustering','Musing','Nebulizing','Nesting','Newspapering','Noodling','Nucleating','Orbiting','Orchestrating','Osmosing','Perambulating','Percolating','Perusing','Philosophising','Photosynthesizing','Pollinating','Pondering','Pontificating','Pouncing','Precipitating','Prestidigitating','Processing','Proofing','Propagating','Puttering','Puzzling','Quantumizing','Razzle-dazzling','Razzmatazzing','Recombobulating','Reticulating','Roosting','Ruminating','Sautéing','Scampering','Schlepping','Scurrying','Seasoning','Shenaniganing','Shimmying','Simmering','Skedaddling','Sketching','Slithering','Smooshing','Sock-hopping','Spelunking','Spinning','Sprouting','Stewing','Sublimating','Swirling','Swooping','Symbioting','Synthesizing','Tempering','Thinking','Thundering','Tinkering','Tomfoolering','Topsy-turvying','Transfiguring','Transmuting','Twisting','Undulating','Unfurling','Unravelling','Vibing','Waddling','Wandering','Warping','Whatchamacalliting','Whirlpooling','Whirring','Whisking','Wibbling','Working','Wrangling','Zesting','Zigzagging'];
 const THINK_GLYPHS=['✶','✷','✸','✹','✺','✹','✸','✷'];
-const DREAM_GLYPHS=['z','z','zz','zz','zzz','zzz'];   /* compacting: a slow Zzz drifting up */
-let thinkTimer=0,thinkStart=0,thinkGi=0,thinkWi=0;
+const DREAM_GLYPHS=['Zzz','zZz','zzZ','ZzZ'];   /* compacting: a slow breathing Zzz wave */
+/* compacting meta: crush-style flowing gradient over scrambling hex (cf. charmbracelet/crush
+   internal/ui/anim/anim.go) — runes à la crush (hex+symbols, minus <>&"' for innerHTML safety);
+   each cell re-scrambles every frame while a warm<->cool color wave scrolls across the row */
+const MATRIX_CHARS='0123456789abcdefABCDEF~!@#$%^*()+=_-?/|';
+const MTX_PERIOD=12, MTX_FLOW=0.06;            /* ~1.3 colour sweeps across the row, scrolling ~1cyc/1.1s */
+let gradA=[224,192,128], gradB=[79,193,255];   /* [--tool,--acc] RGB, refreshed from the live theme per compaction */
+function cssRGB(name){const v=getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  const m=/^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(v);
+  return m?[parseInt(m[1],16),parseInt(m[2],16),parseInt(m[3],16)]:[224,192,128];}
+function matrixHTML(n,phase){let s='';for(let i=0;i<n;i++){
+    const ch=MATRIX_CHARS[Math.floor(Math.random()*MATRIX_CHARS.length)];
+    const t=0.5-0.5*Math.cos(2*Math.PI*(i/MTX_PERIOD+phase*MTX_FLOW)),
+          r=Math.round(gradA[0]+(gradB[0]-gradA[0])*t),
+          g=Math.round(gradA[1]+(gradB[1]-gradA[1])*t),
+          b=Math.round(gradA[2]+(gradB[2]-gradA[2])*t);
+    s+='<span style="color:rgb('+r+','+g+','+b+')">'+ch+'</span>';}
+  return s;}
+let thinkTimer=0,thinkStart=0,thinkGi=0,thinkWi=0,lastWordSeed=null;
+/* map a server seed → spinner verb (so the word is stable across reattach and
+   changes only when the server re-picks the seed, i.e. once per agentic step) */
+function setWord(seed){const el=$('#thinking');if(!el)return;
+  thinkWi=seed!=null?((seed%THINK_WORDS.length)+THINK_WORDS.length)%THINK_WORDS.length:Math.floor(Math.random()*THINK_WORDS.length);
+  const w=el.querySelector('.word');if(w)w.textContent=THINK_WORDS[thinkWi];}
 function startThinking(wordSeed,elapsedMs){const el=$('#thinking');if(!el)return;
   const fresh=!thinkTimer;         /* new turn, or reattaching to a running one */
   if(fresh||elapsedMs!=null)thinkStart=Date.now()-(elapsedMs||0);
   el.classList.toggle('compacting',compacting);
-  if(compacting){el.querySelector('.word').textContent='Compacting';el.querySelector('.glyph').textContent='z';}
+  if(compacting){thinkGi=0;el.querySelector('.word').textContent='Compacting';el.querySelector('.glyph').textContent=DREAM_GLYPHS[0];}
   else if(fresh||wordSeed!=null){  /* server-provided seed keeps the word stable across reattach */
-    thinkWi=(wordSeed!=null)?(wordSeed%THINK_WORDS.length):Math.floor(Math.random()*THINK_WORDS.length);
-    el.querySelector('.word').textContent=THINK_WORDS[thinkWi];
+    lastWordSeed=wordSeed;setWord(wordSeed);
   }
   if(fresh&&atBottom())scroll();
   clearInterval(thinkTimer);
+  let frame=0;
+  const tick=compacting?65:130;    /* compacting shimmer wants ~15fps; the normal spinner stays 130ms */
+  if(compacting){gradA=cssRGB('--tool');gradB=cssRGB('--acc');}   /* harmonize the colour wave with the live theme */
   thinkTimer=setInterval(()=>{     /* during the turn only the glyph + timer move */
-    const arr=compacting?DREAM_GLYPHS:THINK_GLYPHS;
-    thinkGi=(thinkGi+1)%arr.length;
-    el.querySelector('.glyph').textContent=arr[thinkGi];
+    frame++;
     const s=Math.floor((Date.now()-thinkStart)/1000);
-    const tok=(tokShow&&!compacting)?(tokStr()+' · '):'';
-    el.querySelector('.meta').textContent=compacting?(s+'s · compacting'):(tok+s+'s');
-  },130);}
+    if(compacting){
+      if(frame%6===0)thinkGi=(thinkGi+1)%DREAM_GLYPHS.length;   /* slow breathing Zzz (~390ms) */
+      el.querySelector('.glyph').textContent=DREAM_GLYPHS[thinkGi];
+      el.querySelector('.meta').innerHTML=s+'s · <span class="mtx">'+matrixHTML(16,frame)+'</span>';
+    }else{
+      thinkGi=(thinkGi+1)%THINK_GLYPHS.length;
+      el.querySelector('.glyph').textContent=THINK_GLYPHS[thinkGi];
+      const tok=tokShow?(tokStr()+' · '):'';
+      el.querySelector('.meta').textContent=tok+s+'s';
+    }
+  },tick);}
 function stopThinking(){clearInterval(thinkTimer);thinkTimer=0;const el=$('#thinking');if(el)el.classList.remove('compacting');}
+function fmtSecs(ms){const s=Math.max(0,Math.round(ms/1000));if(s<60)return s+'s';const m=Math.floor(s/60);return m+'m '+(s%60)+'s';}
 function doInterrupt(){if(!running)return;wsSend({type:'interrupt'});addNotice('⏹ interrupt sent');}
 function clearUI(){stream.innerHTML='';$('#edits').innerHTML='<div class="empty">no file changes yet</div>';
   $('#gitc').innerHTML='<div class="empty">—</div>';tools={};editCount=0;updateEditBadge();renderCtx(null);ready=false;
@@ -2198,10 +2390,11 @@ function route(ev){
   else if(ev.kind==='turn_start'){tokShow=false;setBusy(true,ev.word,0);}
   else if(ev.kind==='compacting'){compacting=true;setBusy(true,ev.word,0);}
   else if(ev.kind==='compacted'){compacting=false;addNotice(fmtCompacted(ev));if(ev.trigger!=='auto')setBusy(false);}
-  else if(ev.kind==='turn_done'){compacting=false;setBusy(false);if(drawerOpen()&&gitTab())refreshGit();}
+  else if(ev.kind==='turn_done'){compacting=false;setBusy(false);if(ev.done_word)addDone(ev.done_word,ev.dur_ms||0,ev.done_at);if(drawerOpen()&&gitTab())refreshGit();}
   else if(ev.kind==='queued')addQueued(ev);
   else if(ev.kind==='dequeued'||ev.kind==='unqueued')removeQueued(ev.qid);
   else if(ev.kind==='notice')addNotice(ev.text);
+  else if(ev.kind==='recap')addRecap(ev.text);
 }
 
 /* persistent server-side session: attach / reattach / switch */
@@ -2209,10 +2402,10 @@ function markEnded(msg){ready=false;ta.disabled=true;sendBtn.disabled=true;$('#d
   localStorage.removeItem(SKEY);if(msg)addNotice(msg);}
 function onMsg(e){const m=JSON.parse(e.data);
   if(m.type==='started'){pendingStart=false;sid=m.id;cwd=m.cwd;bindProject(m.cwd);localStorage.setItem(SKEY,sid);
-    ready=true;setBusy(false);ta.focus();setCurname(m.name||'session');syncPickers(m.model,m.mode);setEffortPill(m.effort);renderCtx(null);statset('ready');
+    ready=true;setBusy(false);ta.focus();setCurname(m.name||'session');setEffortPill(m.effort);renderCtx(null);statset('ready');
     addNotice('new session « '+(m.name||'')+' »'+(m.effort?' · '+m.effort+' effort':'')+' in '+m.cwd+' — type your first message to begin');reqList();loadPast();}
   else if(m.type==='attached'){clearUI();pendingStart=false;sid=m.id;curCC=m.cc||null;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
-    ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));syncPickers(m.model,m.mode);setEffortPill(m.effort);renderCtx(m.ctx);statset(m.ended?'ended':'ready');
+    ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));setEffortPill(m.effort);renderCtx(m.ctx);statset(m.ended?'ended':'ready');
     replaying=true;m.events.forEach(route);replaying=false;
     compacting=!!m.compacting;setBusy(!!m.busy,m.word,(m.turn_age||0)*1000);
     if(m.ended){markEnded('— this session has ended (history shown · you can resume it from disk) —');}
@@ -2229,7 +2422,8 @@ function onMsg(e){const m=JSON.parse(e.data);
   else if(m.type==='renamed'){if(m.ok){if(m.cc&&m.cc===curCC&&m.name)setCurname(m.name);addNotice('✎ renamed');reqList();loadPast();}else addNotice('rename failed');}
   else if(m.type==='sessions')renderLive(m.sessions);
   else if(m.type==='context')renderCtx(m.ctx);
-  else if(m.type==='tokens'){tokUp=m.up||0;tokOut=m.out||0;tokShow=true;}
+  else if(m.type==='tokens'){tokUp=m.up||0;tokOut=m.out||0;tokShow=true;
+    if(m.word!=null&&m.word!==lastWordSeed){lastWordSeed=m.word;if(running&&!compacting)setWord(m.word);}}
   else if(m.type==='favorites'){favData=m.favorites||[];renderPast();}
 }
 function openWs(cb){const proto=location.protocol==='https:'?'wss:':'ws:';
@@ -2273,12 +2467,6 @@ function renderUsage(u){const el=$('#usage');const f=u&&u.five_hour;
   w7.forEach(([k,lbl])=>{if(u[k]&&u[k].utilization!=null)t+='\n'+lbl+': '+Math.round(u[k].utilization)+'%';});
   el.title=t;}
 function loadUsage(){fetch('api/usage').then(r=>r.json()).then(j=>renderUsage(j.usage)).catch(()=>{});}
-/* reflect the active session's real model/mode in the pickers (programmatic
-   .value set does NOT fire onchange, so this won't echo back to the server) */
-function syncPickers(model,mode){
-  if(model){const o=$('#model');for(const x of o.options){if(x.value===model){o.value=model;break;}}}
-  if(mode){const o=$('#mode');for(const x of o.options){if(x.value===mode){o.value=mode;break;}}}
-}
 /* thinking effort: a clickable pill on the right of the status row. --effort is
    launch-time only, so changing it on a live session relaunches it (server-side
    resume with the new --effort); the choice is remembered for new sessions. */
@@ -2300,13 +2488,10 @@ function modelLabel(real,maxTok){
   let lbl=fam+(m?(' '+m[1]+'.'+m[2]):'');
   if(maxTok)lbl+='['+fmtTok(maxTok)+']';
   return lbl;}
-function setResolvedModel(real,maxTok){
-  if(real)_rmodel=real;
-  if(maxTok)_rmax=maxTok;
-  const lbl=modelLabel(_rmodel,_rmax);
-  const o=$('#model');if(!o)return;
-  for(const x of o.options){if(x.value==='default'){
-    x.textContent=lbl||'model: default';break;}}}
+/* the sidebar #model picker now holds the NEW-session default, so it no longer
+   reflects the live session's resolved model (that moved to ⚙ Configure). Kept
+   as a no-op shim so existing callers (ready / context) stay valid. */
+function setResolvedModel(real,maxTok){if(real)_rmodel=real;if(maxTok)_rmax=maxTok;}
 
 /* sidebar: live sessions (in-RAM) + resume-from-disk (past transcripts) */
 /* shared per-card action menu (⋯): a fixed popover anchored to the clicked
@@ -2324,6 +2509,36 @@ function openCardMenu(anchor,items){const m=$('#cardMenu');m.innerHTML='';m._anc
   let left=r.right-mw,top=r.bottom+4;
   if(left<6)left=6;
   if(top+mh>window.innerHeight-6)top=Math.max(6,r.top-mh-4);
+  m.style.left=left+'px';m.style.top=top+'px';}
+/* ⚙ Configure: change a live session's model / permission in place (hot-swap by
+   id — works for any live session) + effort. Effort is routed through the pill's
+   setEffort() so this control and the 🧠 pill stay in lockstep. Reuses the
+   #cardMenu popover shell (positioning + outside-click close). */
+function openConfigure(s,anchor){const m=$('#cardMenu');m.innerHTML='';m._anchor=anchor;
+  const mkSel=(opts,cur,fn)=>{const o=document.createElement('select');o.className='cfgsel';
+    opts.forEach(([v,t])=>{const x=document.createElement('option');x.value=v;x.textContent=t;if(v===cur)x.selected=true;o.appendChild(x);});
+    o.onchange=()=>fn(o.value);return o;};
+  const row=(label,sel)=>{const w=document.createElement('div');w.className='cfgrow';
+    const l=document.createElement('span');l.textContent=label;w.appendChild(l);w.appendChild(sel);m.appendChild(w);};
+  row('Model',mkSel([['default','default'],['opus','opus'],['sonnet','sonnet'],['haiku','haiku']],s.model||'default',
+    v=>{wsSend({type:'configure',id:s.id,model:v});setTimeout(reqList,200);}));
+  row('Permission',mkSel([['acceptEdits','⚡ Auto-accept'],['default','🔐 Approve'],['plan','📋 Plan'],['bypassPermissions','⏩ Full auto']],s.mode||'default',
+    v=>{wsSend({type:'configure',id:s.id,mode:v});setTimeout(reqList,200);}));
+  row('Effort',mkSel(EFFORTS.map(e=>[e,e]),curEffort,v=>{setEffort(v);closeCardMenu();}));
+  m.classList.add('on');
+  const r=anchor.getBoundingClientRect(),mw=m.offsetWidth,mh=m.offsetHeight;
+  let left,top;
+  if(anchor.isConnected&&(r.width||r.height)){   /* fresh kebab → anchor to it */
+    left=r.right-mw;top=r.bottom+4;
+    if(top+mh>window.innerHeight-6)top=r.top-mh-4;
+  }else{   /* anchor was detached by a live-list re-render (its rect is all-zeros,
+              which would fling the popover to the top-left). Keep the menu where
+              it already sat (closeCardMenu leaves style.left/top intact). */
+    left=parseFloat(m.style.left)||(window.innerWidth-mw)/2;
+    top=parseFloat(m.style.top)||(window.innerHeight-mh)/2;
+  }
+  left=Math.min(Math.max(6,left),Math.max(6,window.innerWidth-mw-6));
+  top=Math.min(Math.max(6,top),Math.max(6,window.innerHeight-mh-6));
   m.style.left=left+'px';m.style.top=top+'px';}
 
 /* collapsible sidebar sections (Favorites / Recent / In folder) */
@@ -2349,7 +2564,8 @@ function renderLive(list){const box=$('#liveList');
       '<span class="skebab" title="more">⋮</span>';
     r.querySelector('.smeta').onclick=()=>switchSession(s.id);
     r.querySelector('.sdot').onclick=()=>switchSession(s.id);
-    r.querySelector('.skebab').onclick=ev=>{ev.stopPropagation();const items=[
+    r.querySelector('.skebab').onclick=ev=>{ev.stopPropagation();const kebab=ev.currentTarget;const items=[
+      {label:'⚙ Configure',fn:()=>openConfigure(s,kebab)},
       {label:'✎ Rename',fn:()=>renameSession(s.cc,s.title||s.name)}];
       if(s.cc)items.push({label:isFav(s.cc)?'★ Unfavorite':'☆ Favorite',fn:()=>toggleFav(s)});
       items.push({label:'✕ End session',danger:true,fn:()=>endSessionById(s.id,s.name)});
@@ -2586,9 +2802,13 @@ document.addEventListener('click',e=>{if(!e.target.closest('#cardMenu')&&!e.targ
 document.addEventListener('keydown',e=>{if(e.key==='Escape')closeCardMenu();});
 window.addEventListener('resize',closeCardMenu);
 window.addEventListener('scroll',closeCardMenu,true);
-/* model/mode: apply live to the active session; otherwise just seed the next New */
-$('#model').onchange=()=>{if(sid&&ws&&ws.readyState===1)wsSend({type:'set_model',model:$('#model').value});};
-$('#mode').onchange=()=>{if(sid&&ws&&ws.readyState===1)wsSend({type:'set_mode',mode:$('#mode').value});};
+/* model/mode pickers set the NEW-session default only (persisted). A running
+   session is reconfigured per-session via the ⚙ Configure menu, so editing the
+   new-session default no longer disturbs the current session. */
+$('#model').onchange=()=>localStorage.setItem('al_model',$('#model').value);
+$('#mode').onchange=()=>localStorage.setItem('al_mode',$('#mode').value);
+{const sm=localStorage.getItem('al_model');if(sm){const o=$('#model');for(const x of o.options)if(x.value===sm){o.value=sm;break;}}
+ const smd=localStorage.getItem('al_mode');if(smd){const o=$('#mode');for(const x of o.options)if(x.value===smd){o.value=smd;break;}}}
 $('#tabEdits').onclick=()=>showTab('edits');
 $('#tabGit').onclick=()=>showTab('git');
 $('#dclose').onclick=()=>$('#drawer').classList.remove('open');
@@ -2633,6 +2853,20 @@ openWs();
 </html>"""
 
 
+def _recap_tick():
+    """Periodic sweep: any session idle past the threshold gets a one-line recap,
+    so it's already waiting (in the log) when you return — and fires for a session
+    you're sitting on idle too. At most one recap per idle window (recap_for dedup)."""
+    if not RECAP_ENABLED:
+        return
+    now = time.time()
+    for s in list(CHAT_SESSIONS.values()):
+        if (not s.busy and not s.ended and not s.compacting and not s.recap_busy
+                and s.recap_for != s.last_activity
+                and (now - s.last_activity) >= RECAP_IDLE_SEC):
+            tornado.ioloop.IOLoop.current().spawn_callback(s._make_recap)
+
+
 def main():
     app = tornado.web.Application([
         (r"/", ConsoleHandler),
@@ -2648,6 +2882,8 @@ def main():
     ])
     loopback = BIND in ("127.0.0.1", "localhost", "::1")
     app.listen(PORT, address=BIND)
+    if RECAP_ENABLED:   # idle-session recap sweep (every 30s)
+        tornado.ioloop.PeriodicCallback(_recap_tick, 30000).start()
     print("Claude Console on http://%s:%d" % (BIND, PORT))
     print("  console: http://%s:%d/" % (BIND, PORT))
     print("  claude bin: %s" % CLAUDE_BIN)
