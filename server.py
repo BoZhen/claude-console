@@ -35,8 +35,8 @@ import tornado.websocket
 try:
     from claude_agent_sdk import (
         ClaudeSDKClient, ClaudeAgentOptions, AssistantMessage, UserMessage,
-        SystemMessage, ResultMessage, TextBlock, ThinkingBlock, ToolUseBlock,
-        ToolResultBlock, PermissionResultAllow, PermissionResultDeny)
+        SystemMessage, ResultMessage, StreamEvent, TextBlock, ThinkingBlock,
+        ToolUseBlock, ToolResultBlock, PermissionResultAllow, PermissionResultDeny)
     HAVE_SDK = True
 except Exception:
     HAVE_SDK = False
@@ -853,6 +853,12 @@ class ChatSession:
         self.turn_started = None  # wall time the current turn began (for the timer)
         self.turn_word = 0        # seed for the "thinking" word, stable across reattach
         self.compacting = False   # True while a manual /compact is running
+        # live streaming token counters (ephemeral; pushed to the pill, never logged)
+        self._tok_up = 0          # input tokens of the latest request (↑)
+        self._tok_out = 0         # output tokens so far (↓; estimated, exact at msg end)
+        self._tok_chars = 0       # streamed output chars, for the live estimate
+        self._tok_exact = False   # True once message_delta gives the real output_tokens
+        self._last_tok_emit = 0.0
 
     def preload(self):
         """Populate history from the on-disk transcript before resuming."""
@@ -881,7 +887,7 @@ class ChatSession:
         # in default & acceptEdits (verified) — it is not forced bypass.
         opts = ClaudeAgentOptions(
             cwd=self.cwd, permission_mode=self.mode, can_use_tool=self._can_use_tool,
-            add_dirs=[self.cwd], cli_path=CLAUDE_BIN,
+            add_dirs=[self.cwd], cli_path=CLAUDE_BIN, include_partial_messages=True,
             extra_args={"dangerously-skip-permissions": None})
         if self.model and self.model != "default":
             opts.model = self.model
@@ -959,6 +965,9 @@ class ChatSession:
     async def _consume(self):
         try:
             async for msg in self.client.receive_messages():
+                if isinstance(msg, StreamEvent):
+                    self._on_stream_event(msg)   # ephemeral token ticks; not logged
+                    continue
                 evs = self._normalize(msg)
                 for e in evs:
                     if e["kind"] == "turn_done":
@@ -1056,6 +1065,49 @@ class ChatSession:
                         "cost": msg.total_cost_usd})
         return evs
 
+    def _on_stream_event(self, msg):
+        """Partial-message stream events (include_partial_messages) → live ↑/↓ token
+        counts in the status pill. message_start carries the request's input usage;
+        content_block_delta lets us estimate output as it streams; message_delta
+        snaps it to the exact output_tokens. All ephemeral — emitted straight to
+        viewers, never appended to self.log (would flood replay on reattach)."""
+        e = getattr(msg, "event", None) or {}
+        et = e.get("type")
+        if et == "message_start":
+            u = (e.get("message") or {}).get("usage") or {}
+            self._tok_up = ((u.get("input_tokens") or 0)
+                            + (u.get("cache_read_input_tokens") or 0)
+                            + (u.get("cache_creation_input_tokens") or 0))
+            self._tok_out = u.get("output_tokens") or 0
+            self._tok_chars = 0
+            self._tok_exact = False
+            self._emit_tokens(force=True)
+        elif et == "content_block_delta":
+            if self._tok_exact:
+                return
+            d = e.get("delta") or {}
+            t = d.get("text") or d.get("thinking") or d.get("partial_json") or ""
+            if t:
+                self._tok_chars += len(t)
+                # ~4 chars/token; snapped to the exact count at message_delta
+                self._tok_out = max(self._tok_out, (self._tok_chars + 3) // 4)
+                self._emit_tokens()
+        elif et == "message_delta":
+            ot = (e.get("usage") or {}).get("output_tokens")
+            if ot is not None:
+                self._tok_out = ot
+                self._tok_exact = True
+                self._emit_tokens(force=True)
+
+    def _emit_tokens(self, force=False):
+        """Throttled ephemeral push of the current ↑/↓ token counts to the pill."""
+        now = time.time()
+        if not force and (now - self._last_tok_emit) < 0.12:
+            return
+        self._last_tok_emit = now
+        self._emit({"type": "tokens", "up": self._tok_up,
+                    "out": self._tok_out, "exact": self._tok_exact})
+
     def turn_age(self):
         """Seconds the current turn has been running (0 if idle) — lets a
         re-attaching viewer resume the elapsed-time display instead of resetting."""
@@ -1116,6 +1168,8 @@ class ChatSession:
             self.busy = True
             self.turn_started = time.time()
             self.turn_word = secrets.randbelow(100000)
+            self._tok_up = self._tok_out = self._tok_chars = 0
+            self._tok_exact = False
             cmd0 = text.strip().split(None, 1)[0] if text.strip() else ""
             self.compacting = (cmd0 == "/compact")
         self._echo_user(text, images, qid=qid, start=start)
@@ -1620,6 +1674,9 @@ pre{background:var(--codebg);border:1px solid var(--line);border-radius:6px;padd
 code{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;background:var(--codebg);border:1px solid var(--line);border-radius:3px;padding:0 4px}
 pre code{background:none;border:none;padding:0}
 .bubble h1,.bubble h2,.bubble h3{font-size:14px;margin:8px 0 4px}
+.bubble table{border-collapse:collapse;margin:7px 0;font-size:12px;display:block;overflow-x:auto;max-width:100%}
+.bubble th,.bubble td{border:1px solid var(--line);padding:3px 9px;text-align:left}
+.bubble thead th{background:var(--bg3);font-weight:600}
 .msg.asst ul,.msg.asst ol{margin:4px 0 4px 20px}
 .msg.asst a{color:var(--acc)}
 .diffline{font-family:ui-monospace,monospace;font-size:12px;white-space:pre-wrap;line-height:1.4}
@@ -1896,6 +1953,7 @@ pre code{background:none;border:none;padding:0}
 const $=s=>document.querySelector(s);
 const stream=$('#stream'), ta=$('#ta'), sendBtn=$('#send');
 let ws=null, running=false, ready=false, compacting=false, cwd='', tools={};
+let tokUp=0,tokOut=0,tokShow=false;   /* live streaming token counts shown in the pill */
 let sid=null, curCC=null, editCount=0, pendingStart=false, reconnectT=0;
 const EFFORTS=['low','medium','high','xhigh','max'];
 let curEffort=localStorage.getItem('al_effort')||'max';
@@ -1905,6 +1963,22 @@ const EDIT_TOOLS=new Set(['Edit','MultiEdit','Write','NotebookEdit']);
 const SKEY='al_session';
 
 function esc(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function mdTable(h){
+  if(h.indexOf('|')<0)return h;
+  const L=h.split('\n'),out=[];let i=0;
+  const sep=l=>/^[\s:|-]+$/.test(l)&&l.includes('-')&&l.includes('|');
+  const row=l=>l.replace(/^\s*\|/,'').replace(/\|\s*$/,'').split('|').map(c=>c.trim());
+  while(i<L.length){
+    if(L[i].includes('|')&&i+1<L.length&&sep(L[i+1])){
+      const head=row(L[i]);i+=2;const rows=[];
+      while(i<L.length&&L[i].trim()&&L[i].includes('|')){rows.push(row(L[i]));i++;}
+      let t='<table><thead><tr>'+head.map(c=>'<th>'+c+'</th>').join('')+'</tr></thead><tbody>';
+      for(const r of rows)t+='<tr>'+head.map((_,j)=>'<td>'+(r[j]==null?'':r[j])+'</td>').join('')+'</tr>';
+      out.push(t+'</tbody></table>');
+    }else{out.push(L[i]);i++;}
+  }
+  return out.join('\n');
+}
 function md(src){
   src=src||''; const bl=[], ml=[];
   src=src.replace(/```(\w*)\n?([\s\S]*?)```/g,(m,l,c)=>{bl.push('<pre><code>'+esc(c.replace(/\n$/,''))+'</code></pre>');return ' %%CB'+(bl.length-1)+'%% ';});
@@ -1916,12 +1990,16 @@ function md(src){
   src=src.replace(/\\\(([\s\S]+?)\\\)/g,(m,c)=>mj(c,0));
   src=src.replace(/\$(?!\s)([^\n$]*?[^\s$])\$(?!\d)/g,(m,c)=>mj(c,0));
   let h=esc(src);
+  h=mdTable(h);
   h=h.replace(/`([^`\n]+)`/g,(m,c)=>'<code>'+c+'</code>');
   h=h.replace(/\*\*([^*\n]+)\*\*/g,'<b>$1</b>');
   h=h.replace(/^### (.*)$/gm,'<h3>$1</h3>').replace(/^## (.*)$/gm,'<h2>$1</h2>').replace(/^# (.*)$/gm,'<h2>$1</h2>');
   h=h.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,'<a href="$2" target="_blank">$1</a>');
-  h=h.replace(/^[\-\*] (.*)$/gm,'<li>$1</li>').replace(/(<li>[\s\S]*?<\/li>)/g,'<ul>$1</ul>');
-  h=h.replace(/\n/g,'<br>').replace(/<br>(<(?:pre|h2|h3|ul)>)/g,'$1').replace(/(<\/(?:pre|h2|h3|ul)>)<br>/g,'$1');
+  h=h.replace(/^(\d+)\. (.*)$/gm,'<oli>$2</oli>').replace(/^[\-\*] (.*)$/gm,'<uli>$1</uli>');
+  h=h.replace(/(<uli>.*?<\/uli>(?:\n<uli>.*?<\/uli>)*)/g,m=>'<ul>'+m.replace(/\n/g,'').replace(/uli>/g,'li>')+'</ul>');
+  h=h.replace(/(<oli>.*?<\/oli>(?:\n<oli>.*?<\/oli>)*)/g,m=>'<ol>'+m.replace(/\n/g,'').replace(/oli>/g,'li>')+'</ol>');
+  h=h.replace(/\*(\S[^*\n]*?\S|\S)\*/g,'<i>$1</i>');
+  h=h.replace(/\n/g,'<br>').replace(/<br>(<(?:pre|h2|h3|ul|ol|table)>)/g,'$1').replace(/(<\/(?:pre|h2|h3|ul|ol|table)>)<br>/g,'$1');
   h=h.replace(/%%CB(\d+)%%/g,(m,i)=>bl[+i]);
   h=h.replace(/%%MJ(\d+)%%/g,(m,i)=>'<span class="math'+(ml[+i].d?' display':'')+'" data-d="'+ml[+i].d+'">'+esc(ml[+i].t)+'</span>');
   return h;
@@ -1990,6 +2068,8 @@ function addResult(ev){const c=tools[ev.toolId];if(!c)return;if(ev.isError)c.cla
 function statset(t){const el=$('#thinking');if(!el)return;
   const w=el.querySelector('.word');if(w)w.textContent=t;
   if(!running){const m=el.querySelector('.meta');if(m)m.textContent='';}}
+/* CLI-style ↑input / ↓output token counts for the pill (reuses the project fmtTok) */
+function tokStr(){return '↑'+fmtTok(tokUp)+' ↓'+fmtTok(tokOut);}
 function bindProject(p){if(!p)return;const sel=$('#project');let ok=false;
   for(const o of sel.options){if(o.value===p){ok=true;break;}}
   if(!ok){const o=document.createElement('option');o.value=p;o.textContent='● '+p.split('/').slice(-2).join('/');sel.insertBefore(o,sel.firstChild);}
@@ -2025,7 +2105,8 @@ function startThinking(wordSeed,elapsedMs){const el=$('#thinking');if(!el)return
     thinkGi=(thinkGi+1)%arr.length;
     el.querySelector('.glyph').textContent=arr[thinkGi];
     const s=Math.floor((Date.now()-thinkStart)/1000);
-    el.querySelector('.meta').textContent=compacting?(s+'s · compacting · esc to interrupt'):(s+'s · esc to interrupt');
+    const tok=(tokShow&&!compacting)?(tokStr()+' · '):'';
+    el.querySelector('.meta').textContent=compacting?(s+'s · compacting'):(tok+s+'s');
   },130);}
 function stopThinking(){clearInterval(thinkTimer);thinkTimer=0;const el=$('#thinking');if(el)el.classList.remove('compacting');}
 function doInterrupt(){if(!running)return;wsSend({type:'interrupt'});addNotice('⏹ interrupt sent');}
@@ -2114,7 +2195,7 @@ function route(ev){
   else if(ev.kind==='approval_resolved')resolveApprovalCard(ev.aid,ev.allow,ev.always);
   else if(ev.kind==='question')addQuestion(ev);
   else if(ev.kind==='question_resolved')resolveQuestionCard(ev.aid,ev.answers);
-  else if(ev.kind==='turn_start')setBusy(true,ev.word,0);
+  else if(ev.kind==='turn_start'){tokShow=false;setBusy(true,ev.word,0);}
   else if(ev.kind==='compacting'){compacting=true;setBusy(true,ev.word,0);}
   else if(ev.kind==='compacted'){compacting=false;addNotice(fmtCompacted(ev));if(ev.trigger!=='auto')setBusy(false);}
   else if(ev.kind==='turn_done'){compacting=false;setBusy(false);if(drawerOpen()&&gitTab())refreshGit();}
@@ -2148,6 +2229,7 @@ function onMsg(e){const m=JSON.parse(e.data);
   else if(m.type==='renamed'){if(m.ok){if(m.cc&&m.cc===curCC&&m.name)setCurname(m.name);addNotice('✎ renamed');reqList();loadPast();}else addNotice('rename failed');}
   else if(m.type==='sessions')renderLive(m.sessions);
   else if(m.type==='context')renderCtx(m.ctx);
+  else if(m.type==='tokens'){tokUp=m.up||0;tokOut=m.out||0;tokShow=true;}
   else if(m.type==='favorites'){favData=m.favorites||[];renderPast();}
 }
 function openWs(cb){const proto=location.protocol==='https:'?'wss:':'ws:';
