@@ -539,13 +539,16 @@ def save_pref(cc, mode=None, model=None, effort=None, fav=None):
 
 
 def list_favorites():
-    """All starred sessions across every device, newest-starred first."""
+    """All starred sessions across every device, newest-starred first.
+    Title tracks the live custom label (load_names) so a rename shows up here too;
+    falls back to the snapshot captured at star time when no custom name is set."""
     out = []
+    names = load_names()
     for cc, p in load_prefs().items():
         f = p.get("fav") if isinstance(p, dict) else None
         if isinstance(f, dict):
             out.append({"cc": cc, "cwd": f.get("cwd", ""), "name": f.get("name", ""),
-                        "title": f.get("title", ""), "ts": f.get("ts", 0)})
+                        "title": names.get(cc) or f.get("title", ""), "ts": f.get("ts", 0)})
     out.sort(key=lambda x: x.get("ts", 0), reverse=True)
     for x in out:
         x.pop("ts", None)
@@ -1640,6 +1643,8 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             ok = set_name(cc, msg.get("name") or "")
             self._say({"type": "renamed", "cc": cc,
                        "name": (msg.get("name") or "").strip()[:120], "ok": bool(ok)})
+            if ok:
+                self._broadcast_favorites()   # a renamed session may be starred → refresh every device's list
         elif mt == "end":
             # End a specific session by id (sidebar ✕) or the active one.
             # Ending a background session never disturbs the active stream.
@@ -1776,6 +1781,7 @@ header input#cwd{flex:1;min-width:120px;display:none}
 #thinking.compacting .glyph{width:2.6em;text-align:left;letter-spacing:1px;font-weight:700}
 #thinking .meta .mtx{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:1px}
 #thinking .meta .mtx span{text-shadow:0 0 5px currentColor}
+#thinking .meta .mtx.lite span{text-shadow:none;font-weight:600}   /* light bg: glow→smear, so drop it & bolden for contrast */
 #thinking .word{color:var(--fg);font-weight:600}
 #thinking.busy .word::after{content:'…'}
 #thinking .meta{color:var(--mut);font-size:12px;font-variant-numeric:tabular-nums}
@@ -2259,9 +2265,24 @@ const DREAM_GLYPHS=['Zzz','zZz','zzZ','ZzZ'];   /* compacting: a slow breathing 
 const MATRIX_CHARS='0123456789abcdefABCDEF~!@#$%^*()+=_-?/|';
 const MTX_PERIOD=12, MTX_FLOW=0.06;            /* ~1.3 colour sweeps across the row, scrolling ~1cyc/1.1s */
 let gradA=[224,192,128], gradB=[79,193,255];   /* [--tool,--acc] RGB, refreshed from the live theme per compaction */
+let mtxLite=false;                              /* light theme: darken the wave + drop the glow so the chars stay legible */
+let mtxTheme=null;                              /* last theme the palette was built for → re-read on live theme-swap */
 function cssRGB(name){const v=getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   const m=/^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(v);
   return m?[parseInt(m[1],16),parseInt(m[2],16),parseInt(m[3],16)]:[224,192,128];}
+function mtxLum(c){return (0.299*c[0]+0.587*c[1]+0.114*c[2])/255;}   /* perceived luminance 0..1 */
+function mtxAdjust(c,light){    /* light bg only: scale toward black to a max luminance (hue kept); dark path untouched */
+  if(!light)return c;
+  const L=mtxLum(c),MAXL=0.34;
+  if(L<=MAXL)return c;
+  const k=MAXL/L;return [Math.round(c[0]*k),Math.round(c[1]*k),Math.round(c[2]*k)];}
+function mtxRefresh(){    /* re-read palette from the live theme; cheap no-op until the theme attr actually changes (hot-swap) */
+  const th=document.documentElement.getAttribute('data-theme')||'dark';
+  if(th===mtxTheme)return;
+  mtxTheme=th;
+  mtxLite=mtxLum(cssRGB('--bg'))>0.5;
+  gradA=mtxAdjust(cssRGB('--tool'),mtxLite);
+  gradB=mtxAdjust(cssRGB('--acc'),mtxLite);}
 function matrixHTML(n,phase){let s='';for(let i=0;i<n;i++){
     const ch=MATRIX_CHARS[Math.floor(Math.random()*MATRIX_CHARS.length)];
     const t=0.5-0.5*Math.cos(2*Math.PI*(i/MTX_PERIOD+phase*MTX_FLOW)),
@@ -2288,14 +2309,15 @@ function startThinking(wordSeed,elapsedMs){const el=$('#thinking');if(!el)return
   clearInterval(thinkTimer);
   let frame=0;
   const tick=compacting?65:130;    /* compacting shimmer wants ~15fps; the normal spinner stays 130ms */
-  if(compacting){gradA=cssRGB('--tool');gradB=cssRGB('--acc');}   /* harmonize the colour wave with the live theme */
+  if(compacting)mtxRefresh();    /* seed palette from the live theme (re-checked each frame for hot theme-swap) */
   thinkTimer=setInterval(()=>{     /* during the turn only the glyph + timer move */
     frame++;
     const s=Math.floor((Date.now()-thinkStart)/1000);
     if(compacting){
+      mtxRefresh();             /* live theme-swap: re-read the palette if the user changes theme mid-compaction */
       if(frame%6===0)thinkGi=(thinkGi+1)%DREAM_GLYPHS.length;   /* slow breathing Zzz (~390ms) */
       el.querySelector('.glyph').textContent=DREAM_GLYPHS[thinkGi];
-      el.querySelector('.meta').innerHTML=s+'s · <span class="mtx">'+matrixHTML(16,frame)+'</span>';
+      el.querySelector('.meta').innerHTML=s+'s · <span class="mtx'+(mtxLite?' lite':'')+'">'+matrixHTML(16,frame)+'</span>';
     }else{
       thinkGi=(thinkGi+1)%THINK_GLYPHS.length;
       el.querySelector('.glyph').textContent=THINK_GLYPHS[thinkGi];
