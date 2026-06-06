@@ -882,6 +882,7 @@ class ChatSession:
         self.recap_for = None     # the last_activity value already recapped (dedup)
         self.recap_busy = False   # True while a recap generation is in flight
         self._compact_turn = False  # was the in-flight turn a manual /compact? (no "Baked" line)
+        self.bg_tasks = {}        # live run_in_background tasks: task_id -> {desc, tool_use_id}
 
     def preload(self):
         """Populate history from the on-disk transcript before resuming."""
@@ -999,6 +1000,9 @@ class ChatSession:
                             e["done_at"] = time.time()   # UTC epoch of completion
                             if self.turn_started:
                                 e["dur_ms"] = int((time.time() - self.turn_started) * 1000)
+                        if self.bg_tasks:   # still-running run_in_background tasks at this boundary
+                            e["bg_running"] = [t.get("desc") or "background task"
+                                               for t in self.bg_tasks.values()]
                         self._compact_turn = False
                         self.busy = False
                         self.turn_started = None
@@ -1143,6 +1147,20 @@ class ChatSession:
                             "pre": g("preTokens", "pre_tokens"),
                             "post": g("postTokens", "post_tokens"),
                             "ms": g("durationMs", "duration_ms")})
+            elif msg.subtype == "task_started":
+                # a run_in_background Bash launched → track it as a live background task
+                d = msg.data or {}
+                if d.get("task_type") == "local_bash" and d.get("task_id"):
+                    self.bg_tasks[d["task_id"]] = {"desc": d.get("description") or "",
+                                                   "tool_use_id": d.get("tool_use_id")}
+            elif msg.subtype == "task_notification":
+                # authoritative completion notice (carries task_id + status + summary)
+                self.bg_tasks.pop((msg.data or {}).get("task_id"), None)
+            elif msg.subtype == "task_updated":
+                # faster completion path: a status patch reaching a terminal state
+                d = msg.data or {}
+                if (d.get("patch") or {}).get("status") in ("completed", "failed", "killed", "error"):
+                    self.bg_tasks.pop(d.get("task_id"), None)
         elif isinstance(msg, AssistantMessage):
             if not self.cc_id and getattr(msg, "session_id", None):
                 self.cc_id = msg.session_id
@@ -1805,6 +1823,8 @@ header input#cwd{flex:1;min-width:120px;display:none}
 .recap .rt{font-style:italic;opacity:.92}
 .doneline{color:var(--mut);font-size:11.5px;margin:6px 0}
 .doneline .dg{color:var(--tool)}
+.bgline{color:var(--mut);font-size:11.5px;margin:6px 0}
+.bgline .bgk{color:var(--tool);font-weight:600}
 
 /* collapsed change/tool cards */
 .tool{border:1px solid var(--line);border-radius:8px;margin:6px 0 12px;background:var(--bg2);overflow:hidden}
@@ -1864,9 +1884,11 @@ pre code{background:none;border:none;padding:0}
 #send{background:var(--acc);color:var(--onacc);border:none;border-radius:10px;width:38px;height:38px;flex:none;display:inline-flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;cursor:pointer}
 #send:disabled{background:var(--line);color:var(--mut);cursor:default}
 
-#drawer{position:fixed;top:0;right:0;width:min(560px,92vw);height:100%;background:var(--bg);border-left:1px solid var(--line);
+#drawer{position:fixed;top:0;right:0;width:var(--drw,min(560px,92vw));height:100%;background:var(--bg);border-left:1px solid var(--line);
   transform:translateX(100%);transition:transform .2s;z-index:20;display:flex;flex-direction:column}
 #drawer.open{transform:none}
+#drresize{position:absolute;left:0;top:0;width:6px;height:100%;cursor:col-resize;background:transparent;transition:background .12s;z-index:30}
+#drresize:hover,#drresize.drag{background:var(--acc)}
 #drawer .dh{padding:8px 12px;background:var(--bg2);border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center}
 #drawer .dh .grow{flex:1}
 #drawer .dc{flex:1;overflow:auto;padding:10px}
@@ -1888,6 +1910,10 @@ pre code{background:none;border:none;padding:0}
 .efocus{font-size:11.5px;color:var(--mut);margin:0 0 9px;padding:5px 8px;background:var(--bg2);border:1px solid var(--line);border-radius:6px}
 .efocus .showall{color:var(--acc);cursor:pointer;text-decoration:underline}
 .ecard .ed{max-height:320px;overflow:auto;padding:6px 9px}
+/* single-file focus: let the one diff fill the drawer height instead of capping at 320px */
+#edits.focusone{display:flex;flex-direction:column;overflow:hidden}
+#edits.focusone .ecard{flex:1;min-height:0;display:flex;flex-direction:column;margin-bottom:0}
+#edits.focusone .ecard .ed{flex:1;min-height:0;max-height:none}
 .ecard .res{padding:0 9px}
 /* approval prompts */
 .approval{border:1px solid var(--toolln);border-radius:8px;margin:6px 0 14px;background:var(--toolbg);overflow:hidden}
@@ -1929,17 +1955,16 @@ pre code{background:none;border:none;padding:0}
 .iconbtn{background:none;border:none;color:var(--fg);font-size:17px;cursor:pointer;padding:2px 5px;line-height:1}
 .curname{font-size:13px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0;max-width:46vw}
 .ctx{display:none;align-items:center;gap:6px;font-size:12.5px;font-weight:600;color:var(--fg);white-space:nowrap;font-family:ui-monospace,monospace}
-.ctx .bar{width:54px;height:7px;border-radius:3px;background:var(--bg3);border:1px solid var(--line);overflow:hidden}
-.ctx .fill{display:block;height:100%;width:0;background:var(--add);transition:width .3s,background .3s}
-.ctx.warn .fill{background:var(--tool)}
-.ctx.hot .fill{background:var(--del)}
 .usage{display:none;align-items:center;gap:6px;font-size:12.5px;font-weight:600;color:var(--fg);white-space:nowrap;font-family:ui-monospace,monospace;
   border-left:1px solid var(--line);padding-left:11px;margin-left:4px}
 .ctx .ulabel,.usage .ulabel{opacity:.7}
-.usage .bar{width:54px;height:7px;border-radius:3px;background:var(--bg3);border:1px solid var(--line);overflow:hidden}
-.usage .fill{display:block;height:100%;width:0;background:var(--add);transition:width .3s,background .3s}
-.usage.warn .fill{background:var(--tool)}
-.usage.hot .fill{background:var(--del)}
+.usage .useg{display:inline-flex;align-items:center;gap:5px}
+.usage .useg + .useg::before{content:"|";opacity:.3;font-weight:400}   /* divider between 5h | 7d */
+/* shared segmented meter: 5 cells × 20%, whole bar coloured by the total % (Context + Usage) */
+.cells{display:inline-flex;gap:2px;align-items:center}
+.cells .cell{width:7px;height:13px;border-radius:2px;background:var(--bg3);border:1px solid var(--line);box-sizing:border-box;transition:background .25s,box-shadow .25s}
+.cells.lv-g{color:#2fbf4f}.cells.lv-y{color:#ecc020}.cells.lv-o{color:#ff8c1a}.cells.lv-r{color:#f5483b}
+.cells .cell.on{background:currentColor;border-color:currentColor;box-shadow:0 0 4px currentColor}
 @media(max-width:680px){.usage{display:none!important}}
 #shell{flex:1;display:flex;min-height:0;position:relative}
 #mainCol{flex:1;display:flex;flex-direction:column;min-width:0}
@@ -2013,7 +2038,7 @@ pre code{background:none;border:none;padding:0}
   #sidebar.open{transform:none}
   #sidebar.collapsed{display:flex}
   #sb-backdrop.show{display:block;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:35}
-  #sbresize{display:none}
+  #sbresize,#drresize{display:none}
 }
 .bubble .math.display{display:block;margin:6px 0;overflow-x:auto;overflow-y:hidden;max-width:100%}
 .katex-display{margin:.35em 0!important}
@@ -2026,7 +2051,7 @@ pre code{background:none;border:none;padding:0}
   <button class="iconbtn" id="navtoggle" title="sessions">☰</button>
   <span class="curname" id="curname">— no session —</span>
   <span class="ctx" id="ctx" title="context-window usage"></span>
-  <span class="usage" id="usage" title="5-hour usage limit"></span>
+  <span class="usage" id="usage" title="usage limits (5h / 7d)"></span>
 </header>
 
 <div id="shell">
@@ -2100,6 +2125,7 @@ pre code{background:none;border:none;padding:0}
 </div>
 
 <div id="drawer">
+  <div id="drresize"></div>
   <div class="dh"><span class="tab on" id="tabEdits">Edits <span id="editN">0</span></span><span class="tab" id="tabGit">Git diff</span><span class="grow"></span><span class="btn" id="grefresh">↻</span><span class="btn" id="dclose">✕</span></div>
   <div class="dc" id="edits"><div class="empty">no file changes yet</div></div>
   <div class="dc" id="gitc" style="display:none"><div class="empty">—</div></div>
@@ -2220,6 +2246,13 @@ function addDone(word,durMs,atSec){const s=atBottom();const d=document.createEle
   let t=word+(durMs>0?(' for '+fmtSecs(durMs)):'');
   if(atSec)t+=' · '+utcStamp(atSec);
   d.querySelector('.dw').textContent=t;
+  stream.appendChild(d);if(s)scroll();}
+/* turn-complete: if any background tasks are still running, note them right under the ✻ line */
+function addBgRunning(list){const s=atBottom();const n=list.length;const d=document.createElement('div');d.className='bgline';
+  d.innerHTML='<span class="bgk"></span><span class="bgt"></span>';
+  d.querySelector('.bgk').textContent='⊙ '+n+' background task'+(n>1?'s':'')+' running';
+  const labels=list.filter(Boolean);
+  d.querySelector('.bgt').textContent=labels.length?(' · '+labels.join(' · ')):'';
   stream.appendChild(d);if(s)scroll();}
 function addErr(t){const d=document.createElement('div');d.className='errline';d.textContent=t;stream.appendChild(d);if(atBottom())scroll();}
 function addTool(ev){const s=atBottom();const c=document.createElement('div');c.className='tool';
@@ -2416,7 +2449,7 @@ function route(ev){
   else if(ev.kind==='turn_start'){tokShow=false;setBusy(true,ev.word,0);}
   else if(ev.kind==='compacting'){compacting=true;setBusy(true,ev.word,0);}
   else if(ev.kind==='compacted'){compacting=false;addNotice(fmtCompacted(ev));if(ev.trigger!=='auto')setBusy(false);}
-  else if(ev.kind==='turn_done'){compacting=false;setBusy(false);if(ev.done_word)addDone(ev.done_word,ev.dur_ms||0,ev.done_at);if(drawerOpen()&&gitTab())refreshGit();}
+  else if(ev.kind==='turn_done'){compacting=false;setBusy(false);if(ev.done_word)addDone(ev.done_word,ev.dur_ms||0,ev.done_at);if(ev.bg_running&&ev.bg_running.length)addBgRunning(ev.bg_running);if(drawerOpen()&&gitTab())refreshGit();}
   else if(ev.kind==='queued')addQueued(ev);
   else if(ev.kind==='dequeued'||ev.kind==='unqueued')removeQueued(ev.qid);
   else if(ev.kind==='notice')addNotice(ev.text);
@@ -2468,29 +2501,34 @@ function fmtTok(n){if(n==null)return '?';
   if(n>=1e6)return (n/1e6).toFixed(1).replace(/\.0$/,'')+'M';
   if(n>=1000)return (n/1000).toFixed(n>=1e4?0:1)+'k';
   return ''+n;}
+/* shared segmented meter: 5 cells (20% each), whole bar coloured by the total % */
+function meterLvl(p){return p>80?'r':p>=60?'o':p>=40?'y':'g';}
+function cellBar(pct){const p=Math.max(0,Math.min(100,pct)),lit=Math.min(5,Math.ceil(p/20));
+  let s='<span class="cells lv-'+meterLvl(p)+'">';
+  for(let i=1;i<=5;i++)s+='<span class="cell'+(i<=lit?' on':'')+'"></span>';
+  return s+'</span>';}
 function renderCtx(c){const el=$('#ctx');
   if(!c||c.percentage==null){el.style.display='none';return;}
   const pct=Math.round(c.percentage);
-  el.className='ctx'+(pct>=85?' hot':(pct>=65?' warn':''));
-  el.style.display='inline-flex';
-  el.innerHTML='<span class="ulabel">Context</span><span class="bar"><span class="fill" style="width:'+Math.min(100,pct)+'%"></span></span>'+
-    '<span>'+pct+'%</span>';
+  el.className='ctx';el.style.display='inline-flex';
+  el.innerHTML='<span class="ulabel">Context</span>'+cellBar(pct)+'<span>'+pct+'%</span>';
   el.title='context '+(c.totalTokens||'?')+' / '+(c.maxTokens||'?')+' tokens ('+pct+'%)'+(c.model?' · '+c.model:'');
   setResolvedModel(c.model, c.maxTokens);}
 /* rolling 5-hour usage limit (Claude-Code-CLI style: Usage ░░░ 2% (4h 38m / 5h)) */
 function fmtDur(ms){if(ms==null||ms<=0)return '0m';const m=Math.floor(ms/60000),h=Math.floor(m/60);
   return h>0?(h+'h '+(m%60)+'m'):(m+'m');}
-function renderUsage(u){const el=$('#usage');const f=u&&u.five_hour;
-  if(!f||f.utilization==null){el.style.display='none';return;}
-  const pct=Math.round(f.utilization);
-  const rem=f.resets_at?fmtDur(new Date(f.resets_at)-Date.now()):'';
-  el.className='usage'+(pct>=85?' hot':(pct>=60?' warn':''));
-  el.style.display='inline-flex';
-  el.innerHTML='<span class="ulabel">Usage</span><span class="bar"><span class="fill" style="width:'+Math.min(100,pct)+'%"></span></span>'+
-    '<span>'+pct+'%'+(rem?(' ('+rem+' / 5h)'):'')+'</span>';
-  let t='5-hour limit: '+pct+'% used'+(rem?(' · resets in '+rem):'');
-  const w7=[['seven_day','7-day'],['seven_day_sonnet','7-day Sonnet'],['seven_day_opus','7-day Opus']];
-  w7.forEach(([k,lbl])=>{if(u[k]&&u[k].utilization!=null)t+='\n'+lbl+': '+Math.round(u[k].utilization)+'%';});
+function renderUsage(u){const el=$('#usage');const f=u&&u.five_hour,w=u&&u.seven_day;
+  if((!f||f.utilization==null)&&(!w||w.utilization==null)){el.style.display='none';return;}
+  function seg(o,lbl){if(!o||o.utilization==null)return '';
+    const pct=Math.round(o.utilization);
+    return '<span class="useg"><span class="ulabel">'+lbl+'</span>'+cellBar(pct)+'<span>'+pct+'%</span></span>';}
+  el.className='usage';el.style.display='inline-flex';
+  el.innerHTML='<span class="ulabel">Usage</span>'+seg(f,'5h')+seg(w,'7d');
+  let t='';
+  const all=[['five_hour','5-hour'],['seven_day','7-day'],['seven_day_sonnet','7-day Sonnet'],['seven_day_opus','7-day Opus']];
+  all.forEach(([k,lbl])=>{const o=u&&u[k];if(o&&o.utilization!=null){
+    const rem=o.resets_at?fmtDur(new Date(o.resets_at)-Date.now()):'';
+    t+=(t?'\n':'')+lbl+': '+Math.round(o.utilization)+'% used'+(rem?(' · resets in '+rem):'');}});
   el.title=t;}
 function loadUsage(){fetch('api/usage').then(r=>r.json()).then(j=>renderUsage(j.usage)).catch(()=>{});}
 /* thinking effort: a clickable pill on the right of the status row. --effort is
@@ -2778,10 +2816,12 @@ function showTab(w){const e=w==='edits';$('#tabEdits').classList.toggle('on',e);
 /* clicking "see Changes" focuses the drawer on just that one file's edit;
    the Edits tab header (or "show all") brings the full list back */
 function showAllEdits(){const ed=$('#edits');const fb=ed.querySelector('.efocus');if(fb)fb.remove();
+  ed.classList.remove('focusone');
   ed.querySelectorAll('.ecard').forEach(c=>c.style.display='');}
 function focusEdit(toolId){const ed=$('#edits'),target=toolId&&tools[toolId];
   if(!target){showAllEdits();return;}
   ed.querySelectorAll('.ecard').forEach(c=>{c.style.display=(c===target)?'':'none';});
+  ed.classList.add('focusone');
   let fb=ed.querySelector('.efocus');
   if(!fb){fb=document.createElement('div');fb.className='efocus';ed.insertBefore(fb,ed.firstChild);}
   fb.innerHTML='showing one file · <span class="showall">show all changes</span>';
@@ -2831,6 +2871,20 @@ function setSidebarW(w,save){w=Math.max(SBW_MIN,Math.min(SBW_MAX,Math.round(w)))
   window.addEventListener('mouseup',()=>{if(!on)return;on=false;h.classList.remove('drag');document.body.style.userSelect='';
     setSidebarW($('#sidebar').getBoundingClientRect().width,true);});
   h.addEventListener('dblclick',()=>setSidebarW(270,true));   /* double-click: reset to default */
+})();
+/* desktop: drag the Changes drawer's left edge to resize (clamped + persisted) */
+const DRW_KEY='al_drw',DRW_MIN=360,DRW_MAX=1100;
+function setDrawerW(w,save){const cap=Math.round(window.innerWidth*0.96);
+  w=Math.max(DRW_MIN,Math.min(Math.min(DRW_MAX,cap),Math.round(w)));
+  document.documentElement.style.setProperty('--drw',w+'px');
+  if(save)localStorage.setItem(DRW_KEY,w);}
+(function(){const saved=parseInt(localStorage.getItem(DRW_KEY)||'',10);if(saved)setDrawerW(saved,false);
+  const h=$('#drresize');if(!h)return;let on=false;
+  h.addEventListener('mousedown',e=>{on=true;h.classList.add('drag');document.body.style.userSelect='none';e.preventDefault();});
+  window.addEventListener('mousemove',e=>{if(!on)return;setDrawerW(window.innerWidth-e.clientX,false);});
+  window.addEventListener('mouseup',()=>{if(!on)return;on=false;h.classList.remove('drag');document.body.style.userSelect='';
+    setDrawerW($('#drawer').getBoundingClientRect().width,true);});
+  h.addEventListener('dblclick',()=>setDrawerW(560,true));   /* double-click: reset to default */
 })();
 $('#resumeRef').onclick=e=>{e.stopPropagation();loadPast();};
 /* collapsible sections: clicking the header toggles; restore saved state */
