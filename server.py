@@ -359,8 +359,9 @@ def list_sessions(limit=50):
 
 
 def list_projects():
-    """Real project dirs for the console picker: recent session cwds (filtered)
-    plus git repos under ~/Git. Excludes /tmp and runtime/cache dirs."""
+    """Real project dirs for the console picker: recent session cwds (filtered).
+    Excludes /tmp and runtime/cache dirs. Any other path can be typed in the
+    picker's custom-path box."""
     junk = [os.path.realpath(p) for p in (
         "/tmp", os.path.join(HOME, ".cache"), os.path.join(HOME, ".claude-mem"),
         os.path.join(HOME, ".claude"), os.path.join(HOME, ".codex"),
@@ -377,10 +378,6 @@ def list_projects():
             seen.add(cwd)
             out.append({"path": cwd, "recent": True,
                         "git": os.path.isdir(os.path.join(cwd, ".git"))})
-    for d in sorted(glob.glob(os.path.join(HOME, "Git", "*"))):
-        if d not in seen and os.path.isdir(os.path.join(d, ".git")):
-            seen.add(d)
-            out.append({"path": d, "recent": False, "git": True})
     return out
 
 
@@ -2061,7 +2058,7 @@ pre code{background:none;border:none;padding:0}
       <select id="project" title="working directory for a new session"></select>
       <div class="cwdwrap" id="cwdwrap"><input id="cwd" placeholder="type a path…  ↑↓ to pick" autocomplete="off"><div id="cwdac"></div></div>
       <div class="sb-row2">
-        <select id="model" title="model"><option value="default">model: default</option><option>opus</option><option>sonnet</option><option>haiku</option></select>
+        <select id="model" title="model"><option value="opus">model: opus</option><option>sonnet</option><option>haiku</option></select>
         <select id="mode" title="permission mode"><option value="acceptEdits">⚡ Auto-accept</option><option value="default">🔐 Approve</option><option value="plan">📋 Plan</option><option value="bypassPermissions">⏩ Full auto</option></select>
       </div>
       <button class="newbtn" id="newbtn">＋ New session</button>
@@ -2584,7 +2581,7 @@ function openConfigure(s,anchor){const m=$('#cardMenu');m.innerHTML='';m._anchor
     o.onchange=()=>fn(o.value);return o;};
   const row=(label,sel)=>{const w=document.createElement('div');w.className='cfgrow';
     const l=document.createElement('span');l.textContent=label;w.appendChild(l);w.appendChild(sel);m.appendChild(w);};
-  row('Model',mkSel([['default','default'],['opus','opus'],['sonnet','sonnet'],['haiku','haiku']],s.model||'default',
+  row('Model',mkSel([['opus','opus'],['sonnet','sonnet'],['haiku','haiku']],s.model||'opus',
     v=>{wsSend({type:'configure',id:s.id,model:v});setTimeout(reqList,200);}));
   row('Permission',mkSel([['acceptEdits','⚡ Auto-accept'],['default','🔐 Approve'],['plan','📋 Plan'],['bypassPermissions','⏩ Full auto']],s.mode||'default',
     v=>{wsSend({type:'configure',id:s.id,mode:v});setTimeout(reqList,200);}));
@@ -2901,7 +2898,8 @@ window.addEventListener('scroll',closeCardMenu,true);
    new-session default no longer disturbs the current session. */
 $('#model').onchange=()=>localStorage.setItem('al_model',$('#model').value);
 $('#mode').onchange=()=>localStorage.setItem('al_mode',$('#mode').value);
-{const sm=localStorage.getItem('al_model');if(sm){const o=$('#model');for(const x of o.options)if(x.value===sm){o.value=sm;break;}}
+{let sm=localStorage.getItem('al_model');if(sm==='default'){localStorage.removeItem('al_model');sm=null;}   /* legacy 'default' → use the new opus default */
+ if(sm){const o=$('#model');for(const x of o.options)if(x.value===sm){o.value=sm;break;}}
  const smd=localStorage.getItem('al_mode');if(smd){const o=$('#mode');for(const x of o.options)if(x.value===smd){o.value=smd;break;}}}
 $('#tabEdits').onclick=()=>showTab('edits');
 $('#tabGit').onclick=()=>showTab('git');
@@ -2927,16 +2925,15 @@ $('#cwd').addEventListener('keydown',e=>{const b=$('#cwdac');if(!b.classList.con
   else if(e.key==='Enter'&&acSel>=0){e.preventDefault();acPick(acSel);}
   else if(e.key==='Escape')acClose();});
 
-/* project picker: real projects (recent dirs + git repos under ~/Git) */
+/* project picker: recent project dirs (+ Custom path…) */
 (async function(){try{const r=await fetch('api/projects');const j=await r.json();HOMEDIR=j.home||'';const sel=$('#project');
-  /* Custom path… first (easy to reach); recent vs git-repos as labelled groups
-     instead of a ★ marker (★ now means "favorite" in the session lists) */
+  /* Custom path… first (easy to reach); recent dirs as a labelled group */
   const cust=document.createElement('option');cust.value='__custom__';cust.textContent='✎  Custom path…';sel.appendChild(cust);
   const mk=(label,items)=>{if(!items.length)return;const g=document.createElement('optgroup');g.label=label;
     items.forEach(p=>{const o=document.createElement('option');o.value=p.path;o.textContent=p.path.split('/').slice(-2).join('/');o.title=p.path;g.appendChild(o);});sel.appendChild(g);};
-  const recent=(j.projects||[]).filter(p=>p.recent), repos=(j.projects||[]).filter(p=>!p.recent);
-  mk('Recent',recent); mk('Git repos (~/Git)',repos);
-  const first=recent[0]||repos[0];
+  const recent=(j.projects||[]);
+  mk('Recent',recent);
+  const first=recent[0];
   sel.value=first?first.path:'__custom__';
   $('#cwdwrap').classList.toggle('show',sel.value==='__custom__');
   loadPast();
