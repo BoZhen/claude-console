@@ -10,6 +10,8 @@ Env (legacy AGENTLENS_* names still accepted as a fallback):
   CLAUDE_CONSOLE_PORT   listen port (default 7703)
   CLAUDE_CONSOLE_BIND   bind address (default 127.0.0.1; set 0.0.0.0 for LAN)
   CLAUDE_CONSOLE_AUTH   optional HTTP Basic Auth "user:pass" (default disabled)
+  CLAUDE_CONSOLE_WEBFM_URL  web-file-manager base URL — makes file paths in chat
+                        clickable (opens the file there). Default: this host on :7701
 """
 
 import asyncio
@@ -48,6 +50,9 @@ def _env(name, default=""):
 
 PORT = int(_env("PORT", "7703"))
 AUTH = _env("AUTH", "")
+# Base URL of a web-file-manager so file paths in chat become links that open the
+# file there (new tab). Empty → the frontend falls back to this host on :7701.
+WEBFM_URL = _env("WEBFM_URL", "").rstrip("/")
 # Default to loopback: this serves ALL your agent transcripts + home-wide git
 # diffs, so it must not land on the network by accident. Set CLAUDE_CONSOLE_BIND=
 # 0.0.0.0 (ideally with CLAUDE_CONSOLE_AUTH) to reach it from another device.
@@ -589,6 +594,38 @@ def fetch_usage():
         return _usage_cache["v"]
 
 
+_models_cache = {"t": 0.0, "v": None}
+
+def fetch_models():
+    """Live model list from the API's /v1/models (id + display name), so the
+    picker self-updates when Anthropic ships/retires models (e.g. fable).
+    Same OAuth token as fetch_usage; cached ~1h. Blocking (run off the IO loop).
+    Returns [{id, name}], the last good value on a transient error, or None."""
+    now = time.monotonic()
+    if _models_cache["v"] is not None and now - _models_cache["t"] < 3600:
+        return _models_cache["v"]
+    try:
+        with open(os.path.join(HOME, ".claude", ".credentials.json"), encoding="utf-8") as f:
+            tok = (json.load(f).get("claudeAiOauth") or {}).get("accessToken")
+        if not tok:
+            return None
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/models?limit=100",
+            headers={"Authorization": "Bearer " + tok,
+                     "anthropic-version": "2023-06-01",
+                     "anthropic-beta": "oauth-2025-04-20",
+                     "User-Agent": "claude-console"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.load(r)
+        out = [{"id": m["id"], "name": m.get("display_name") or m["id"]}
+               for m in (data.get("data") or []) if isinstance(m, dict) and m.get("id")]
+        if out:
+            _models_cache["t"], _models_cache["v"] = now, out
+        return _models_cache["v"]
+    except Exception:
+        return _models_cache["v"]
+
+
 def load_transcript_events(cc, cap=1000):
     """Parse a saved transcript into console events, for preload on --resume."""
     path = find_transcript(cc)
@@ -821,6 +858,16 @@ class UsageHandler(AuthMixin, tornado.web.RequestHandler):
         loop = tornado.ioloop.IOLoop.current()
         u = await loop.run_in_executor(None, fetch_usage)   # blocking HTTP off-loop
         self.write(json.dumps({"usage": u}))
+
+
+class ModelsHandler(AuthMixin, tornado.web.RequestHandler):
+    async def get(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "application/json")
+        loop = tornado.ioloop.IOLoop.current()
+        m = await loop.run_in_executor(None, fetch_models)   # blocking HTTP off-loop
+        self.write(json.dumps({"models": m or []}))
 
 
 CHAT_SESSIONS = {}  # id -> ChatSession (live, independent of any browser connection)
@@ -1696,7 +1743,7 @@ class ConsoleHandler(AuthMixin, tornado.web.RequestHandler):
         if not self._ok_auth():
             return
         self.set_header("Cache-Control", "no-store")
-        self.write(CONSOLE_HTML)
+        self.write(CONSOLE_HTML.replace("__CLAUDE_CONSOLE_WEBFM_URL__", json.dumps(WEBFM_URL)))
 
 
 CONSOLE_HTML = r"""<!DOCTYPE html>
@@ -1845,6 +1892,8 @@ pre{background:var(--codebg);border:1px solid var(--line);border-radius:6px;padd
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;line-height:1.45}
 code{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;background:var(--codebg);border:1px solid var(--line);border-radius:3px;padding:0 4px}
 pre code{background:none;border:none;padding:0}
+.bubble a{color:var(--acc);text-decoration:underline;text-underline-offset:2px}
+.bubble a.filelink{text-decoration-style:dotted}
 .bubble h1,.bubble h2,.bubble h3{font-size:14px;margin:8px 0 4px}
 .bubble table{border-collapse:collapse;margin:7px 0;font-size:12px;display:block;overflow-x:auto;max-width:100%}
 .bubble th,.bubble td{border:1px solid var(--line);padding:3px 9px;text-align:left}
@@ -2143,6 +2192,34 @@ const EDIT_TOOLS=new Set(['Edit','MultiEdit','Write','NotebookEdit']);
 const SKEY='al_session';
 
 function esc(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+/* clickable file paths → open in a web-file-manager (new tab). Base from the
+   server-injected config, else this host on :7701 (the file manager's default). */
+const WEBFM_CONFIG_URL = __CLAUDE_CONSOLE_WEBFM_URL__;
+function escAttr(s){return esc(s).replace(/"/g,'&quot;');}
+function unescHtml(s){return (s||'').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&');}
+function webfmBase(){const cfg=(WEBFM_CONFIG_URL||'').replace(/\/+$/,'');
+  return cfg || (location.protocol+'//'+location.hostname+':7701');}
+function webfmOpenUrl(path){return webfmBase()+'/?open='+encodeURIComponent(path);}
+function cleanLinkTarget(raw){let t=unescHtml((raw||'').trim());
+  if(t[0]==='<'&&t[t.length-1]==='>')t=t.slice(1,-1).trim();
+  try{t=decodeURI(t);}catch(e){}
+  return t;}
+function isLocalTarget(t){return t==='~'||t.startsWith('~/')||t.startsWith('/')||t.startsWith('file://');}
+function stripLineRef(t){return t.replace(/:(\d+)(?::\d+)?$/,'');}
+function protectMarkdownLinks(h,links){
+  return h.replace(/\[([^\]\n]+)\]\((?:&lt;([^\n]*?)&gt;|([^)\s]+))\)/g,(m,label,angle,bare)=>{
+    const target=cleanLinkTarget(angle!=null?angle:bare);
+    let href='';
+    if(/^https?:\/\//i.test(target))href=target;
+    else if(isLocalTarget(target))href=webfmOpenUrl(stripLineRef(target));
+    else return m;
+    links.push('<a href="'+escAttr(href)+'" target="_blank" rel="noopener">'+label+'</a>');
+    return '%%LK'+(links.length-1)+'%%';
+  });}
+function linkLocalPaths(h){
+  const exts='pdf|png|jpe?g|gif|webp|svg|avif|heic|txt|md|markdown|rst|log|py|pyi|ipynb|js|mjs|ts|tsx|jsx|css|json|ya?ml|toml|ini|cfg|conf|xml|csv|tsv|sh|bash|zsh|fish|c|h|cpp|cc|hpp|rs|go|java|kt|rb|php|pl|lua|sql|tex|bib|m|jl|r|swift|html?';
+  const re=new RegExp('(^|[\\s(>])((?:~|/)[^\\n<]*?\\.('+exts+'))(?=$|[\\s.,;:!?)}\\]]|<br>)','gi');
+  return h.replace(re,(m,pre,path)=>pre+'<a href="'+escAttr(webfmOpenUrl(unescHtml(path)))+'" target="_blank" rel="noopener" class="filelink">'+path+'</a>');}
 function mdTable(h){
   if(h.indexOf('|')<0)return h;
   const L=h.split('\n'),out=[];let i=0;
@@ -2172,9 +2249,12 @@ function md(src){
   let h=esc(src);
   h=mdTable(h);
   h=h.replace(/`([^`\n]+)`/g,(m,c)=>'<code>'+c+'</code>');
+  const ll=[];
+  h=protectMarkdownLinks(h,ll);   /* [label](http|local path) → placeholder; local paths open in web-file-manager */
+  h=linkLocalPaths(h);            /* bare ~/… or /… file paths → web-file-manager links */
   h=h.replace(/\*\*([^*\n]+)\*\*/g,'<b>$1</b>');
   h=h.replace(/^### (.*)$/gm,'<h3>$1</h3>').replace(/^## (.*)$/gm,'<h2>$1</h2>').replace(/^# (.*)$/gm,'<h2>$1</h2>');
-  h=h.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,'<a href="$2" target="_blank">$1</a>');
+  h=h.replace(/%%LK(\d+)%%/g,(m,i)=>ll[+i]);   /* restore protected links */
   h=h.replace(/^(\d+)\. (.*)$/gm,'<oli>$2</oli>').replace(/^[\-\*] (.*)$/gm,'<uli>$1</uli>');
   h=h.replace(/(<uli>.*?<\/uli>(?:\n<uli>.*?<\/uli>)*)/g,m=>'<ul>'+m.replace(/\n/g,'').replace(/uli>/g,'li>')+'</ul>');
   h=h.replace(/(<oli>.*?<\/oli>(?:\n<oli>.*?<\/oli>)*)/g,m=>'<ol>'+m.replace(/\n/g,'').replace(/oli>/g,'li>')+'</ol>');
@@ -2528,6 +2608,23 @@ function renderUsage(u){const el=$('#usage');const f=u&&u.five_hour,w=u&&u.seven
     t+=(t?'\n':'')+lbl+': '+Math.round(o.utilization)+'% used'+(rem?(' · resets in '+rem):'');}});
   el.title=t;}
 function loadUsage(){fetch('api/usage').then(r=>r.json()).then(j=>renderUsage(j.usage)).catch(()=>{});}
+/* dynamic model list from the live /v1/models API: aliases (track the latest of
+   each family) stay on top; the full list — incl. temporary models like fable —
+   loads into an "all models" group. Static opus/sonnet/haiku = offline fallback. */
+const MODEL_ALIASES=[['opus','model: opus'],['sonnet','sonnet'],['haiku','haiku']];
+let MODELS=[];   /* [{id,name}] mirror of the API list */
+function rebuildModelPicker(){
+  if(!MODELS.length)return;
+  const sel=$('#model');const want=localStorage.getItem('al_model')||sel.value;
+  sel.innerHTML='';
+  MODEL_ALIASES.forEach(([v,t])=>{const o=document.createElement('option');o.value=v;o.textContent=t;sel.appendChild(o);});
+  const g=document.createElement('optgroup');g.label='all models';
+  MODELS.forEach(m=>{const o=document.createElement('option');o.value=m.id;o.textContent=m.name;o.title=m.id;g.appendChild(o);});
+  sel.appendChild(g);
+  for(const o of sel.options)if(o.value===want){sel.value=want;break;}   /* keep the saved/current pick */
+}
+function loadModels(){fetch('api/models').then(r=>r.json()).then(j=>{
+  if(j.models&&j.models.length){MODELS=j.models;rebuildModelPicker();}}).catch(()=>{});}
 /* thinking effort: a clickable pill on the right of the status row. --effort is
    launch-time only, so changing it on a live session relaunches it (server-side
    resume with the new --effort); the choice is remembered for new sessions. */
@@ -2543,7 +2640,7 @@ let _rmodel='', _rmax=0;
 function modelLabel(real,maxTok){
   if(!real)return '';
   const s=(''+real).toLowerCase();
-  const fam=s.includes('opus')?'opus':s.includes('sonnet')?'sonnet':s.includes('haiku')?'haiku':'';
+  const fam=s.includes('opus')?'opus':s.includes('sonnet')?'sonnet':s.includes('haiku')?'haiku':s.includes('fable')?'fable':'';
   if(!fam)return ''+real;
   const m=s.match(new RegExp(fam+'-(\\d+)-(\\d+)'))||s.match(new RegExp('(\\d+)-(\\d+)-'+fam));
   let lbl=fam+(m?(' '+m[1]+'.'+m[2]):'');
@@ -2581,7 +2678,7 @@ function openConfigure(s,anchor){const m=$('#cardMenu');m.innerHTML='';m._anchor
     o.onchange=()=>fn(o.value);return o;};
   const row=(label,sel)=>{const w=document.createElement('div');w.className='cfgrow';
     const l=document.createElement('span');l.textContent=label;w.appendChild(l);w.appendChild(sel);m.appendChild(w);};
-  row('Model',mkSel([['opus','opus'],['sonnet','sonnet'],['haiku','haiku']],s.model||'opus',
+  row('Model',mkSel([['opus','opus'],['sonnet','sonnet'],['haiku','haiku'],...MODELS.map(m=>[m.id,m.name])],s.model||'opus',
     v=>{wsSend({type:'configure',id:s.id,model:v});setTimeout(reqList,200);}));
   row('Permission',mkSel([['acceptEdits','⚡ Auto-accept'],['default','🔐 Approve'],['plan','📋 Plan'],['bypassPermissions','⏩ Full auto']],s.mode||'default',
     v=>{wsSend({type:'configure',id:s.id,mode:v});setTimeout(reqList,200);}));
@@ -2944,6 +3041,7 @@ setInterval(loadPast,30000);
 loadPast();
 loadUsage();
 setInterval(loadUsage,60000);
+loadModels();
 openWs();
 </script>
 </body>
@@ -2973,6 +3071,7 @@ def main():
         (r"/api/dircomplete", DirCompleteHandler),
         (r"/api/diff", DiffHandler),
         (r"/api/usage", UsageHandler),
+        (r"/api/models", ModelsHandler),
         (r"/ws/chat", ChatSocket),
         (r"/static/(.*)", tornado.web.StaticFileHandler,
          {"path": os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")}),
