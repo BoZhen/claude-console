@@ -57,6 +57,10 @@ WEBFM_URL = _env("WEBFM_URL", "").rstrip("/")
 # diffs, so it must not land on the network by accident. Set CLAUDE_CONSOLE_BIND=
 # 0.0.0.0 (ideally with CLAUDE_CONSOLE_AUTH) to reach it from another device.
 BIND = _env("BIND", "127.0.0.1")
+# The SDK aborts the whole stream if one CLI stdout NDJSON line exceeds this
+# (SDK default 1 MB) — a large tool result / diff / image message can. Raise it
+# generously so a big message doesn't kill the session. Override via env.
+MAX_BUFFER = int(_env("MAX_BUFFER_MB", "64") or "64") * 1024 * 1024
 HOME = os.path.expanduser("~")
 CLAUDE_ROOT = os.path.join(HOME, ".claude", "projects")
 CODEX_ROOT = os.path.join(HOME, ".codex", "sessions")
@@ -302,6 +306,8 @@ def _peek_claude(path):
                     msg = (rec.get("message") or {}).get("content")
                     s = msg if isinstance(msg, str) else _txt(msg)
                     s = (s or "").strip()
+                    if s.startswith("Transcript so far:") and s.endswith("Recap:"):
+                        return "__recap__", "", ""   # claude-console recap-query artifact → hide it
                     if s and not s.startswith("<") and "tool_result" not in s[:40]:
                         title = s.replace("\n", " ")[:100]
                 if cwd and title:
@@ -355,6 +361,8 @@ def list_sessions(limit=50):
         except OSError:
             continue
         cwd, branch, title = (_peek_claude if source == "claude" else _peek_codex)(path)
+        if cwd == "__recap__":   # recap-query artifact, not a real session
+            continue
         items.append({
             "id": path, "source": source, "cwd": cwd, "branch": branch,
             "title": title or os.path.basename(path),
@@ -883,9 +891,14 @@ def safe_cwd(cwd):
 def _sanitize_mode(m):
     return m if m in ("acceptEdits", "plan", "default", "bypassPermissions") else "acceptEdits"
 
-EFFORTS = ("low", "medium", "high", "xhigh", "max")
+EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultracode")
 def _sanitize_effort(e):
     return e if e in EFFORTS else "max"   # default: deepest thinking
+# "ultracode" = xhigh thinking + standing multi-agent Workflow orchestration. The
+# CLI's session toggle is interactive-only (--effort rejects it; /effort is
+# unavailable headless), so we emulate it: launch with --effort xhigh and append
+# the "ultracode" keyword trigger to every outgoing user message (each turn
+# opts in → standing). Requires the plan's workflow keyword trigger (default-on).
 
 
 class ChatSession:
@@ -956,11 +969,13 @@ class ChatSession:
         opts = ClaudeAgentOptions(
             cwd=self.cwd, permission_mode=self.mode, can_use_tool=self._can_use_tool,
             add_dirs=[self.cwd], cli_path=CLAUDE_BIN, include_partial_messages=True,
+            max_buffer_size=MAX_BUFFER,
             extra_args={"dangerously-skip-permissions": None})
         if self.model and self.model != "default":
             opts.model = self.model
         if self.effort:
-            opts.effort = self.effort       # SDK passes through as --effort
+            # --effort only accepts low..max; ultracode launches at its xhigh base
+            opts.effort = "xhigh" if self.effort == "ultracode" else self.effort
         if self.resume_cc:
             opts.resume = self.resume_cc
         self.client = ClaudeSDKClient(options=opts)
@@ -1141,10 +1156,15 @@ class ChatSession:
         self.recap_busy = True
         text = None
         try:
+            # isolate the recap query's transcript into a junk dir so it never
+            # lands in (and pollutes) a real project's session list. cwd is
+            # cosmetic here: no tools, no settings — pure text summarization.
+            recap_cwd = os.path.join(HOME, ".cache", "claude-console-recap")
+            os.makedirs(recap_cwd, exist_ok=True)
             opts = ClaudeAgentOptions(
-                model=RECAP_MODEL, cwd=self.cwd, cli_path=CLAUDE_BIN,
+                model=RECAP_MODEL, cwd=recap_cwd, cli_path=CLAUDE_BIN,
                 system_prompt=RECAP_SYS, allowed_tools=[], max_turns=1,
-                setting_sources=[])
+                max_buffer_size=MAX_BUFFER, setting_sources=[])
             chunks = []
             async def _run():
                 async for m in query(
@@ -1362,7 +1382,14 @@ class ChatSession:
         if start and self.compacting:   # surface the otherwise-silent long compaction
             self._push([{"kind": "compacting", "word": self.turn_word}])
         client = self.client
-        payload = self._make_payload(text, images)
+        send_text = text
+        if (self.effort == "ultracode" and text.strip()
+                and not text.lstrip().startswith("/")
+                and "ultracode" not in text.lower()):
+            # ultracode mode: opt every turn into Workflow orchestration via the
+            # keyword trigger (viewers still see the clean original text above)
+            send_text = text.rstrip() + "\n\nultracode"
+        payload = self._make_payload(send_text, images)
         async def _q():
             try:
                 await client.query(payload)
@@ -2184,7 +2211,7 @@ const stream=$('#stream'), ta=$('#ta'), sendBtn=$('#send');
 let ws=null, running=false, ready=false, compacting=false, cwd='', tools={};
 let tokUp=0,tokOut=0,tokShow=false;   /* live streaming token counts shown in the pill */
 let sid=null, curCC=null, editCount=0, pendingStart=false, reconnectT=0;
-const EFFORTS=['low','medium','high','xhigh','max'];
+const EFFORTS=['low','medium','high','xhigh','max','ultracode'];
 let curEffort=localStorage.getItem('al_effort')||'max';
 let showThink=false;
 let liveCCs=new Set(), recentData=[], folderData=[], favData=[], HOMEDIR='';
@@ -2851,7 +2878,12 @@ function addImageFile(file){
   const r=new FileReader();
   r.onload=()=>{const url=''+r.result;pendingImages.push({media_type:file.type,data:url.split(',')[1]||'',url:url});renderAttach();};
   r.readAsDataURL(file);}
-function handlePaste(e){const items=(e.clipboardData||{}).items||[];let got=false;
+function handlePaste(e){const cd=e.clipboardData;if(!cd)return;
+  /* Word / rich-text copies put BOTH the text AND a rendered image on the clipboard.
+     If there's any plain text, let the textarea paste it normally (don't grab the
+     image); only treat the paste as an image when it's image-only — a real screenshot. */
+  if((cd.getData('text/plain')||'').length>0)return;
+  const items=cd.items||[];let got=false;
   for(const it of items){if(it.kind==='file'&&it.type.indexOf('image/')===0){const f=it.getAsFile();if(f){addImageFile(f);got=true;}}}
   if(got)e.preventDefault();}
 /* per-session composer drafts — each session keeps its own unsent text (+ images),
@@ -3048,6 +3080,26 @@ openWs();
 </html>"""
 
 
+RECAP_KEEP_H = 24   # prune isolated recap-query transcripts older than this (hours)
+
+def _cleanup_recap_artifacts():
+    """Prune the isolated recap-query transcripts (the away-summary feature writes
+    one per call into ~/.cache/claude-console-recap; the recap text already lives in
+    the real session's log, so the file is pure junk). Hard-removes ONLY files in
+    our own cache dir — never touches real project transcripts."""
+    try:
+        cutoff = time.time() - RECAP_KEEP_H * 3600
+        for d in glob.glob(os.path.join(CLAUDE_ROOT, "*claude-console-recap*")):
+            for p in glob.glob(os.path.join(d, "*.jsonl")):
+                try:
+                    if os.path.getmtime(p) < cutoff:
+                        os.remove(p)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
 def _recap_tick():
     """Periodic sweep: any session idle past the threshold gets a one-line recap,
     so it's already waiting (in the log) when you return — and fires for a session
@@ -3080,6 +3132,8 @@ def main():
     app.listen(PORT, address=BIND)
     if RECAP_ENABLED:   # idle-session recap sweep (every 30s)
         tornado.ioloop.PeriodicCallback(_recap_tick, 30000).start()
+        _cleanup_recap_artifacts()   # prune stale recap transcripts now…
+        tornado.ioloop.PeriodicCallback(_cleanup_recap_artifacts, 6 * 3600 * 1000).start()   # …and every 6h
     print("Claude Console on http://%s:%d" % (BIND, PORT))
     print("  console: http://%s:%d/" % (BIND, PORT))
     print("  claude bin: %s" % CLAUDE_BIN)
