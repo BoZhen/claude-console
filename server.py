@@ -23,7 +23,9 @@ import re
 import secrets
 import shutil
 import signal
+import sqlite3
 import subprocess
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -61,6 +63,8 @@ BIND = _env("BIND", "127.0.0.1")
 # (SDK default 1 MB) — a large tool result / diff / image message can. Raise it
 # generously so a big message doesn't kill the session. Override via env.
 MAX_BUFFER = int(_env("MAX_BUFFER_MB", "64") or "64") * 1024 * 1024
+# upload ceiling for /api/import; tornado's 100 MB default rejects big transcripts
+IMPORT_MAX = int(_env("IMPORT_MAX_MB", "1024") or "1024") * 1024 * 1024
 HOME = os.path.expanduser("~")
 CLAUDE_ROOT = os.path.join(HOME, ".claude", "projects")
 CODEX_ROOT = os.path.join(HOME, ".codex", "sessions")
@@ -418,6 +422,33 @@ def find_transcript(cc):
     return hits[0] if hits else None
 
 
+def proj_folder(cwd):
+    """The ~/.claude/projects/<folder> name the CLI derives from a working dir:
+    every non-alphanumeric char becomes '-'. (Verified against 26 real transcripts,
+    0 mismatches.) This matters for import: `claude --resume <id>` searches ONLY the
+    folder matching the cwd it is launched from, so a transcript has to land here to
+    be found. The cwd recorded *inside* the file is not used for lookup, which is why
+    a transcript moves between machines and paths untouched."""
+    return re.sub(r"[^A-Za-z0-9]", "-", os.path.abspath(cwd))
+
+
+def transcript_session_id(body):
+    """The session id a transcript claims for itself, read from the first line that
+    carries one. Preferred over the uploaded filename (which a user may have renamed)
+    — the file is written back as '<sessionId>.jsonl' so name and content agree."""
+    for line in body[: 1 << 20].decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(d, dict) and d.get("sessionId"):
+            return str(d["sessionId"])
+    return ""
+
+
 def trash_transcript(cc):
     """Move a claude session's on-disk transcript to the trash (reversible) — the
     sidebar 🗑 uses this to clean resumable sessions out of a folder. Prefers
@@ -604,13 +635,14 @@ def fetch_usage():
 
 _models_cache = {"t": 0.0, "v": None}
 
-def fetch_models():
+def fetch_models(force=False):
     """Live model list from the API's /v1/models (id + display name), so the
     picker self-updates when Anthropic ships/retires models (e.g. fable).
-    Same OAuth token as fetch_usage; cached ~1h. Blocking (run off the IO loop).
+    Same OAuth token as fetch_usage; cached ~1h — force=True bypasses the cache
+    (the picker's manual ↻ refresh). Blocking (run off the IO loop).
     Returns [{id, name}], the last good value on a transient error, or None."""
     now = time.monotonic()
-    if _models_cache["v"] is not None and now - _models_cache["t"] < 3600:
+    if not force and _models_cache["v"] is not None and now - _models_cache["t"] < 3600:
         return _models_cache["v"]
     try:
         with open(os.path.join(HOME, ".claude", ".credentials.json"), encoding="utf-8") as f:
@@ -817,6 +849,297 @@ class AuthMixin:
         return False
 
 
+# ─────────────────── history search index ───────────────────
+#
+# Searching the transcripts directly is the obvious approach and the wrong one:
+# measured on a real corpus, 2.4 GB of .jsonl holds only ~250 MB of anything a
+# person said — the other 98.6% is tool output, file dumps and base64 images, which
+# would bury every real hit and cost seconds per query to scan. So this keeps a
+# small SQLite side-table of just the conversation: user/assistant prose plus the
+# file paths and commands tools acted on.
+#
+# Substring matching (LIKE), not FTS. FTS5's default tokenizer scores ZERO hits on
+# Chinese text, and the trigram tokenizer that fixes that still misses every
+# two-character word (重启, 冲突) while costing ~1 GB of index. LIKE treats every
+# language and code fragment alike for ~2 s on the full corpus, and is instant once
+# a scope narrows it. A trigram layer can be added later as pure acceleration.
+
+INDEX_DB = os.path.join(HOME, ".cache", "claude-console", "history.db")
+CJK_RE = re.compile(r"[㐀-鿿぀-ヿ가-힯]")
+INDEX_REFRESH_SEC = 30   # incremental catch-up cadence, checked on search
+_index_lock = threading.Lock()
+_index_state = {"t": 0.0, "err": ""}
+
+
+INDEX_SCHEMA = 3      # bump to force a rebuild when the layout below changes
+
+
+def _index_conn():
+    os.makedirs(os.path.dirname(INDEX_DB), exist_ok=True)
+    db = sqlite3.connect(INDEX_DB, timeout=30)
+    db.execute("PRAGMA journal_mode=WAL")     # readers never block the indexer
+    db.execute("PRAGMA synchronous=NORMAL")
+    if db.execute("PRAGMA user_version").fetchone()[0] != INDEX_SCHEMA:
+        db.executescript("DROP TABLE IF EXISTS msgs; DROP TABLE IF EXISTS files;")
+        db.execute("PRAGMA user_version=%d" % INDEX_SCHEMA)
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS files(
+            fid INTEGER PRIMARY KEY, path TEXT UNIQUE,
+            off INTEGER DEFAULT 0, cc TEXT, cwd TEXT);
+        CREATE TABLE IF NOT EXISTS msgs(
+            fid INTEGER, uid TEXT, ts TEXT, role TEXT, txt TEXT);
+        CREATE INDEX IF NOT EXISTS msgs_fid ON msgs(fid);
+        CREATE INDEX IF NOT EXISTS files_cc ON files(cc);
+        CREATE INDEX IF NOT EXISTS files_cwd ON files(cwd);
+        -- resuming a session makes the CLI re-append the whole prior history to the
+        -- same .jsonl, so one message can sit in the file three times over with an
+        -- identical uuid. Scoped per file, not globally: an imported copy of a
+        -- session is its own transcript and has to stay searchable in its own
+        -- folder. NULLs stay exempt, and SQLite allows many of those.
+        CREATE UNIQUE INDEX IF NOT EXISTS msgs_uid ON msgs(fid, uid);
+    """)
+    return db
+
+
+def _searchable(d):
+    """The searchable text of one transcript line, as (role, text) pairs. Tool
+    *output* is deliberately excluded — see the note above."""
+    m = d.get("message")
+    if not isinstance(m, dict):
+        return
+    role = m.get("role")
+    if role not in ("user", "assistant"):
+        return
+    c = m.get("content")
+    if isinstance(c, str):
+        if c.strip():
+            yield role, c
+        return
+    if not isinstance(c, list):
+        return
+    for b in c:
+        if not isinstance(b, dict):
+            continue
+        t = b.get("type")
+        if t == "text" and isinstance(b.get("text"), str) and b["text"].strip():
+            yield role, b["text"]
+        elif t == "tool_use":
+            i = b.get("input") or {}
+            v = i.get("file_path") or i.get("command") or i.get("pattern") or ""
+            if isinstance(v, str) and v.strip():
+                yield "tool", v[:400]
+
+
+# Folders under CLAUDE_ROOT that hold machine-written transcripts *about* your
+# conversations rather than conversations themselves. Both quote your content back,
+# so indexing them returns every hit two or three times over:
+#   claude-console-recap — this console's own recap prompt is "Transcript so far:"
+#                          followed by a full copy of the session it summarised.
+#   claude-mem           — the memory plugin's observer logs each tool call as an
+#                          <observed_from_primary_session> XML blob (~80 k chars,
+#                          16% of everything indexed here) carrying file contents
+#                          and tool parameters verbatim.
+INDEX_SKIP_MARKS = ("claude-console-recap", "claude-mem")
+
+
+def _index_skip(path):
+    folder = os.path.basename(os.path.dirname(path))
+    return any(m in folder for m in INDEX_SKIP_MARKS)
+
+
+def reindex():
+    """Fold new transcript lines into the index. Transcripts are append-only (checked
+    against a 405 MB file spanning a month), so each pass seeks to where the last one
+    stopped and reads only the tail — keeping a huge session current costs nothing.
+    A file that shrank was replaced rather than appended to, so it is rebuilt."""
+    if not _index_lock.acquire(blocking=False):
+        return {"skipped": "already running"}
+    try:
+        db = _index_conn()
+        known = {p: (fid, off) for fid, p, off
+                 in db.execute("SELECT fid, path, off FROM files")}
+        added = 0
+        alive = set()
+        for path in glob.glob(os.path.join(CLAUDE_ROOT, "*", "*.jsonl")):
+            if _index_skip(path):
+                continue      # left out of `alive`, so any rows already stored go
+            alive.add(path)
+            try:
+                sz = os.path.getsize(path)
+            except OSError:
+                continue
+            fid, off = known.get(path, (None, 0))
+            if fid is not None and sz < off:      # truncated/replaced → rebuild
+                db.execute("DELETE FROM msgs WHERE fid=?", (fid,))
+                off = 0
+            if fid is not None and sz == off:
+                continue
+            try:
+                with open(path, "rb") as f:
+                    f.seek(off)
+                    data = f.read()
+            except OSError:
+                continue
+            cut = data.rfind(b"\n")               # whole lines only
+            if cut < 0:
+                continue
+            chunk, consumed = data[:cut + 1], cut + 1
+            cc = cwd = ""
+            rows = []
+            for line in chunk.decode("utf-8", "replace").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(d, dict):
+                    continue
+                cc = cc or (d.get("sessionId") or "")
+                cwd = cwd or (d.get("cwd") or "")
+                ts = d.get("timestamp") or ""
+                u = d.get("uuid") or ""
+                for seq, (role, txt) in enumerate(_searchable(d)):
+                    # one line can yield several texts, so the key carries the slot
+                    rows.append(("%s:%d" % (u, seq) if u else None, ts, role, txt))
+            if fid is None:
+                cur = db.execute(
+                    "INSERT INTO files(path, off, cc, cwd) VALUES(?,?,?,?)",
+                    (path, 0, cc, cwd))
+                fid = cur.lastrowid
+            elif cc or cwd:                       # backfill ids learned later
+                db.execute("UPDATE files SET cc=COALESCE(NULLIF(cc,''),?),"
+                           " cwd=COALESCE(NULLIF(cwd,''),?) WHERE fid=?",
+                           (cc, cwd, fid))
+            if rows:
+                before = db.total_changes
+                db.executemany(
+                    "INSERT OR IGNORE INTO msgs(fid, uid, ts, role, txt) VALUES(?,?,?,?,?)",
+                    [(fid, a, b, c, d_) for a, b, c, d_ in rows])
+                added += db.total_changes - before   # re-appended history is ignored
+            db.execute("UPDATE files SET off=? WHERE fid=?", (off + consumed, fid))
+        for path, (fid, _off) in known.items():   # transcripts deleted since
+            if path not in alive:
+                db.execute("DELETE FROM msgs WHERE fid=?", (fid,))
+                db.execute("DELETE FROM files WHERE fid=?", (fid,))
+        db.commit()
+        n = db.execute("SELECT COUNT(*) FROM msgs").fetchone()[0]
+        db.close()
+        _index_state["t"] = time.time()
+        _index_state["err"] = ""
+        return {"added": added, "messages": n}
+    except Exception as e:
+        _index_state["err"] = str(e)
+        return {"error": str(e)}
+    finally:
+        _index_lock.release()
+
+
+def min_query_len(q):
+    """How short a query is allowed to be, by script. One han character is a whole
+    word — 熵, 态, 谱 are all worth searching for on their own — whereas a lone latin
+    letter matches nearly every message. A single threshold for both would either
+    lock Chinese users out of one-character words or drown Latin ones in noise."""
+    return 1 if CJK_RE.search(q or "") else 2
+
+
+def _snippet(txt, q, span=160):
+    """A window of text around the first match, split so the client can highlight
+    the hit without re-running the search or trusting a regex."""
+    i = txt.lower().find(q.lower())
+    if i < 0:
+        return {"pre": txt[:span], "hit": "", "post": ""}
+    a = max(0, i - span // 2)
+    b = min(len(txt), i + len(q) + span)
+    return {"pre": ("…" if a else "") + txt[a:i],
+            "hit": txt[i:i + len(q)],
+            "post": txt[i + len(q):b] + ("…" if b < len(txt) else "")}
+
+
+def search_history(q, scope="all", cc="", cwd="", limit=200):
+    """Substring search over the indexed conversation. Runs an incremental catch-up
+    first so a message sent seconds ago is already findable."""
+    q = (q or "").strip()
+    need = min_query_len(q)
+    if len(q) < need:
+        return {"results": [], "note": "type at least %d character%s"
+                                       % (need, "" if need == 1 else "s")}
+    if time.time() - _index_state["t"] > INDEX_REFRESH_SEC:
+        reindex()
+    try:
+        db = _index_conn()
+    except Exception as e:
+        return {"results": [], "error": str(e)}
+    esc = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    where, args = ["m.txt LIKE ? ESCAPE '\\'"], ["%" + esc + "%"]
+    if scope == "session" and cc:
+        where.append("f.cc=?")
+        args.append(cc)
+    elif scope == "project" and cwd:
+        # the folder AND everything under it — the same rule the sidebar's "In folder"
+        # list uses. Sessions usually live in a subdir of the project you pick, so an
+        # exact-equality filter would quietly return almost nothing.
+        base = os.path.abspath(os.path.expanduser(cwd)).rstrip(os.sep)
+        pre = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        where.append("(f.cwd=? OR f.cwd LIKE ? ESCAPE '\\')")
+        args.extend([base, pre + os.sep + "%"])
+    args.append(int(limit) + 1)
+    rows = db.execute(
+        "SELECT f.cc, f.cwd, m.ts, m.role, m.txt, m.rowid FROM msgs m JOIN files f"
+        " ON f.fid=m.fid WHERE " + " AND ".join(where) +
+        " ORDER BY m.ts DESC LIMIT ?", args).fetchall()
+    db.close()
+    more = len(rows) > limit
+    names = load_names()
+    out = []
+    for r_cc, r_cwd, ts, role, txt, mid in rows[:limit]:
+        item = {"cc": r_cc, "cwd": r_cwd, "ts": ts, "role": role, "mid": mid,
+                "title": names.get(r_cc) or os.path.basename(r_cwd or "") or "session",
+                "name": os.path.basename(r_cwd or "")}
+        item.update(_snippet(txt, q))
+        out.append(item)
+    return {"results": out, "more": more}
+
+
+THREAD_TXT_CAP = 20000    # one pathological message shouldn't blow up the viewer
+
+
+def load_thread(mid, before=40, after=40):
+    """The conversation surrounding one search hit, served straight out of the index.
+    Reading it back from the .jsonl would mean touching a file that can be 400 MB to
+    show forty messages; the index already holds them in order."""
+    try:
+        db = _index_conn()
+        mid = int(mid)
+    except Exception as e:
+        return {"error": str(e), "messages": []}
+    r = db.execute("SELECT fid FROM msgs WHERE rowid=?", (mid,)).fetchone()
+    if not r:
+        return {"error": "that message is no longer indexed", "messages": []}
+    fid = r[0]
+    cc, cwd = db.execute("SELECT cc, cwd FROM files WHERE fid=?", (fid,)).fetchone() or ("", "")
+    # rowids are global, but within one file they increase with position, so a
+    # window either side of the hit is just two bounded index scans
+    pre = db.execute("SELECT rowid, ts, role, txt FROM msgs WHERE fid=? AND rowid<=?"
+                     " ORDER BY rowid DESC LIMIT ?", (fid, mid, int(before) + 1)).fetchall()
+    post = db.execute("SELECT rowid, ts, role, txt FROM msgs WHERE fid=? AND rowid>?"
+                      " ORDER BY rowid LIMIT ?", (fid, mid, int(after))).fetchall()
+    lo, hi = db.execute("SELECT MIN(rowid), MAX(rowid) FROM msgs WHERE fid=?", (fid,)).fetchone()
+    total = db.execute("SELECT COUNT(*) FROM msgs WHERE fid=?", (fid,)).fetchone()[0]
+    db.close()
+    rows = list(reversed(pre)) + list(post)
+    msgs = []
+    for rid, ts, role, txt in rows:
+        cut = len(txt) > THREAD_TXT_CAP
+        msgs.append({"mid": rid, "ts": ts, "role": role,
+                     "txt": txt[:THREAD_TXT_CAP] + ("\n…(truncated)" if cut else "")})
+    return {"cc": cc, "cwd": cwd, "total": total, "messages": msgs,
+            "title": load_names().get(cc) or os.path.basename(cwd or "") or "session",
+            "atStart": bool(rows) and rows[0][0] == lo,
+            "atEnd": bool(rows) and rows[-1][0] == hi}
+
+
 # ───────────────────────── handlers ─────────────────────────
 
 
@@ -874,8 +1197,124 @@ class ModelsHandler(AuthMixin, tornado.web.RequestHandler):
             return
         self.set_header("Content-Type", "application/json")
         loop = tornado.ioloop.IOLoop.current()
-        m = await loop.run_in_executor(None, fetch_models)   # blocking HTTP off-loop
+        fresh = self.get_argument("fresh", "") == "1"        # manual ↻: skip the 1h cache
+        m = await loop.run_in_executor(None, fetch_models, fresh)   # blocking HTTP off-loop
         self.write(json.dumps({"models": m or []}))
+
+
+class ExportHandler(AuthMixin, tornado.web.RequestHandler):
+    """Download a session's raw transcript. Streamed, because these run to hundreds
+    of MB. The download keeps the name '<session-id>.jsonl' on purpose: the CLI
+    resolves --resume by filename, so a prettier name would break re-import."""
+    async def get(self):
+        if not self._ok_auth():
+            return
+        cc = self.get_argument("cc", "")
+        path = find_transcript(cc)
+        if not path:
+            self.set_status(404)
+            self.write("no transcript for that session")
+            return
+        self.set_header("Content-Type", "application/x-ndjson")
+        self.set_header("Content-Disposition", 'attachment; filename="%s.jsonl"' % cc)
+        self.set_header("Content-Length", str(os.path.getsize(path)))
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(1 << 20)
+                if not chunk:
+                    break
+                self.write(chunk)
+                await self.flush()
+
+
+class ImportHandler(AuthMixin, tornado.web.RequestHandler):
+    """Adopt a transcript exported from another machine. The file is dropped, byte
+    for byte, into the project folder for `cwd` — no rewriting of the cwd/gitBranch
+    fields inside, since --resume never reads them. After this the session shows up
+    in the sidebar and resumes like a local one."""
+    def post(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "application/json")
+
+        def fail(msg, code=400):
+            self.set_status(code)
+            self.write(json.dumps({"ok": False, "error": msg}))
+
+        cwd = (self.get_body_argument("cwd", "") or "").strip()
+        if not cwd:
+            return fail("pick a project folder first")
+        cwd = os.path.abspath(os.path.expanduser(cwd))
+        if not os.path.isdir(cwd):
+            return fail("not a folder: %s" % cwd)
+        files = self.request.files.get("file") or []
+        if not files:
+            return fail("no file uploaded")
+        up = files[0]
+        body = up["body"]
+        if not body:
+            return fail("empty file")
+
+        cc = transcript_session_id(body)
+        if not cc:   # fall back to the filename stem when no line carries a sessionId
+            cc = os.path.splitext(os.path.basename(up.get("filename") or ""))[0]
+        if not _valid_cc(cc):
+            return fail("not a claude transcript (no sessionId found)")
+
+        dest_dir = os.path.join(CLAUDE_ROOT, proj_folder(cwd))
+        dest = os.path.join(dest_dir, cc + ".jsonl")
+        if os.path.exists(dest):
+            return fail("this session already exists in that folder", 409)
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+            tmp = dest + ".part"
+            with open(tmp, "wb") as f:
+                f.write(body)
+            # transcripts are plaintext and may hold anything a tool printed, so match
+            # the 0600 the CLI writes — an upload must not land world-readable.
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, dest)
+        except Exception as e:
+            return fail("write failed: %s" % e, 500)
+        # the same id living in another folder is fine (verified) — just say so
+        elsewhere = [os.path.basename(os.path.dirname(p))
+                     for p in glob.glob(os.path.join(CLAUDE_ROOT, "*", cc + ".jsonl"))
+                     if os.path.realpath(p) != os.path.realpath(dest)]
+        self.write(json.dumps({"ok": True, "cc": cc, "cwd": cwd,
+                               "bytes": len(body), "also_in": elsewhere}))
+
+
+class SearchHandler(AuthMixin, tornado.web.RequestHandler):
+    """Full-text search across every stored conversation. The scan and the SQLite
+    work both run off the IO loop so a 2 s global query never stalls live sessions."""
+    async def get(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "application/json")
+        q = self.get_argument("q", "")
+        scope = self.get_argument("scope", "all")
+        cc = self.get_argument("cc", "")
+        cwd = self.get_argument("cwd", "")
+        loop = tornado.ioloop.IOLoop.current()
+        res = await loop.run_in_executor(
+            None, search_history, q, scope, cc, cwd, 200)
+        self.write(json.dumps(res))
+
+
+class ThreadHandler(AuthMixin, tornado.web.RequestHandler):
+    """Read-only context around a search hit, for the viewer. Deliberately separate
+    from resuming: opening a past conversation to read it must never disturb, or take
+    over, the session the user is presently talking to."""
+    async def get(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "application/json")
+        loop = tornado.ioloop.IOLoop.current()
+        res = await loop.run_in_executor(
+            None, load_thread, self.get_argument("mid", "0"),
+            min(400, int(self.get_argument("before", "40") or 40)),
+            min(400, int(self.get_argument("after", "40") or 40)))
+        self.write(json.dumps(res))
 
 
 CHAT_SESSIONS = {}  # id -> ChatSession (live, independent of any browser connection)
@@ -2061,6 +2500,76 @@ pre code{background:none;border:none;padding:0}
 .acitem:hover .acname,.acitem.sel .acname,.acitem:hover .acpath,.acitem.sel .acpath{color:var(--onacc)}
 .acmore{padding:5px 8px;font-size:10px;color:var(--mut);font-style:italic}
 .sb-row2{display:flex;gap:6px}.sb-row2 select{flex:1;min-width:0}
+#srchopen{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;
+  margin:0 0 8px;padding:6px 8px;background:var(--bg3);color:var(--dim);
+  border:1px solid var(--line);border-radius:6px;font-size:12px;cursor:pointer}
+#srchopen:hover{color:var(--fg);border-color:var(--acc)}
+#srchopen kbd{font:inherit;font-size:10.5px;color:var(--dim);border:1px solid var(--line);
+  border-radius:3px;padding:0 4px;background:var(--bg2)}
+/* history search: a full-screen palette (Ctrl/Cmd+K). Wide on purpose — snippets
+   are the point, and a sidebar-width column truncates them into uselessness. */
+#srch{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.55);
+  display:flex;justify-content:center;align-items:flex-start;padding:8vh 16px 16px}
+#srch[hidden]{display:none}
+#srchpanel{width:min(900px,100%);max-height:78vh;display:flex;flex-direction:column;
+  background:var(--bg2);border:1px solid var(--line);border-radius:10px;
+  box-shadow:0 18px 60px rgba(0,0,0,.5);overflow:hidden}
+.srchtop{display:flex;gap:8px;padding:10px;border-bottom:1px solid var(--line);align-items:center}
+#srchq{flex:1;min-width:0;background:var(--bg3);color:var(--fg);border:1px solid var(--line);
+  border-radius:6px;padding:9px 11px;font-size:14px;outline:none}
+#srchq:focus{border-color:var(--acc)}
+#srchscope{flex:0 0 auto;background:var(--bg3);color:var(--fg);border:1px solid var(--line);
+  border-radius:6px;padding:8px;font-size:12px}
+#srchx{flex:0 0 auto;background:none;border:none;color:var(--dim);font-size:16px;cursor:pointer;padding:4px 8px}
+#srchx:hover{color:var(--fg)}
+#srchmeta{padding:7px 12px;font-size:11.5px;color:var(--dim);border-bottom:1px solid var(--line)}
+#srchres{overflow:auto;padding:4px 0}
+.shit{padding:9px 12px;border-bottom:1px solid var(--line);cursor:pointer}
+.shit:hover{background:var(--bg3)}
+.shit .sh1{display:flex;gap:8px;align-items:baseline;font-size:11.5px;color:var(--dim);margin-bottom:3px}
+.shit .sh1 b{color:var(--fg);font-weight:600;font-size:12.5px}
+.shit .sh1 .role{border:1px solid var(--line);border-radius:3px;padding:0 4px;font-size:10px}
+.shit .sh2{font-size:12.5px;line-height:1.5;color:var(--fg);word-break:break-word;
+  display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.shit .sh2 mark{background:var(--acc);color:var(--bg);border-radius:2px;padding:0 1px}
+/* read-only transcript viewer — a search hit opens here, never in the live chat */
+#srchthread{display:flex;flex-direction:column;min-height:0;overflow:hidden}
+#srchthread[hidden]{display:none}
+.thhead{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line)}
+.thhead .thtitle{flex:1;min-width:0;font-size:12.5px;color:var(--fg);font-weight:600;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.thhead button{flex:0 0 auto;background:var(--bg3);color:var(--fg);border:1px solid var(--line);
+  border-radius:5px;padding:4px 9px;font-size:11.5px;cursor:pointer}
+.thhead button:hover{border-color:var(--acc);color:var(--acc)}
+#thopen{color:var(--acc);border-color:var(--acc)}
+#thopen:hover{background:var(--acc);color:var(--onacc)}
+#thbody{overflow:auto;padding:6px 0 12px}
+.thmsg{padding:7px 14px;border-left:3px solid transparent}
+.thmsg .thr{font-size:10.5px;color:var(--dim);margin-bottom:2px;letter-spacing:.03em}
+.thmsg .tht{font-size:12.5px;line-height:1.55;color:var(--fg);white-space:pre-wrap;word-break:break-word}
+.thmsg.user{border-left-color:var(--acc)}
+.thmsg.assistant{border-left-color:var(--line)}
+.thmsg.tool .tht{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;color:var(--dim)}
+.thmsg.target{background:var(--bg3)}
+.thmsg .tht mark{background:var(--acc);color:var(--bg);border-radius:2px;padding:0 1px}
+.thmore{display:block;width:calc(100% - 24px);margin:6px 12px;padding:5px;background:var(--bg3);
+  color:var(--dim);border:1px dashed var(--line);border-radius:5px;font-size:11.5px;cursor:pointer}
+.thmore:hover{color:var(--acc);border-color:var(--acc)}
+.thend{text-align:center;font-size:11px;color:var(--mut);padding:6px}
+/* Import sits directly under New session and mirrors its geometry, but stays
+   outlined rather than solid: two filled accent buttons stacked would read as two
+   equally primary actions, and importing is the rarer one. */
+.impline{display:flex;flex-direction:column;gap:5px;margin-top:6px}
+#impbtn{width:100%;background:var(--bg3);color:var(--acc);font-weight:700;
+  border:1px solid var(--acc);border-radius:6px;padding:7px;font-size:13px;cursor:pointer}
+#impbtn:hover{background:var(--acc);color:var(--onacc)}
+#impmsg{font-size:11px;color:var(--dim);line-height:1.35;word-break:break-word}
+#impmsg:empty{display:none}   /* no dead gap when there is nothing to report */
+#impmsg.bad{color:#f5483b}
+#mrefresh{flex:0 0 auto;width:26px;padding:0;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:5px;font-size:13px;cursor:pointer;line-height:1}
+#mrefresh:hover{color:var(--acc);border-color:var(--acc)}
+#mrefresh.busy{color:var(--acc);animation:mrspin .8s linear infinite;pointer-events:none}
+@keyframes mrspin{to{transform:rotate(360deg)}}
 .newbtn{background:var(--acc);color:var(--onacc);font-weight:700;border:none;border-radius:6px;padding:7px;font-size:13px;cursor:pointer}
 .newbtn:hover{filter:brightness(1.08)}
 .sb-sec{border-bottom:1px solid var(--line);padding:4px 0 6px}
@@ -2130,14 +2639,16 @@ pre code{background:none;border:none;padding:0}
 <div id="shell">
   <aside id="sidebar">
     <div class="sb-brand">⬡ Claude Console</div>
+    <button id="srchopen" title="search all conversation history"><span>🔍 Search history</span><kbd>⌘K</kbd></button>
     <div class="sb-new">
       <select id="project" title="working directory for a new session"></select>
       <div class="cwdwrap" id="cwdwrap"><input id="cwd" placeholder="type a path…  ↑↓ to pick" autocomplete="off"><div id="cwdac"></div></div>
       <div class="sb-row2">
-        <select id="model" title="model"><option value="opus">model: opus</option><option>sonnet</option><option>haiku</option></select>
+        <select id="model" title="model"><option value="opus">model: opus</option><option>sonnet</option><option>haiku</option></select><button id="mrefresh" title="refresh model list from the API">↻</button>
         <select id="mode" title="permission mode"><option value="acceptEdits">⚡ Auto-accept</option><option value="default">🔐 Approve</option><option value="plan">📋 Plan</option><option value="bypassPermissions">⏩ Full auto</option></select>
       </div>
       <button class="newbtn" id="newbtn">＋ New session</button>
+      <div class="impline"><input type="file" id="impfile" accept=".jsonl,application/x-ndjson" hidden><button id="impbtn" title="adopt a .jsonl transcript exported from another machine — it lands in the folder above">Import session</button><span id="impmsg"></span></div>
     </div>
     <div class="sb-sec">
       <div class="sb-h">Live <span id="liveN" class="cnt">0</span></div>
@@ -2180,6 +2691,27 @@ pre code{background:none;border:none;padding:0}
   </aside>
   <div id="sbresize"></div>
   <div id="sb-backdrop"></div>
+  <div id="srch" hidden><div id="srchpanel">
+    <div class="srchtop">
+      <input id="srchq" type="text" placeholder="search every conversation…" autocomplete="off" spellcheck="false">
+      <select id="srchscope" title="how much history to search">
+        <option value="all">all history</option>
+        <option value="project">this folder + subfolders</option>
+        <option value="session">this conversation</option>
+      </select>
+      <button id="srchx" title="close (Esc)">✕</button>
+    </div>
+    <div id="srchmeta">Search your full conversation history — what you asked, what Claude answered, and the files and commands it touched.</div>
+    <div id="srchres"></div>
+    <div id="srchthread" hidden>
+      <div class="thhead">
+        <button id="thback" title="back to results">← results</button>
+        <div class="thtitle"></div>
+        <button id="thopen" title="resume this conversation in the chat pane">Open session</button>
+      </div>
+      <div id="thbody"></div>
+    </div>
+  </div></div>
   <div id="mainCol">
     <div id="chat"><div class="wrap" id="stream"></div></div>
     <div id="composer">
@@ -2214,7 +2746,7 @@ let sid=null, curCC=null, editCount=0, pendingStart=false, reconnectT=0;
 const EFFORTS=['low','medium','high','xhigh','max','ultracode'];
 let curEffort=localStorage.getItem('al_effort')||'max';
 let showThink=false;
-let liveCCs=new Set(), recentData=[], folderData=[], favData=[], HOMEDIR='';
+let liveCCs=new Set(), liveSessions=[], recentData=[], folderData=[], favData=[], HOMEDIR='';
 const EDIT_TOOLS=new Set(['Edit','MultiEdit','Write','NotebookEdit']);
 const SKEY='al_session';
 
@@ -2650,8 +3182,9 @@ function rebuildModelPicker(){
   sel.appendChild(g);
   for(const o of sel.options)if(o.value===want){sel.value=want;break;}   /* keep the saved/current pick */
 }
-function loadModels(){fetch('api/models').then(r=>r.json()).then(j=>{
-  if(j.models&&j.models.length){MODELS=j.models;rebuildModelPicker();}}).catch(()=>{});}
+function loadModels(fresh){return fetch('api/models'+(fresh?'?fresh=1':'')).then(r=>r.json()).then(j=>{
+  if(j.models&&j.models.length&&JSON.stringify(j.models)!==JSON.stringify(MODELS)){
+    MODELS=j.models;rebuildModelPicker();}}).catch(()=>{});}
 /* thinking effort: a clickable pill on the right of the status row. --effort is
    launch-time only, so changing it on a live session relaunches it (server-side
    resume with the new --effort); the choice is remembered for new sessions. */
@@ -2735,7 +3268,7 @@ function applySecCollapse(){let c={};try{c=JSON.parse(localStorage.getItem(SECKE
   ['secFav','secRecent','secFolder'].forEach(id=>{const el=$('#'+id);if(el)el.classList.toggle('collapsed',!!c[id]);});}
 
 function renderLive(list){const box=$('#liveList');
-  liveCCs=new Set(list.map(s=>s.cc).filter(Boolean));
+  liveCCs=new Set(list.map(s=>s.cc).filter(Boolean));liveSessions=list;
   $('#liveN').textContent=list.length;
   if(!list.length){box.innerHTML='<div class="sb-empty">none running — pick a project, ＋ New</div>';}
   else{box.innerHTML='';list.forEach(s=>{
@@ -2753,6 +3286,7 @@ function renderLive(list){const box=$('#liveList');
       {label:'⚙ Configure',fn:()=>openConfigure(s,kebab)},
       {label:'✎ Rename',fn:()=>renameSession(s.cc,s.title||s.name)}];
       if(s.cc)items.push({label:isFav(s.cc)?'★ Unfavorite':'☆ Favorite',fn:()=>toggleFav(s)});
+      if(s.cc)items.push({label:'⤓ Export transcript',fn:()=>exportSession(s.cc)});
       items.push({label:'✕ End session',danger:true,fn:()=>endSessionById(s.id,s.name)});
       toggleCardMenu(ev.currentTarget,items);};
     box.appendChild(r);});}
@@ -2790,8 +3324,163 @@ function pastRow(s,fav){const r=document.createElement('div');r.className='srow'
   r.querySelector('.skebab').onclick=ev=>{ev.stopPropagation();toggleCardMenu(ev.currentTarget,[
     {label:'✎ Rename',fn:()=>renameSession(s.cc,s.title)},
     {label:fav?'★ Unfavorite':'☆ Favorite',fn:()=>toggleFav(s)},
+    {label:'⤓ Export transcript',fn:()=>exportSession(s.cc)},
     {label:'🗑 Delete (to trash)',danger:true,fn:()=>delResumable(s)}]);};
   return r;}
+/* export/import: a transcript is a self-contained .jsonl. `claude --resume` finds it
+   by FOLDER (derived from the cwd) + FILENAME (the session id) — never by the cwd
+   recorded inside — so moving one between machines is a plain file copy. The download
+   therefore keeps the '<session-id>.jsonl' name; renaming it would break re-import. */
+function exportSession(cc){
+  if(!cc){alert('This session has no transcript yet.');return;}
+  const a=document.createElement('a');a.href='api/export?cc='+encodeURIComponent(cc);
+  a.download=cc+'.jsonl';document.body.appendChild(a);a.click();a.remove();}
+/* ── history search (Ctrl/Cmd+K) ────────────────────────────────────────────
+   The server does substring matching over an index of conversation text only, so a
+   query costs ~2 s across all history and is instant once a scope narrows it. That
+   latency is why this debounces and aborts the in-flight request on every keystroke
+   — otherwise slow answers land out of order and overwrite fast ones. */
+let srchAbort=null, srchT=0, srchSeq=0;
+function srchOpen(){return !$('#srch').hasAttribute('hidden');}
+function openSearch(){const w=$('#srch');w.removeAttribute('hidden');
+  showResults();
+  const q=$('#srchq');q.focus();q.select();}
+function closeSearch(){$('#srch').setAttribute('hidden','');
+  if(srchAbort){srchAbort.abort();srchAbort=null;}}
+/* the folder "this folder" means: the open conversation's own working dir when there
+   is one, else whatever the sidebar's project picker points at. Keying it off the
+   picker alone would be a trap — you'd be chatting in project A while the search
+   silently scoped itself to project B. */
+function searchFolder(){
+  const s=(liveSessions||[]).find(x=>x.id===sid);
+  return (s&&s.cwd)||currentFolder()||'';}
+function srchScopeArgs(){const sc=$('#srchscope').value;
+  if(sc==='session')return curCC?'&scope=session&cc='+encodeURIComponent(curCC):'&scope=all';
+  if(sc==='project'){const f=searchFolder();
+    return f?'&scope=project&cwd='+encodeURIComponent(f):'&scope=all';}
+  return '&scope=all';}
+function runSearch(){
+  const q=$('#srchq').value.trim(), res=$('#srchres'), meta=$('#srchmeta');
+  showResults();          /* a new query always returns from the reading view */
+  if(srchAbort){srchAbort.abort();srchAbort=null;}
+  /* one han character is a word, one latin letter is not — mirror the server's rule */
+  const need=/[㐀-鿿぀-ヿ가-힯]/.test(q)?1:2;
+  if(q.length<need){res.innerHTML='';
+    meta.textContent='Type at least '+need+' character'+(need===1?'':'s')+'.';return;}
+  const seq=++srchSeq;
+  meta.textContent='searching…';
+  srchAbort=new AbortController();
+  const t0=Date.now();
+  fetch('api/search?q='+encodeURIComponent(q)+srchScopeArgs(),{signal:srchAbort.signal})
+    .then(r=>r.json()).then(j=>{
+      if(seq!==srchSeq)return;                 /* a newer query already answered */
+      const list=j.results||[];
+      meta.textContent=list.length
+        ? list.length+(j.more?'+':'')+' match'+(list.length===1?'':'es')+' · '+((Date.now()-t0)/1000).toFixed(1)+'s'
+            +(j.more?' · showing the 200 most recent':'')
+        : (j.note||j.error||'no matches');
+      res.innerHTML='';
+      list.forEach(h=>{
+        const d=document.createElement('div');d.className='shit';
+        const proj=(h.cwd||'').split('/').slice(-2).join('/');
+        d.innerHTML='<div class="sh1"><b>'+esc(h.title||'session')+'</b>'+
+          '<span class="role">'+esc(h.role)+'</span><span>'+esc(proj)+'</span>'+
+          '<span>'+esc((h.ts||'').slice(0,16).replace('T',' '))+'</span></div>'+
+          '<div class="sh2">'+esc(h.pre)+'<mark>'+esc(h.hit)+'</mark>'+esc(h.post)+'</div>';
+        d.onclick=()=>openThread(h);
+        res.appendChild(d);});
+    }).catch(e=>{if(e.name!=='AbortError'&&seq===srchSeq)meta.textContent='search failed: '+e;});
+}
+/* Clicking a hit opens it HERE, read-only. It used to call resumeSession(), which
+   was wrong twice over: it commandeered whatever conversation you were in, and when
+   the old session's folder no longer existed the server rejected the resume and the
+   chat pane sat on "resuming…" forever. Reading and resuming are now separate acts —
+   the latter needs the explicit "Open session" button. */
+let thState=null;
+function showResults(){$('#srchthread').setAttribute('hidden','');
+  $('#srchres').removeAttribute('hidden');}
+function highlightInto(el,txt,q){
+  el.textContent=txt;
+  if(!q)return;
+  const i=txt.toLowerCase().indexOf(q.toLowerCase());
+  if(i<0)return;
+  el.textContent='';
+  el.appendChild(document.createTextNode(txt.slice(0,i)));
+  const m=document.createElement('mark');m.textContent=txt.slice(i,i+q.length);
+  el.appendChild(m);
+  el.appendChild(document.createTextNode(txt.slice(i+q.length)));}
+function renderThread(j,q,targetMid){
+  const body=$('#thbody');body.innerHTML='';
+  $('.thtitle').textContent=(j.title||'session')+' · '+(j.cwd||'').split('/').slice(-2).join('/')
+    +' · '+(j.total||0)+' messages';
+  if(!j.atStart){const b=document.createElement('button');b.className='thmore';
+    b.textContent='↑ load 60 earlier';
+    b.onclick=()=>loadThread(thState.mid,thState.before+60,thState.after,q,targetMid);
+    body.appendChild(b);}
+  else body.insertAdjacentHTML('beforeend','<div class="thend">— start of conversation —</div>');
+  let tgt=null;
+  (j.messages||[]).forEach(m=>{
+    const d=document.createElement('div');
+    d.className='thmsg '+m.role+(m.mid===targetMid?' target':'');
+    d.innerHTML='<div class="thr">'+esc(m.role)+' · '+esc((m.ts||'').slice(0,16).replace('T',' '))+'</div>';
+    const t=document.createElement('div');t.className='tht';
+    highlightInto(t,m.txt||'',m.mid===targetMid?q:'');
+    d.appendChild(t);body.appendChild(d);
+    if(m.mid===targetMid)tgt=d;});
+  if(!j.atEnd){const b=document.createElement('button');b.className='thmore';
+    b.textContent='↓ load 60 later';
+    b.onclick=()=>loadThread(thState.mid,thState.before,thState.after+60,q,targetMid);
+    body.appendChild(b);}
+  else body.insertAdjacentHTML('beforeend','<div class="thend">— end of conversation —</div>');
+  if(tgt)tgt.scrollIntoView({block:'center'});}
+function loadThread(mid,before,after,q,targetMid){
+  thState={mid:mid,before:before,after:after,q:q};
+  $('#thbody').innerHTML='<div class="thend">loading…</div>';
+  fetch('api/thread?mid='+encodeURIComponent(mid)+'&before='+before+'&after='+after)
+    .then(r=>r.json()).then(j=>{
+      if(j.error){$('#thbody').innerHTML='<div class="thend">'+esc(j.error)+'</div>';return;}
+      thState.cc=j.cc;thState.cwd=j.cwd;renderThread(j,q,targetMid);})
+    .catch(e=>{$('#thbody').innerHTML='<div class="thend">failed: '+esc(String(e))+'</div>';});}
+function openThread(h){
+  $('#srchres').setAttribute('hidden','');
+  $('#srchthread').removeAttribute('hidden');
+  loadThread(h.mid,40,40,$('#srchq').value.trim(),h.mid);}
+function wireSearch(){
+  const q=$('#srchq');if(!q)return;
+  $('#thback').onclick=showResults;
+  $('#thopen').onclick=()=>{const s=thState;if(!s||!s.cc)return;
+    closeSearch();resumeSession({cc:s.cc,cwd:s.cwd});};
+  q.addEventListener('input',()=>{clearTimeout(srchT);srchT=setTimeout(runSearch,260);});
+  q.addEventListener('keydown',e=>{if(e.key==='Enter'){clearTimeout(srchT);runSearch();}});
+  $('#srchscope').onchange=runSearch;
+  $('#srchx').onclick=closeSearch;
+  const ob=$('#srchopen');if(ob)ob.onclick=()=>{openSearch();if(window.innerWidth<=860)closeSidebar();};
+  $('#srch').onclick=e=>{if(e.target===$('#srch'))closeSearch();};   /* backdrop */
+  document.addEventListener('keydown',e=>{
+    if((e.ctrlKey||e.metaKey)&&(e.key==='k'||e.key==='K')){e.preventDefault();
+      srchOpen()?closeSearch():openSearch();return;}
+    if(e.key==='Escape'&&srchOpen()){e.preventDefault();e.stopPropagation();closeSearch();}
+  },true);   /* capture: close the palette before Esc reaches the interrupt handler */
+}
+function impMsg(t,bad){const el=$('#impmsg');if(!el)return;
+  el.textContent=t||'';el.classList.toggle('bad',!!bad);
+  if(t&&!bad)setTimeout(()=>{if(el.textContent===t)el.textContent='';},6000);}
+function importTarget(){return (($('#cwd').value||'').trim())||$('#project').value||'';}
+function wireImport(){
+  const btn=$('#impbtn'),inp=$('#impfile');if(!btn||!inp)return;
+  btn.onclick=()=>{if(!importTarget()){impMsg('pick a project folder above first',true);return;}
+    inp.click();};
+  inp.onchange=()=>{const f=inp.files&&inp.files[0];if(!f){return;}
+    const dir=importTarget();
+    if(!dir){impMsg('pick a project folder above first',true);inp.value='';return;}
+    const fd=new FormData();fd.append('file',f);fd.append('cwd',dir);
+    impMsg('importing '+f.name+' …');
+    fetch('api/import',{method:'POST',body:fd}).then(r=>r.json().then(j=>({ok:r.ok,j})))
+      .then(({ok,j})=>{
+        if(ok&&j.ok){impMsg('✓ imported · resume it from the list below');loadPast();}
+        else impMsg('✗ '+((j&&j.error)||'import failed'),true);})
+      .catch(e=>impMsg('✗ '+e,true))
+      .finally(()=>{inp.value='';});};}
 function renameSession(cc,cur){
   if(!cc){alert('This session is still starting — try again in a moment.');return;}
   const nm=prompt('Rename session (leave empty to reset to the auto name):',cur||'');
@@ -2971,7 +3660,7 @@ window.addEventListener('paste',handlePaste);
 sendBtn.onclick=sendMsg;
 $('#stop').onclick=doInterrupt;
 document.addEventListener('keydown',e=>{
-  if(e.key==='Escape'&&running&&!$('#cwdac').classList.contains('on')){e.preventDefault();doInterrupt();}});
+  if(e.key==='Escape'&&running&&!srchOpen()&&!$('#cwdac').classList.contains('on')){e.preventDefault();doInterrupt();}});
 $('#newbtn').onclick=newSession;
 /* color theme: apply + persist (the <head> script already set it pre-paint) */
 function applyTheme(t){if(t&&t!=='dark')document.documentElement.setAttribute('data-theme',t);
@@ -3074,6 +3763,13 @@ loadPast();
 loadUsage();
 setInterval(loadUsage,60000);
 loadModels();
+wireImport();
+wireSearch();
+/* manual model-list refresh: the ↻ button next to the picker re-queries the API,
+   bypassing the server's 1h cache — so a just-shipped model appears on click,
+   no page reload. Spins while fetching; no automatic polling by design. */
+$('#mrefresh').onclick=()=>{const b=$('#mrefresh');if(b.classList.contains('busy'))return;
+  b.classList.add('busy');loadModels(true).finally(()=>b.classList.remove('busy'));};
 openWs();
 </script>
 </body>
@@ -3124,12 +3820,21 @@ def main():
         (r"/api/diff", DiffHandler),
         (r"/api/usage", UsageHandler),
         (r"/api/models", ModelsHandler),
+        (r"/api/export", ExportHandler),
+        (r"/api/import", ImportHandler),
+        (r"/api/search", SearchHandler),
+        (r"/api/thread", ThreadHandler),
         (r"/ws/chat", ChatSocket),
         (r"/static/(.*)", tornado.web.StaticFileHandler,
          {"path": os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")}),
     ])
     loopback = BIND in ("127.0.0.1", "localhost", "::1")
-    app.listen(PORT, address=BIND)
+    # transcripts reach hundreds of MB, and tornado's 100MB default body cap would
+    # reject those uploads outright on /api/import.
+    app.listen(PORT, address=BIND, max_buffer_size=IMPORT_MAX, max_body_size=IMPORT_MAX)
+    # warm the search index in the background; the first build is ~6 s over a 2.4 GB
+    # corpus, every pass after that only reads what was appended
+    tornado.ioloop.IOLoop.current().run_in_executor(None, reindex)
     if RECAP_ENABLED:   # idle-session recap sweep (every 30s)
         tornado.ioloop.PeriodicCallback(_recap_tick, 30000).start()
         _cleanup_recap_artifacts()   # prune stale recap transcripts now…
