@@ -17,6 +17,7 @@ Env (legacy AGENTLENS_* names still accepted as a fallback):
 import asyncio
 import base64
 import glob
+import io
 import json
 import os
 import re
@@ -1228,10 +1229,15 @@ class ExportHandler(AuthMixin, tornado.web.RequestHandler):
 
 
 class ImportHandler(AuthMixin, tornado.web.RequestHandler):
-    """Adopt a transcript exported from another machine. The file is dropped, byte
-    for byte, into the project folder for `cwd` — no rewriting of the cwd/gitBranch
-    fields inside, since --resume never reads them. After this the session shows up
-    in the sidebar and resumes like a local one."""
+    """Adopt a transcript exported from another machine, into the project folder for
+    `cwd`.
+
+    The cwd recorded *inside* each line is rewritten to the target. `claude --resume`
+    would not care — it finds a session by folder and filename — but this console's
+    own sidebar reads that field and drops any session whose directory does not exist
+    locally. An import from another machine always carries a foreign path (a different
+    user's home, say), so leaving it verbatim files the session away somewhere
+    invisible: resumable in principle, unreachable in the UI."""
     def post(self):
         if not self._ok_auth():
             return
@@ -1265,11 +1271,27 @@ class ImportHandler(AuthMixin, tornado.web.RequestHandler):
         dest = os.path.join(dest_dir, cc + ".jsonl")
         if os.path.exists(dest):
             return fail("this session already exists in that folder", 409)
+        rewritten = 0
         try:
             os.makedirs(dest_dir, exist_ok=True)
             tmp = dest + ".part"
+            # stream rather than build a second copy: transcripts run to hundreds of MB
             with open(tmp, "wb") as f:
-                f.write(body)
+                for raw in io.BytesIO(body):
+                    s = raw.strip()
+                    if not s:
+                        continue
+                    try:
+                        d = json.loads(s)
+                    except Exception:
+                        f.write(raw)          # keep unparseable lines untouched
+                        continue
+                    if isinstance(d, dict) and d.get("cwd") and d["cwd"] != cwd:
+                        d["cwd"] = cwd
+                        rewritten += 1
+                        f.write(json.dumps(d, ensure_ascii=False).encode() + b"\n")
+                    else:
+                        f.write(raw if raw.endswith(b"\n") else raw + b"\n")
             # transcripts are plaintext and may hold anything a tool printed, so match
             # the 0600 the CLI writes — an upload must not land world-readable.
             os.chmod(tmp, 0o600)
@@ -1280,8 +1302,8 @@ class ImportHandler(AuthMixin, tornado.web.RequestHandler):
         elsewhere = [os.path.basename(os.path.dirname(p))
                      for p in glob.glob(os.path.join(CLAUDE_ROOT, "*", cc + ".jsonl"))
                      if os.path.realpath(p) != os.path.realpath(dest)]
-        self.write(json.dumps({"ok": True, "cc": cc, "cwd": cwd,
-                               "bytes": len(body), "also_in": elsewhere}))
+        self.write(json.dumps({"ok": True, "cc": cc, "cwd": cwd, "bytes": len(body),
+                               "rewritten": rewritten, "also_in": elsewhere}))
 
 
 class SearchHandler(AuthMixin, tornado.web.RequestHandler):
@@ -2563,6 +2585,8 @@ pre code{background:none;border:none;padding:0}
 #impbtn{width:100%;background:var(--bg3);color:var(--acc);font-weight:700;
   border:1px solid var(--acc);border-radius:6px;padding:7px;font-size:13px;cursor:pointer}
 #impbtn:hover{background:var(--acc);color:var(--onacc)}
+#imphint{font-size:10.5px;color:var(--mut);line-height:1.3;word-break:break-all}
+#imphint.bad{color:#d08b2a}
 #impmsg{font-size:11px;color:var(--dim);line-height:1.35;word-break:break-word}
 #impmsg:empty{display:none}   /* no dead gap when there is nothing to report */
 #impmsg.bad{color:#f5483b}
@@ -2648,7 +2672,7 @@ pre code{background:none;border:none;padding:0}
         <select id="mode" title="permission mode"><option value="acceptEdits">⚡ Auto-accept</option><option value="default">🔐 Approve</option><option value="plan">📋 Plan</option><option value="bypassPermissions">⏩ Full auto</option></select>
       </div>
       <button class="newbtn" id="newbtn">＋ New session</button>
-      <div class="impline"><input type="file" id="impfile" accept=".jsonl,application/x-ndjson" hidden><button id="impbtn" title="adopt a .jsonl transcript exported from another machine — it lands in the folder above">Import session</button><span id="impmsg"></span></div>
+      <div class="impline"><input type="file" id="impfile" accept=".jsonl,application/x-ndjson" hidden><button id="impbtn" title="adopt a .jsonl transcript exported from another machine — it lands in the folder above">Import session</button><span id="imphint"></span><span id="impmsg"></span></div>
     </div>
     <div class="sb-sec">
       <div class="sb-h">Live <span id="liveN" class="cnt">0</span></div>
@@ -3465,19 +3489,40 @@ function wireSearch(){
 function impMsg(t,bad){const el=$('#impmsg');if(!el)return;
   el.textContent=t||'';el.classList.toggle('bad',!!bad);
   if(t&&!bad)setTimeout(()=>{if(el.textContent===t)el.textContent='';},6000);}
+/* An import's target folder is the one selected above, the same control New session
+   uses — NOT the conversation currently open. That choice decides where the session
+   will live and resume, and it used to be invisible at the moment of clicking, so it
+   is now shown under the button at all times and confirmed before anything uploads. */
 function importTarget(){return (($('#cwd').value||'').trim())||$('#project').value||'';}
+/* HOMEDIR arrives asynchronously from /api/projects; guard it, because
+   ''.replace('','~') would prepend a tilde and show /data/x as ~/data/x. */
+function shortPath(p){p=p||'';
+  return (HOMEDIR&&p.startsWith(HOMEDIR))?('~'+p.slice(HOMEDIR.length)):p;}
+function refreshImportHint(){
+  const el=$('#imphint');if(!el)return;
+  const d=importTarget();
+  el.textContent=d?('→ '+shortPath(d)):'→ pick a project folder above first';
+  el.classList.toggle('bad',!d);}
 function wireImport(){
   const btn=$('#impbtn'),inp=$('#impfile');if(!btn||!inp)return;
+  refreshImportHint();
+  ['#project','#cwd'].forEach(s=>{const el=$(s);if(!el)return;
+    el.addEventListener('change',refreshImportHint);
+    el.addEventListener('input',refreshImportHint);});
   btn.onclick=()=>{if(!importTarget()){impMsg('pick a project folder above first',true);return;}
     inp.click();};
   inp.onchange=()=>{const f=inp.files&&inp.files[0];if(!f){return;}
     const dir=importTarget();
     if(!dir){impMsg('pick a project folder above first',true);inp.value='';return;}
+    if(!confirm('Import this conversation into\n\n    '+shortPath(dir)+
+                '\n\nfile: '+f.name+'\n\nIt will resume in that folder. To use a different one, '
+                +'cancel and change the project selector above.')){
+      impMsg('import cancelled');inp.value='';return;}
     const fd=new FormData();fd.append('file',f);fd.append('cwd',dir);
-    impMsg('importing '+f.name+' …');
+    impMsg('importing '+f.name+' → '+shortPath(dir)+' …');
     fetch('api/import',{method:'POST',body:fd}).then(r=>r.json().then(j=>({ok:r.ok,j})))
       .then(({ok,j})=>{
-        if(ok&&j.ok){impMsg('✓ imported · resume it from the list below');loadPast();}
+        if(ok&&j.ok){impMsg('✓ imported into '+shortPath(j.cwd||dir)+' · resume it below');loadPast();}
         else impMsg('✗ '+((j&&j.error)||'import failed'),true);})
       .catch(e=>impMsg('✗ '+e,true))
       .finally(()=>{inp.value='';});};}
@@ -3755,6 +3800,7 @@ $('#cwd').addEventListener('keydown',e=>{const b=$('#cwdac');if(!b.classList.con
   sel.value=first?first.path:'__custom__';
   $('#cwdwrap').classList.toggle('show',sel.value==='__custom__');
   loadPast();
+  refreshImportHint();   /* HOMEDIR and the default project are only known now */
 }catch(e){}})();
 
 setInterval(()=>reqList(),8000);
