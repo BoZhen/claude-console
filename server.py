@@ -597,6 +597,199 @@ def list_favorites():
     return out
 
 
+# ─────────────────── projects (the sidebar groups by folder) ───────────────────
+#
+# A "project" is one folder. Its sessions are the transcripts whose cwd is EXACTLY
+# that folder — a subfolder is a separate project, so opening several sessions in
+# one directory collects them under one heading instead of scattering them
+# through a flat recency list. Folders reach the sidebar two ways: they already
+# hold a session, or they were pinned through Import folder.
+
+PROJECTS_FILE = os.path.join(HOME, ".claude", "console-projects.json")
+_projmeta_cache = {"mtime": -1.0, "v": {}}
+
+
+def load_project_meta():
+    """Per-folder metadata {abs_path: {name, fav, pinned, ts}}. Cached by mtime."""
+    try:
+        m = os.path.getmtime(PROJECTS_FILE)
+    except OSError:
+        _projmeta_cache["mtime"], _projmeta_cache["v"] = -1.0, {}
+        return _projmeta_cache["v"]
+    if m != _projmeta_cache["mtime"]:
+        try:
+            with open(PROJECTS_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+            _projmeta_cache["v"] = d if isinstance(d, dict) else {}
+        except Exception:
+            _projmeta_cache["v"] = {}
+        _projmeta_cache["mtime"] = m
+    return _projmeta_cache["v"]
+
+
+def save_project_meta(path, name=None, fav=None, pinned=None):
+    """Persist one folder's label / star / pin. Dropping every flag removes the
+    entry, so an unpinned, unstarred, unrenamed folder leaves no residue."""
+    path = _norm_dir(path)
+    if not path:
+        return False
+    meta = load_project_meta()
+    cur = meta.get(path)
+    cur = dict(cur) if isinstance(cur, dict) else {}
+    if name is not None:
+        name = (name or "").strip()[:120]
+        if name:
+            cur["name"] = name
+        else:
+            cur.pop("name", None)
+    if fav is not None:
+        if fav:
+            cur["fav"] = True
+            cur.setdefault("ts", time.time())
+        else:
+            cur.pop("fav", None)
+    if pinned is not None:
+        if pinned:
+            cur["pinned"] = True
+            cur.setdefault("ts", time.time())
+        else:
+            cur.pop("pinned", None)
+    if not cur.get("fav") and not cur.get("pinned"):
+        cur.pop("ts", None)
+    if cur == meta.get(path):
+        return True
+    meta = dict(meta)
+    if cur:
+        meta[path] = cur
+    else:
+        meta.pop(path, None)
+    return _write_project_meta(meta)
+
+
+def _write_project_meta(meta):
+    try:
+        os.makedirs(os.path.dirname(PROJECTS_FILE), exist_ok=True)
+        tmp = PROJECTS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False)
+        os.replace(tmp, PROJECTS_FILE)
+        _projmeta_cache["mtime"] = -1.0
+        return True
+    except Exception:
+        return False
+
+
+FAV_MIGRATION_KEY = "#migrated_session_favs"
+
+
+def migrate_session_favs_to_projects():
+    """One-off: favorites used to be per session, they are per folder now. Lift
+    every existing session star onto the folder that session ran in, so the
+    Favorites list survives the change instead of starting empty. A marker in the
+    same file makes this idempotent, so a folder the user later unstars is never
+    resurrected on the next start."""
+    meta = load_project_meta()
+    if meta.get(FAV_MIGRATION_KEY):
+        return 0
+    moved = set()
+    for f in list_favorites():
+        path = _norm_dir(f.get("cwd"))
+        if path and not _is_junk(path):
+            moved.add(path)
+    for path in moved:
+        save_project_meta(path, fav=True)
+    meta = dict(load_project_meta())
+    meta[FAV_MIGRATION_KEY] = True
+    _write_project_meta(meta)
+    return len(moved)
+
+
+def _norm_dir(p):
+    """Absolute, symlink-resolved directory path, or "" when it isn't one.
+    Blank input returns "" rather than the process cwd, which is what
+    os.path.realpath("") would hand back."""
+    p = (p or "").strip()
+    if not p:
+        return ""
+    try:
+        p = os.path.realpath(os.path.expanduser(p))
+    except Exception:
+        return ""
+    return p if p and os.path.isdir(p) else ""
+
+
+def short_path(p):
+    """The subtitle shown under a project name: parent/current, never the full
+    path. $HOME collapses to ~ so a session opened in the home dir reads as ~."""
+    if p == HOME:
+        return "~"
+    rel = p[len(HOME) + 1:] if p.startswith(HOME + os.sep) else p.lstrip(os.sep)
+    parts = [x for x in rel.split(os.sep) if x]
+    return os.sep.join(parts[-2:]) if parts else p
+
+
+_scan_cache = {"t": 0.0, "v": {}}
+
+
+def _sessions_by_folder(force=False):
+    """{folder: [session, ...]} over every claude transcript, newest first.
+    Grouping is by exact folder. ~0.25s over 875 transcripts, and it runs on every
+    sidebar refresh, so it is cached for a few seconds. _is_junk drops the
+    ~/.claude-mem observer artifacts, which are the large majority of the files."""
+    now = time.monotonic()
+    if not force and _scan_cache["v"] and now - _scan_cache["t"] < 6:
+        return _scan_cache["v"]
+    names = load_names()
+    out = {}
+    for s in list_sessions(2000):
+        if s.get("source") != "claude":
+            continue
+        folder = _norm_dir(s.get("cwd"))
+        if not folder or _is_junk(folder):
+            continue
+        cc = os.path.splitext(os.path.basename(s["id"]))[0]
+        if not cc:
+            continue
+        out.setdefault(folder, []).append({
+            "cc": cc, "cwd": s.get("cwd") or folder,
+            "title": names.get(cc) or s.get("title", ""),
+            "mtime": s.get("mtime", 0),
+        })
+    _scan_cache["v"], _scan_cache["t"] = out, now
+    return out
+
+
+def project_tree(force=False):
+    """The sidebar payload. One entry per folder, most recently touched first.
+    Pinned and starred folders appear even with no sessions on disk yet."""
+    by_folder = _sessions_by_folder(force)
+    meta = load_project_meta()
+    folders = set(by_folder)
+    for path, m in meta.items():
+        if not isinstance(m, dict):
+            continue          # the migration marker, not a folder
+        if (m.get("fav") or m.get("pinned")) and os.path.isdir(path):
+            folders.add(path)
+    out = []
+    for path in folders:
+        sessions = by_folder.get(path, [])
+        m = meta.get(path)
+        m = m if isinstance(m, dict) else {}
+        out.append({
+            "path": path,
+            "name": m.get("name") or os.path.basename(path) or path,
+            "sub": short_path(path),
+            "fav": bool(m.get("fav")),
+            "pinned": bool(m.get("pinned")),
+            "renamed": bool(m.get("name")),
+            "mtime": max([x["mtime"] for x in sessions], default=m.get("ts", 0)),
+            "sessions": sessions[:60],
+            "n": len(sessions),
+        })
+    out.sort(key=lambda x: x.get("mtime", 0), reverse=True)
+    return out
+
+
 _usage_cache = {"t": 0.0, "v": None}
 
 def fetch_usage():
@@ -1159,6 +1352,40 @@ class ResumableHandler(AuthMixin, tornado.web.RequestHandler):
         self.set_header("Content-Type", "application/json")
         cwd = self.get_argument("cwd", "") or None
         self.write(json.dumps({"resumable": list_resumable(cwd)}))
+
+
+class TreeHandler(AuthMixin, tornado.web.RequestHandler):
+    """The project-grouped sidebar: folders, each with the sessions it owns."""
+    def get(self):
+        self.set_header("Content-Type", "application/json")
+        self.write(json.dumps({"projects": project_tree()}))
+
+
+class PinFolderHandler(AuthMixin, tornado.web.RequestHandler):
+    """Import folder: register a directory as a project so it shows in the
+    sidebar before it owns any session."""
+    def post(self):
+        self.set_header("Content-Type", "application/json")
+        try:
+            body = json.loads(self.request.body or b"{}")
+        except Exception:
+            body = {}
+        raw = (body.get("path") or "").strip()
+        path = _norm_dir(raw)
+        if not path:
+            self.write(json.dumps({"ok": False, "error": "not a directory: " + (raw or "(empty)")}))
+            return
+        home = os.path.realpath(HOME)
+        if not (path == home or path.startswith(home + os.sep)):
+            self.write(json.dumps({"ok": False, "error": "outside $HOME"}))
+            return
+        if _is_junk(path):
+            self.write(json.dumps({"ok": False, "error": "runtime/cache directory"}))
+            return
+        ok = save_project_meta(path, pinned=True)
+        self.write(json.dumps({"ok": bool(ok), "path": path,
+                               "name": os.path.basename(path) or path,
+                               "sub": short_path(path)}))
 
 
 class DirCompleteHandler(AuthMixin, tornado.web.RequestHandler):
@@ -2004,6 +2231,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
         self.session = None
         ChatSocket.clients.add(self)
         self._say({"type": "favorites", "favorites": list_favorites()})
+        self._say({"type": "projects", "projects": project_tree()})
 
     def _say(self, obj):
         try:
@@ -2015,6 +2243,13 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
         favs = list_favorites()
         for ws in list(ChatSocket.clients):
             ws._say({"type": "favorites", "favorites": favs})
+
+    def _broadcast_tree(self, rescan=False):
+        """Push the project-grouped sidebar to every device. `rescan` forces a
+        disk re-scan; metadata-only edits (star, rename, pin) reuse the cache."""
+        tree = project_tree(force=rescan)
+        for ws in list(ChatSocket.clients):
+            ws._say({"type": "projects", "projects": tree})
 
     async def on_message(self, raw):
         try:
@@ -2174,6 +2409,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             self._say({"type": "resumable_deleted", "cc": cc,
                        "ok": bool(res.get("ok")), "error": res.get("error")})
             self._broadcast_favorites()
+            self._broadcast_tree(rescan=True)
         elif mt == "set_favorite":
             # Star/unstar a session; persisted server-side and broadcast so every
             # device shares one favorites list. Starring carries a metadata snapshot.
@@ -2187,6 +2423,22 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                 else:
                     save_pref(cc, fav=False)
                 self._broadcast_favorites()
+        elif mt == "proj_fav":
+            # Star/unstar a FOLDER. Favorites are project-level now: a starred
+            # project keeps every session it owns, instead of pinning one thread.
+            if save_project_meta(msg.get("path"), fav=bool(msg.get("fav"))):
+                self._broadcast_tree()
+        elif mt == "proj_rename":
+            # Sidebar ✎ on a project: label the folder. Empty name resets to basename.
+            if save_project_meta(msg.get("path"), name=msg.get("name") or ""):
+                self._broadcast_tree()
+        elif mt == "proj_unpin":
+            # Drop an imported folder. Only removes the sidebar entry; a folder
+            # that still owns sessions keeps showing up through the disk scan.
+            if save_project_meta(msg.get("path"), pinned=False, fav=False):
+                self._broadcast_tree()
+        elif mt == "proj_refresh":
+            self._broadcast_tree(rescan=True)
         elif mt == "rename":
             # Sidebar ✎: set/clear a custom label for a session (by claude id).
             cc = msg.get("cc")
@@ -2195,6 +2447,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "name": (msg.get("name") or "").strip()[:120], "ok": bool(ok)})
             if ok:
                 self._broadcast_favorites()   # a renamed session may be starred → refresh every device's list
+                self._broadcast_tree(rescan=True)   # the session title shows in its project too
         elif mt == "end":
             # End a specific session by id (sidebar ✕) or the active one.
             # Ending a background session never disturbs the active stream.
@@ -2214,7 +2467,8 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                 self._say({"type": "ended", "id": cur.id})
         elif mt == "list":
             self._say({"type": "sessions", "sessions": [
-                {"id": s.id, "cwd": s.cwd, "name": os.path.basename(s.cwd) or s.cwd,
+                {"id": s.id, "cwd": s.cwd, "root": _norm_dir(s.cwd) or s.cwd,
+                 "name": os.path.basename(s.cwd) or s.cwd,
                  "cc": s.cc_id, "model": s.model or "default", "mode": s.mode,
                  "effort": s.effort, "title": s.title(),
                  "busy": s.busy, "ended": s.ended}
@@ -2609,14 +2863,98 @@ pre code{background:none;border:none;padding:0}
 .srow:hover{background:var(--bg3)}
 .srow.active{background:var(--sel);border-left-color:var(--acc)}
 .srow.ended{opacity:.6}
-.srow .sdot{width:7px;height:7px;border-radius:50%;background:var(--mut);flex-shrink:0}
-.srow .sdot.on{background:var(--add)}
-.srow .sdot.busy{background:var(--tool);box-shadow:0 0 5px var(--tool);animation:pulse 1s infinite}
+.srow .sdot,.prow .sdot{width:7px;height:7px;border-radius:50%;background:var(--mut);flex-shrink:0}
+.srow .sdot.on,.prow .sdot.on{background:var(--add)}
+.srow .sdot.busy,.prow .sdot.busy{background:var(--tool);box-shadow:0 0 5px var(--tool);animation:pulse 1s infinite}
 .srow .smeta{flex:1;min-width:0}
 .srow .sname{font-size:12.5px;color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .srow .ssub{font-size:11px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .srow .skebab{flex-shrink:0;font-size:18px;line-height:1;padding:1px 6px;color:var(--fg);cursor:pointer;opacity:.9;border-radius:5px;user-select:none}
 .srow:hover .skebab{opacity:1}.srow .skebab:hover{color:var(--acc);background:var(--bg3)}
+/* project groups — the sidebar is grouped by folder, so a row is a project and
+   the sessions it owns nest under it. A project is Live when one of its sessions
+   is running, which is why the Live section lists folders, not threads. */
+.pgroup{border-left:2px solid transparent}
+.prow{padding:6px 9px;cursor:pointer;display:flex;gap:7px;align-items:center;user-select:none}
+.prow:hover{background:var(--bg3)}
+.prow .caret{display:inline-flex;align-items:center;justify-content:center;flex:none;
+  width:15px;height:15px;border-radius:5px;color:var(--fg);opacity:.65;transition:opacity .15s}
+.prow .caret::before{content:"";width:6px;height:6px;border-right:2px solid currentColor;
+  border-bottom:2px solid currentColor;border-radius:1.5px;
+  transform:translate(-2px,0) rotate(-45deg);transition:transform .2s ease}
+.pgroup.open .prow .caret::before{transform:translate(-1px,-2px) rotate(45deg)}
+.prow:hover .caret{opacity:1}
+.prow .pmeta{flex:1;min-width:0}
+.prow .pname{font-size:12.5px;font-weight:600;color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.prow .pstar{color:var(--tool);font-size:11px}
+.prow .psub{font-size:11px;color:var(--mut);font-family:ui-monospace,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.prow .pn{flex:none;font-size:10px;color:var(--mut);background:var(--bg3);border:1px solid var(--line);
+  border-radius:8px;padding:0 6px;line-height:15px}
+.pgroup .plist{display:none}
+.pgroup.open .plist{display:block}
+.pgroup .plist .srow{padding-left:31px;border-left:none}
+.pgroup .plist .srow .sname{font-size:12px}
+.pgroup .plist .sb-empty{padding-left:31px;font-size:11px}
+
+/* Manage sessions — a project can accumulate a lot of threads (sub-agents in
+   particular), so the ⋮ menu opens a checklist for deleting several at once. */
+#pman{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.55);
+  display:flex;justify-content:center;align-items:flex-start;padding:9vh 16px 16px}
+#pman[hidden]{display:none}
+#pmanpanel{width:min(680px,100%);max-height:78vh;display:flex;flex-direction:column;
+  background:var(--bg2);border:1px solid var(--line);border-radius:10px;
+  box-shadow:0 18px 60px rgba(0,0,0,.5);overflow:hidden}
+#pman .pmsub{flex:1;min-width:0;font-family:ui-monospace,monospace;font-size:11.5px;color:var(--mut);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pmbar{display:flex;align-items:center;gap:10px;padding:7px 12px;
+  border-bottom:1px solid var(--line);font-size:12px;color:var(--mut)}
+.pmbar label{display:flex;align-items:center;gap:6px;cursor:pointer;color:var(--fg);user-select:none}
+.pmbar .grow{flex:1}
+#pmanlist{flex:1;min-height:0;overflow:auto}
+.pmrow{display:flex;align-items:center;gap:9px;padding:7px 12px;
+  border-bottom:1px solid var(--line);cursor:pointer}
+.pmrow:hover{background:var(--bg3)}
+.pmrow:last-child{border-bottom:none}
+.pmrow input{flex:none;cursor:pointer;width:15px;height:15px;accent-color:var(--acc)}
+.pmrow .pmmeta{flex:1;min-width:0}
+.pmrow .pmt{font-size:12.5px;color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pmrow .pmd{font-size:11px;color:var(--mut);font-family:ui-monospace,monospace}
+.pmrow .pmlive{flex:none;font-size:10px;color:var(--addfg);border:1px solid var(--add);
+  border-radius:8px;padding:0 6px;line-height:15px}
+#pmandel{background:var(--nobg);color:var(--delfg);border:1px solid var(--del)}
+#pmandel:disabled{opacity:.45;cursor:not-allowed}
+
+/* Import folder — pick a directory and it becomes a sidebar project even before
+   it owns a session. Same dircomplete backend as the custom-path box. */
+#fimp{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.55);
+  display:flex;justify-content:center;align-items:flex-start;padding:12vh 16px 16px}
+#fimp[hidden]{display:none}
+#fimppanel{width:min(620px,100%);max-height:70vh;display:flex;flex-direction:column;
+  background:var(--bg2);border:1px solid var(--line);border-radius:10px;
+  box-shadow:0 18px 60px rgba(0,0,0,.5);overflow:hidden}
+#fimp .fh,#pman .fh{display:flex;gap:10px;align-items:baseline;padding:10px 12px;
+  border-bottom:1px solid var(--line)}
+#fimp .fh .ft{flex:1;font-size:13px;font-weight:600;color:var(--fg)}
+#pman .fh .ft{flex:none;font-size:13px;font-weight:600;color:var(--fg);white-space:nowrap}
+#pman .fh .btn{align-self:center}
+#fimpq{width:100%;background:var(--bg3);color:var(--fg);border:1px solid var(--line);
+  border-radius:6px;padding:9px 11px;font-size:13px;font-family:ui-monospace,monospace;outline:none}
+#fimpq:focus{border-color:var(--acc)}
+#fimp .fbody{padding:10px;display:flex;flex-direction:column;gap:8px;min-height:0}
+#fimpac{flex:1;min-height:0;overflow:auto;border:1px solid var(--line);border-radius:6px;background:var(--bg)}
+#fimpmsg{font-size:11.5px;color:var(--mut);min-height:1em}
+#fimpmsg.bad{color:var(--delfg)}
+#fimp .fbtns,#pman .fbtns{display:flex;gap:8px;justify-content:flex-end;padding:10px}
+#pman .fbtns{border-top:1px solid var(--line)}
+#fimp .fbtns button,#pman .fbtns button{padding:7px 14px;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer}
+#fimp .fadd{background:var(--acc);color:var(--onacc);border:none}
+#fimp .fcancel,#pman .fcancel{background:var(--bg3);color:var(--fg);border:1px solid var(--line)}
+.improw{display:flex;gap:5px}
+.improw button{flex:1;min-width:0}
+#fimpbtn{background:var(--bg3);color:var(--fg);border:1px solid var(--line);
+  border-radius:6px;padding:7px;font-size:13px;cursor:pointer;white-space:nowrap}
+#fimpbtn:hover{border-color:var(--acc);color:var(--acc)}
+
 /* collapsible past-session sections */
 .sb-h.sb-toggle{cursor:pointer;user-select:none}
 .sb-h .caret{display:inline-flex;align-items:center;justify-content:center;flex:none;
@@ -2628,7 +2966,7 @@ pre code{background:none;border:none;padding:0}
 .sb-sec.collapsed .caret::before{transform:translate(-2px,0) rotate(-45deg)}
 .sb-h.sb-toggle:hover .caret{opacity:1;background:var(--bg3)}
 .sb-sec.collapsed .seclist{display:none}
-.seclist{max-height:266px;overflow-y:auto}
+/* project groups expand in place, so the section must not be its own scroll\n   box — a nested scrollbar swallows the sessions you just expanded. The\n   sidebar itself scrolls instead. */\n.seclist{max-height:none}
 /* shared per-card action menu (⋯) */
 #cardMenu{position:fixed;z-index:60;min-width:152px;background:var(--bg2);border:1px solid var(--line);border-radius:8px;box-shadow:0 8px 26px rgba(0,0,0,.55);padding:4px;display:none}
 #cardMenu.on{display:block}
@@ -2672,23 +3010,19 @@ pre code{background:none;border:none;padding:0}
         <select id="mode" title="permission mode"><option value="acceptEdits">⚡ Auto-accept</option><option value="default">🔐 Approve</option><option value="plan">📋 Plan</option><option value="bypassPermissions">⏩ Full auto</option></select>
       </div>
       <button class="newbtn" id="newbtn">＋ New session</button>
-      <div class="impline"><input type="file" id="impfile" accept=".jsonl,application/x-ndjson" hidden><button id="impbtn" title="adopt a .jsonl transcript exported from another machine — it lands in the folder above">Import session</button><span id="imphint"></span><span id="impmsg"></span></div>
+      <div class="impline"><div class="improw"><input type="file" id="impfile" accept=".jsonl,application/x-ndjson" hidden><button id="impbtn" title="adopt a .jsonl transcript exported from another machine — it lands in the folder above">Import session</button><button id="fimpbtn" title="add a folder to the sidebar as a project">Import folder</button></div><span id="imphint"></span><span id="impmsg"></span></div>
     </div>
     <div class="sb-sec">
       <div class="sb-h">Live <span id="liveN" class="cnt">0</span></div>
-      <div id="liveList"><div class="sb-empty">none running</div></div>
+      <div id="liveList"><div class="sb-empty">no active project</div></div>
     </div>
     <div class="sb-sec" id="secFav">
       <div class="sb-h sb-toggle"><span class="caret"></span>★ Favorites <span id="favN" class="cnt">0</span></div>
-      <div id="favList" class="seclist"><div class="sb-empty">star a session to pin it here</div></div>
+      <div id="favList" class="seclist"><div class="sb-empty">star a project to pin it here</div></div>
     </div>
     <div class="sb-sec" id="secRecent">
-      <div class="sb-h sb-toggle"><span class="caret"></span>🕘 Recent <span class="grow"></span><span class="sb-ref" id="resumeRef" title="refresh">↻</span></div>
+      <div class="sb-h sb-toggle"><span class="caret"></span>🕘 Recent <span class="grow"></span><span class="sb-ref" id="resumeRef" title="rescan">↻</span></div>
       <div id="recentList" class="seclist"><div class="sb-empty">—</div></div>
-    </div>
-    <div class="sb-sec" id="secFolder">
-      <div class="sb-h sb-toggle"><span class="caret"></span>📁 In folder <span class="grow"></span><span id="folderScope" class="fscope"></span></div>
-      <div id="folderList" class="seclist"><div class="sb-empty">—</div></div>
     </div>
     <div class="sb-foot">
       <span class="sb-foot-l">Theme</span>
@@ -2759,6 +3093,31 @@ pre code{background:none;border:none;padding:0}
   <div class="dc" id="edits"><div class="empty">no file changes yet</div></div>
   <div class="dc" id="gitc" style="display:none"><div class="empty">—</div></div>
 </div>
+<div id="pman" hidden>
+  <div id="pmanpanel">
+    <div class="fh"><span class="ft">☑ Manage</span><span id="pmansub" class="pmsub"></span>
+      <button class="btn" id="pmanx" title="close">✕</button></div>
+    <div class="pmbar">
+      <label><input type="checkbox" id="pmanall"> Select all</label>
+      <span class="grow"></span><span id="pmancount">0 selected</span>
+    </div>
+    <div id="pmanlist"></div>
+    <div class="fbtns"><button class="fcancel" id="pmanclose">Close</button>
+      <button id="pmandel" disabled>🗑 Delete selected</button></div>
+  </div>
+</div>
+<div id="fimp" hidden>
+  <div id="fimppanel">
+    <div class="fh"><span class="ft">📁 Import folder</span>
+      <button class="btn" id="fimpx" title="close">✕</button></div>
+    <div class="fbody">
+      <input id="fimpq" placeholder="type a path…  ↑↓ to pick, Enter to add" autocomplete="off" spellcheck="false">
+      <div id="fimpac"></div>
+      <div id="fimpmsg"></div>
+      <div class="fbtns"><button class="fcancel" id="fimpcancel">Cancel</button><button class="fadd" id="fimpok">Add project</button></div>
+    </div>
+  </div>
+</div>
 <div id="cardMenu"></div>
 
 <script>
@@ -2770,7 +3129,9 @@ let sid=null, curCC=null, editCount=0, pendingStart=false, reconnectT=0;
 const EFFORTS=['low','medium','high','xhigh','max','ultracode'];
 let curEffort=localStorage.getItem('al_effort')||'max';
 let showThink=false;
-let liveCCs=new Set(), liveSessions=[], recentData=[], folderData=[], favData=[], HOMEDIR='';
+let liveSessions=[], projData=[], HOMEDIR='';
+/* which project groups are expanded — per device, survives reloads */
+let pExp=new Set();try{pExp=new Set(JSON.parse(localStorage.getItem('al_pexp')||'[]'));}catch(e){}
 const EDIT_TOOLS=new Set(['Edit','MultiEdit','Write','NotebookEdit']);
 const SKEY='al_session';
 
@@ -3122,32 +3483,39 @@ function markEnded(msg){ready=false;ta.disabled=true;sendBtn.disabled=true;$('#d
 function onMsg(e){const m=JSON.parse(e.data);
   if(m.type==='started'){pendingStart=false;sid=m.id;cwd=m.cwd;bindProject(m.cwd);localStorage.setItem(SKEY,sid);loadDraft(sid);
     ready=true;setBusy(false);ta.focus();setCurname(m.name||'session');setEffortPill(m.effort);renderCtx(null);statset('ready');
-    addNotice('new session « '+(m.name||'')+' »'+(m.effort?' · '+m.effort+' effort':'')+' in '+m.cwd+' — type your first message to begin');reqList();loadPast();}
+    addNotice('new session « '+(m.name||'')+' »'+(m.effort?' · '+m.effort+' effort':'')+' in '+m.cwd+' — type your first message to begin');reqList();loadTree();}
   else if(m.type==='attached'){clearUI();pendingStart=false;sid=m.id;curCC=m.cc||null;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
     ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));setEffortPill(m.effort);renderCtx(m.ctx);statset(m.ended?'ended':'ready');
     replaying=true;m.events.forEach(route);replaying=false;
     compacting=!!m.compacting;setBusy(!!m.busy,m.word,(m.turn_age||0)*1000);loadDraft(sid);
     if(m.ended){markEnded('— this session has ended (history shown · you can resume it from disk) —');}
     else{ta.disabled=false;sendBtn.disabled=false;addNotice('— '+(m.resumed?'resumed':'reattached to')+' « '+(m.name||'')+' » ('+m.events.length+' events)'+(m.effort?' with '+m.effort+' effort':'')+' —');}
-    scroll();requestAnimationFrame(scroll);reqList();loadPast();}
+    scroll();requestAnimationFrame(scroll);reqList();loadTree();}
   else if(m.type==='no_session'){localStorage.removeItem(SKEY);sid=null;ready=false;setBusy(false);setCurname('');renderCtx(null);statset('idle');
-    addNotice('that session is no longer running — pick it under “Resume from disk”, or ＋ New.');reqList();loadPast();}
+    addNotice('that session is no longer running — pick it under “Resume from disk”, or ＋ New.');reqList();loadTree();}
   else if(m.type==='events')m.events.forEach(route);
   else if(m.type==='stderr')addErr(m.text);
   else if(m.type==='error'){pendingStart=false;addErr('⚠ '+m.error);}
-  else if(m.type==='exit'){if(!pendingStart){markEnded('session process exited (code '+m.code+')');setCurname('');}reqList();loadPast();}
-  else if(m.type==='ended'){dropDraft(m.id);if(m.id&&m.id===sid){sid=null;setCurname('');markEnded('session ended');}reqList();loadPast();}
-  else if(m.type==='resumable_deleted'){addNotice(m.ok?'🗑 session moved to trash':('delete failed: '+(m.error||'?')));loadPast();}
-  else if(m.type==='renamed'){if(m.ok){if(m.cc&&m.cc===curCC&&m.name)setCurname(m.name);addNotice('✎ renamed');reqList();loadPast();}else addNotice('rename failed');}
+  else if(m.type==='exit'){if(!pendingStart){markEnded('session process exited (code '+m.code+')');setCurname('');}reqList();loadTree();}
+  else if(m.type==='ended'){dropDraft(m.id);if(m.id&&m.id===sid){sid=null;setCurname('');markEnded('session ended');}reqList();loadTree();}
+  else if(m.type==='resumable_deleted'){
+    if(pmanBatch){pmanBatch.done++;
+      if(m.ok)pmanBatch.ok++;else pmanBatch.err.push(m.error||'?');
+      if(pmanBatch.done>=pmanBatch.n){
+        addNotice('🗑 '+pmanBatch.ok+'/'+pmanBatch.n+' session'+(pmanBatch.n>1?'s':'')+' moved to trash'+
+          (pmanBatch.err.length?(' · '+pmanBatch.err.length+' failed: '+pmanBatch.err[0]):''));
+        pmanBatch=null;reqList();loadTree();}}
+    else{addNotice(m.ok?'🗑 session moved to trash':('delete failed: '+(m.error||'?')));loadTree();}}
+  else if(m.type==='renamed'){if(m.ok){if(m.cc&&m.cc===curCC&&m.name)setCurname(m.name);addNotice('✎ renamed');reqList();loadTree();}else addNotice('rename failed');}
   else if(m.type==='sessions')renderLive(m.sessions);
   else if(m.type==='context')renderCtx(m.ctx);
   else if(m.type==='tokens'){tokUp=m.up||0;tokOut=m.out||0;tokShow=true;
     if(m.word!=null&&m.word!==lastWordSeed){lastWordSeed=m.word;if(running&&!compacting)setWord(m.word);}}
-  else if(m.type==='favorites'){favData=m.favorites||[];renderPast();}
+  else if(m.type==='projects'){projData=m.projects||[];renderSidebar();}
 }
 function openWs(cb){const proto=location.protocol==='https:'?'wss:':'ws:';
   ws=new WebSocket(proto+'//'+location.host+'/ws/chat');
-  ws.onopen=()=>{clearTimeout(reconnectT);$('#dot').className='dot '+(ready?'on':'');if(cb)cb();reqList();maybeMigrateFavs();
+  ws.onopen=()=>{clearTimeout(reconnectT);$('#dot').className='dot '+(ready?'on':'');if(cb)cb();reqList();
     const saved=localStorage.getItem(SKEY);if(saved&&!sid&&!pendingStart){statset('reattaching…');ws.send(JSON.stringify({type:'attach',id:saved}));}};
   ws.onclose=()=>{$('#dot').className='dot';statset('disconnected');ta.disabled=true;sendBtn.disabled=true;
     clearTimeout(reconnectT);reconnectT=setTimeout(()=>openWs(),1800);};
@@ -3289,68 +3657,208 @@ function toggleSec(id){const el=$('#'+id);if(!el)return;el.classList.toggle('col
   let c={};try{c=JSON.parse(localStorage.getItem(SECKEY)||'{}');}catch(e){}
   c[id]=el.classList.contains('collapsed');localStorage.setItem(SECKEY,JSON.stringify(c));}
 function applySecCollapse(){let c={};try{c=JSON.parse(localStorage.getItem(SECKEY)||'{}');}catch(e){}
-  ['secFav','secRecent','secFolder'].forEach(id=>{const el=$('#'+id);if(el)el.classList.toggle('collapsed',!!c[id]);});}
+  ['secFav','secRecent'].forEach(id=>{const el=$('#'+id);if(el)el.classList.toggle('collapsed',!!c[id]);});}
 
-function renderLive(list){const box=$('#liveList');
-  liveCCs=new Set(list.map(s=>s.cc).filter(Boolean));liveSessions=list;
-  $('#liveN').textContent=list.length;
-  if(!list.length){box.innerHTML='<div class="sb-empty">none running — pick a project, ＋ New</div>';}
-  else{box.innerHTML='';list.forEach(s=>{
-    const r=document.createElement('div');
-    r.className='srow'+(s.id===sid?' active':'')+(s.ended?' ended':'');
-    const proj=(s.cwd||'').split('/').slice(-2).join('/');
-    const dot=s.busy?'busy':(s.ended?'':'on');
-    r.innerHTML='<span class="sdot '+dot+'"></span><div class="smeta">'+
-      '<div class="sname">'+esc(s.title||s.name||'new session')+(s.ended?' · ended':'')+'</div>'+
-      '<div class="ssub">'+esc(proj)+(s.busy?' · working…':'')+'</div></div>'+
-      '<span class="skebab" title="more">⋮</span>';
-    r.querySelector('.smeta').onclick=()=>switchSession(s.id);
-    r.querySelector('.sdot').onclick=()=>switchSession(s.id);
-    r.querySelector('.skebab').onclick=ev=>{ev.stopPropagation();const kebab=ev.currentTarget;const items=[
-      {label:'⚙ Configure',fn:()=>openConfigure(s,kebab)},
+function renderLive(list){liveSessions=list||[];renderSidebar();}
+
+/* ── project-grouped sidebar ──────────────────────────────────────────────
+   A sidebar row is a FOLDER, and the sessions whose cwd is exactly that folder
+   nest under it (a subfolder is its own project). Live therefore answers "which
+   projects am I working in" rather than "which threads are open": a project is
+   Live when at least one of its sessions is running. Favorites and Recent are
+   likewise folder-level. Server data arrives as `projects`; live sessions arrive
+   separately over the socket and are merged in here, because a brand-new session
+   has no transcript on disk yet. */
+
+function saveExp(){try{localStorage.setItem('al_pexp',JSON.stringify([...pExp]));}catch(e){}}
+
+function shortPath(p){   /* mirrors the server: parent/current, $HOME as ~ */
+  if(!p)return '';
+  if(HOMEDIR&&p===HOMEDIR)return '~';
+  const rel=(HOMEDIR&&p.indexOf(HOMEDIR+'/')===0)?p.slice(HOMEDIR.length+1):p.replace(/^\/+/,'');
+  const parts=rel.split('/').filter(Boolean);
+  return parts.slice(-2).join('/')||p;}
+
+function buildProjects(){
+  const liveBy={};
+  (liveSessions||[]).forEach(s=>{const k=s.root||s.cwd||'';if(k)(liveBy[k]=liveBy[k]||[]).push(s);});
+  const by={};
+  (projData||[]).forEach(p=>{by[p.path]=Object.assign({},p,{sessions:(p.sessions||[]).slice()});});
+  /* a folder the server hasn't indexed yet still needs a row */
+  Object.keys(liveBy).forEach(k=>{if(!by[k])by[k]={path:k,
+    name:(k.split('/').filter(Boolean).slice(-1)[0]||k),sub:shortPath(k),
+    fav:false,pinned:false,mtime:Date.now()/1000,sessions:[]};});
+  const now=Date.now()/1000;
+  return Object.keys(by).map(k=>{const p=by[k];
+    p.liveS=liveBy[k]||[];
+    const lcc=new Set(p.liveS.map(x=>x.cc).filter(Boolean));
+    p.past=(p.sessions||[]).filter(x=>!lcc.has(x.cc));
+    p.isLive=p.liveS.some(x=>!x.ended);
+    p.anyBusy=p.liveS.some(x=>x.busy);
+    p.total=p.liveS.length+p.past.length;
+    p.sortKey=p.liveS.length?now:(p.mtime||0);
+    return p;}).sort((a,b)=>(b.sortKey||0)-(a.sortKey||0));}
+
+function renderSidebar(){
+  const all=buildProjects();
+  const live=all.filter(p=>p.isLive);
+  const fav=all.filter(p=>!p.isLive&&p.fav);
+  const rest=all.filter(p=>!p.isLive&&!p.fav).slice(0,40);
+  $('#liveN').textContent=live.length;
+  $('#favN').textContent=fav.length;
+  fillSec('#liveList',live,'no active project — pick a folder, ＋ New session');
+  fillSec('#favList',fav,'star a project to pin it here');
+  fillSec('#recentList',rest,'no projects yet');}
+
+function fillSec(sel,list,empty){const box=$(sel);if(!box)return;
+  if(!list.length){box.innerHTML='<div class="sb-empty">'+esc(empty)+'</div>';return;}
+  box.innerHTML='';list.forEach(p=>box.appendChild(projGroup(p)));}
+
+function projGroup(p){
+  const g=document.createElement('div');
+  g.className='pgroup'+(pExp.has(p.path)?' open':'');
+  const r=document.createElement('div');r.className='prow';
+  r.innerHTML='<span class="caret"></span>'+
+    '<div class="pmeta"><div class="pname">'+esc(p.name)+(p.fav?' <span class="pstar">★</span>':'')+'</div>'+
+    '<div class="psub">'+esc(p.sub||shortPath(p.path))+'</div></div>'+
+    '<span class="pn">'+p.total+'</span><span class="skebab" title="more">⋮</span>';
+  r.onclick=ev=>{if(ev.target.closest('.skebab'))return;
+    if(pExp.has(p.path))pExp.delete(p.path);else pExp.add(p.path);
+    saveExp();g.classList.toggle('open');};
+  r.querySelector('.skebab').onclick=ev=>{ev.stopPropagation();
+    const items=[{label:'＋ New session here',fn:()=>newSessionIn(p.path)},
+      {label:'☑ Manage sessions…',fn:()=>pmanOpen(p)},
+      {label:'✎ Rename project',fn:()=>renameProject(p)},
+      {label:p.fav?'★ Unfavorite':'☆ Favorite',fn:()=>wsSend({type:'proj_fav',path:p.path,fav:!p.fav})}];
+    if(p.pinned)items.push({label:'✕ Remove from sidebar',danger:true,fn:()=>{
+      if(confirm('Remove “'+p.name+'” from the sidebar?\n\nOnly the sidebar entry goes away. '+
+                 'No session and no file is deleted.'))wsSend({type:'proj_unpin',path:p.path});}});
+    toggleCardMenu(ev.currentTarget,items);};
+  g.appendChild(r);
+  const list=document.createElement('div');list.className='plist';
+  p.liveS.forEach(x=>list.appendChild(liveSessRow(x)));
+  p.past.forEach(x=>list.appendChild(pastSessRow(x)));
+  if(!list.children.length)list.innerHTML='<div class="sb-empty">no sessions yet</div>';
+  g.appendChild(list);
+  return g;}
+
+/* a running session: green dot, click to switch to it */
+function liveSessRow(s){const r=document.createElement('div');
+  r.className='srow'+(s.id===sid?' active':'')+(s.ended?' ended':'');
+  const dot=s.busy?'busy':(s.ended?'':'on');
+  r.innerHTML='<span class="sdot '+dot+'"></span><div class="smeta">'+
+    '<div class="sname">'+esc(s.title||s.name||'new session')+'</div></div>'+
+    '<span class="skebab" title="more">⋮</span>';
+  r.querySelector('.smeta').onclick=()=>switchSession(s.id);
+  r.querySelector('.sdot').onclick=()=>switchSession(s.id);
+  r.querySelector('.skebab').onclick=ev=>{ev.stopPropagation();const kebab=ev.currentTarget;
+    const items=[{label:'⚙ Configure',fn:()=>openConfigure(s,kebab)},
       {label:'✎ Rename',fn:()=>renameSession(s.cc,s.title||s.name)}];
-      if(s.cc)items.push({label:isFav(s.cc)?'★ Unfavorite':'☆ Favorite',fn:()=>toggleFav(s)});
-      if(s.cc)items.push({label:'⤓ Export transcript',fn:()=>exportSession(s.cc)});
-      items.push({label:'✕ End session',danger:true,fn:()=>endSessionById(s.id,s.name)});
-      toggleCardMenu(ev.currentTarget,items);};
-    box.appendChild(r);});}
-  renderPast();
-}
+    if(s.cc)items.push({label:'⤓ Export transcript',fn:()=>exportSession(s.cc)});
+    items.push({label:'✕ End session',danger:true,fn:()=>endSessionById(s.id,s.name)});
+    toggleCardMenu(kebab,items);};
+  return r;}
 
-/* favorites: starred sessions, persisted SERVER-SIDE by claude session id so every
-   device shares one list. favData mirrors the server; the server pushes it on connect
-   and re-broadcasts on every change. */
-const FKEY='al_favs';   /* legacy per-device store — read once to migrate, then ignored */
-function getFavs(){return favData;}
-function isFav(cc){return favData.some(f=>f.cc===cc);}
-function toggleFav(s){
-  if(isFav(s.cc)){favData=favData.filter(f=>f.cc!==s.cc);
-    wsSend({type:'set_favorite',cc:s.cc,fav:false});}
-  else{favData=[{cc:s.cc,cwd:s.cwd||'',name:s.name||'',title:s.title||''},...favData];
-    wsSend({type:'set_favorite',cc:s.cc,fav:true,cwd:s.cwd||'',name:s.name||'',title:s.title||''});}
-  renderPast();}
-function maybeMigrateFavs(){   /* one-time: lift this device's old localStorage stars to the server */
-  if(localStorage.getItem('al_favs_migrated'))return;
-  if(!ws||ws.readyState!==1)return;        /* need the socket open; onopen retries */
-  let old=[];try{old=JSON.parse(localStorage.getItem(FKEY)||'[]');}catch(e){}
-  old.forEach(f=>{if(f&&f.cc)wsSend({type:'set_favorite',cc:f.cc,fav:true,
-    cwd:f.cwd||'',name:f.name||'',title:f.title||''});});
-  localStorage.setItem('al_favs_migrated','1');}
-
-/* a past-session row: click to resume; star toggles favorite */
-function pastRow(s,fav){const r=document.createElement('div');r.className='srow';
-  const proj=(s.cwd||'').split('/').slice(-2).join('/');
-  const sub=(fav?'':'↺ ')+esc(proj)+(s.mtime?(' · '+reltime(s.mtime)):'');
-  r.innerHTML='<div class="smeta">'+
-    '<div class="sname">'+esc(s.title||proj||'session')+'</div><div class="ssub">'+sub+'</div></div>'+
+/* an on-disk session: grey dot, click to resume */
+function pastSessRow(s){const r=document.createElement('div');r.className='srow';
+  r.innerHTML='<span class="sdot"></span><div class="smeta">'+
+    '<div class="sname">'+esc(s.title||'session')+'</div>'+
+    '<div class="ssub">↺ '+(s.mtime?esc(reltime(s.mtime)):'resume')+'</div></div>'+
     '<span class="skebab" title="more">⋮</span>';
   r.querySelector('.smeta').onclick=()=>resumeSession(s);
+  r.querySelector('.sdot').onclick=()=>resumeSession(s);
   r.querySelector('.skebab').onclick=ev=>{ev.stopPropagation();toggleCardMenu(ev.currentTarget,[
     {label:'✎ Rename',fn:()=>renameSession(s.cc,s.title)},
-    {label:fav?'★ Unfavorite':'☆ Favorite',fn:()=>toggleFav(s)},
     {label:'⤓ Export transcript',fn:()=>exportSession(s.cc)},
     {label:'🗑 Delete (to trash)',danger:true,fn:()=>delResumable(s)}]);};
   return r;}
+
+function renameProject(p){
+  const nm=prompt('Rename project (leave empty to reset to the folder name):',p.renamed?p.name:'');
+  if(nm===null)return;
+  wsSend({type:'proj_rename',path:p.path,name:nm});}
+
+/* start a session in a specific folder: route through the custom-path box so the
+   picker visibly shows where the new session will run */
+function newSessionIn(path){
+  $('#project').value='__custom__';
+  $('#cwdwrap').classList.add('show');
+  $('#cwd').value=path;
+  $('#newbtn').click();}
+
+/* ── Manage sessions ──────────────────────────────────────────────────────
+   Batch cleanup for one project. Sub-agent threads can pile up dozens deep, and
+   deleting them one ⋮ menu at a time is the wrong tool. Deletion goes through the
+   same del_resumable path as the single-session ⋮ (gio trash, recoverable), and a
+   running session is terminated first by the server. */
+let pmanProj=null, pmanSel=new Set(), pmanBatch=null;
+
+function pmanRows(){
+  if(!pmanProj)return [];
+  return (pmanProj.liveS||[]).map(s=>({cc:s.cc,title:s.title||s.name||'new session',
+                                       live:true,busy:s.busy,ended:s.ended,mtime:0}))
+    .concat((pmanProj.past||[]).map(s=>({cc:s.cc,title:s.title||'session',
+                                         live:false,mtime:s.mtime})));}
+
+function pmanOpen(p){
+  pmanProj=p;pmanSel=new Set();
+  $('#pmansub').textContent=p.name+'  ·  '+(p.sub||'');
+  $('#pman').removeAttribute('hidden');
+  pmanRender();}
+
+function pmanClose(){$('#pman').setAttribute('hidden','');pmanProj=null;pmanSel=new Set();}
+function pmanOpened(){return !$('#pman').hasAttribute('hidden');}
+
+function pmanRender(){
+  const rows=pmanRows(),box=$('#pmanlist');
+  if(!rows.length){box.innerHTML='<div class="sb-empty">no sessions in this project</div>';}
+  else{box.innerHTML='';rows.forEach(x=>{
+    const el=document.createElement('div');el.className='pmrow';
+    const dis=x.cc?'':' disabled title="this session has no transcript yet"';
+    el.innerHTML='<input type="checkbox"'+dis+(x.cc&&pmanSel.has(x.cc)?' checked':'')+'>'+
+      '<div class="pmmeta"><div class="pmt">'+esc(x.title)+'</div>'+
+      '<div class="pmd">'+(x.live?(x.busy?'working…':(x.ended?'ended':'running')):
+                                  ('↺ '+(x.mtime?esc(reltime(x.mtime)):'on disk')))+'</div></div>'+
+      (x.live?'<span class="pmlive">live</span>':'');
+    const cb=el.querySelector('input');
+    const flip=()=>{if(!x.cc)return;
+      if(pmanSel.has(x.cc))pmanSel.delete(x.cc);else pmanSel.add(x.cc);
+      cb.checked=pmanSel.has(x.cc);pmanBar();};
+    el.onclick=ev=>{if(ev.target!==cb)flip();else{cb.checked=!cb.checked;flip();}};
+    box.appendChild(el);});}
+  pmanBar();}
+
+function pmanBar(){
+  const rows=pmanRows().filter(x=>x.cc),n=pmanSel.size;
+  $('#pmancount').textContent=n+' selected';
+  $('#pmandel').disabled=!n;
+  const all=$('#pmanall');
+  all.checked=n>0&&n===rows.length;
+  all.indeterminate=n>0&&n<rows.length;}
+
+function pmanToggleAll(){
+  const rows=pmanRows().filter(x=>x.cc);
+  if(pmanSel.size===rows.length)pmanSel=new Set();
+  else pmanSel=new Set(rows.map(x=>x.cc));
+  pmanRender();}
+
+function pmanDelete(){
+  const ccs=[...pmanSel];if(!ccs.length)return;
+  const liveN=pmanRows().filter(x=>x.live&&pmanSel.has(x.cc)).length;
+  if(!confirm('Delete '+ccs.length+' session'+(ccs.length>1?'s':'')+' from '+
+      (pmanProj?pmanProj.name:'this project')+'?'+
+      (liveN?('\n\n'+liveN+' of them '+(liveN>1?'are':'is')+' still running and will be ended first.'):'')+
+      '\n\nTranscripts move to the trash (recoverable), they are not erased.'))return;
+  pmanBatch={n:ccs.length,done:0,ok:0,err:[]};
+  ccs.forEach(cc=>wsSend({type:'del_resumable',cc:cc}));
+  pmanClose();}
+
+$('#pmanx').onclick=pmanClose;
+$('#pmanclose').onclick=pmanClose;
+$('#pmandel').onclick=pmanDelete;
+$('#pmanall').onclick=pmanToggleAll;
+$('#pman').addEventListener('mousedown',e=>{if(e.target.id==='pman')pmanClose();});
+
 /* export/import: a transcript is a self-contained .jsonl. `claude --resume` finds it
    by FOLDER (derived from the cwd) + FILENAME (the session id) — never by the cwd
    recorded inside — so moving one between machines is a plain file copy. The download
@@ -3522,7 +4030,7 @@ function wireImport(){
     impMsg('importing '+f.name+' → '+shortPath(dir)+' …');
     fetch('api/import',{method:'POST',body:fd}).then(r=>r.json().then(j=>({ok:r.ok,j})))
       .then(({ok,j})=>{
-        if(ok&&j.ok){impMsg('✓ imported into '+shortPath(j.cwd||dir)+' · resume it below');loadPast();}
+        if(ok&&j.ok){impMsg('✓ imported into '+shortPath(j.cwd||dir)+' · resume it below');loadTree();}
         else impMsg('✗ '+((j&&j.error)||'import failed'),true);})
       .catch(e=>impMsg('✗ '+e,true))
       .finally(()=>{inp.value='';});};}
@@ -3535,33 +4043,20 @@ function delResumable(s){
   if(!confirm('Delete this session from disk?\n\n'+(s.title||s.name||s.cc||'session')+
     '\n\nIt is moved to the trash (recoverable), not permanently deleted.'))return;
   wsSend({type:'del_resumable',cc:s.cc});
-  /* optimistic: drop it from favorites + cached lists so it vanishes at once */
-  favData=favData.filter(f=>f.cc!==s.cc);
-  recentData=(recentData||[]).filter(x=>x.cc!==s.cc);
-  folderData=(folderData||[]).filter(x=>x.cc!==s.cc);
-  renderPast();}
+  /* optimistic: drop it from the cached tree so it vanishes at once */
+  projData=(projData||[]).map(p=>Object.assign({},p,
+    {sessions:(p.sessions||[]).filter(x=>x.cc!==s.cc)}));
+  renderSidebar();}
 
-function renderPast(){
-  const favs=getFavs(),favCC=new Set(favs.map(f=>f.cc));
-  const fb=$('#favList');$('#favN').textContent=favs.length;
-  if(!favs.length)fb.innerHTML='<div class="sb-empty">star a session to pin it here</div>';
-  else{fb.innerHTML='';favs.forEach(f=>fb.appendChild(pastRow(f,true)));}
-  const rec=(recentData||[]).filter(s=>!liveCCs.has(s.cc)&&!favCC.has(s.cc)).slice(0,30);
-  const rb=$('#recentList');
-  if(!rec.length)rb.innerHTML='<div class="sb-empty">no recent sessions</div>';
-  else{rb.innerHTML='';rec.forEach(s=>rb.appendChild(pastRow(s,false)));}
-  const fol=(folderData||[]).filter(s=>!liveCCs.has(s.cc)&&!favCC.has(s.cc)).slice(0,30);
-  const ob=$('#folderList');
-  if(!fol.length)ob.innerHTML='<div class="sb-empty">no past sessions in this folder</div>';
-  else{ob.innerHTML='';fol.forEach(s=>ob.appendChild(pastRow(s,false)));}
-}
 function currentFolder(){const p=$('#project').value;
   return p==='__custom__'?$('#cwd').value.trim():(p||'');}
-function loadPast(){const folder=currentFolder();
-  $('#folderScope').textContent=folder?(folder.split('/').filter(Boolean).slice(-1)[0]||folder):'';
-  fetch('api/resumable').then(r=>r.json()).then(j=>{recentData=j.resumable||[];renderPast();}).catch(()=>{});
-  if(folder)fetch('api/resumable?cwd='+encodeURIComponent(folder)).then(r=>r.json()).then(j=>{folderData=j.resumable||[];renderPast();}).catch(()=>{});
-  else{folderData=[];renderPast();}}
+
+/* pull the folder-grouped sidebar. The socket also pushes it on connect and after
+   any change, so this is the cold-start and manual-rescan path. */
+function loadTree(){
+  fetch('api/tree').then(r=>r.json())
+    .then(j=>{projData=j.projects||[];renderSidebar();})
+    .catch(()=>{});}
 
 /* directory autocomplete for the custom path box (server /api/dircomplete) */
 let acItems=[],acSel=-1,acTimer=0;
@@ -3575,7 +4070,7 @@ function acRender(j){const b=$('#cwdac');acItems=(j&&j.dirs)||[];acSel=-1;
   b.querySelectorAll('.acitem').forEach(el=>el.onmousedown=ev=>{ev.preventDefault();acPick(+el.dataset.i);});}
 function acPick(i){if(i<0||i>=acItems.length)return;
   $('#cwd').value=acItems[i]+'/';   /* auto-append slash → keep drilling with the mouse, no typing */
-  $('#cwd').focus();loadPast();acQuery();}
+  $('#cwd').focus();loadTree();acQuery();}
 function acMove(d){const els=$('#cwdac').querySelectorAll('.acitem');if(!els.length)return;
   acSel=(acSel+d+els.length)%els.length;els.forEach((el,i)=>el.classList.toggle('sel',i===acSel));els[acSel].scrollIntoView({block:'nearest'});}
 function acQuery(){clearTimeout(acTimer);const q=$('#cwd').value;
@@ -3598,7 +4093,7 @@ function endSessionById(id,name){if(!id)return;
   if(!confirm('End session '+(name?'« '+name+' »':'')+'?\nIts claude process stops; you can still resume it from disk later.'))return;
   wsSend({type:'end',id:id});
   if(id===sid){sid=null;setCurname('');markEnded('session ended');}
-  reqList();loadPast();}
+  reqList();loadTree();}
 /* image attachments: paste (Ctrl/Cmd+V) an image into the composer */
 let pendingImages=[];
 const MAX_IMG=8, MAX_IMG_BYTES=5*1024*1024, OK_IMG=['image/png','image/jpeg','image/gif','image/webp'];
@@ -3746,14 +4241,15 @@ function setDrawerW(w,save){const cap=Math.round(window.innerWidth*0.96);
     setDrawerW($('#drawer').getBoundingClientRect().width,true);});
   h.addEventListener('dblclick',()=>setDrawerW(560,true));   /* double-click: reset to default */
 })();
-$('#resumeRef').onclick=e=>{e.stopPropagation();loadPast();};
+$('#resumeRef').onclick=e=>{e.stopPropagation();wsSend({type:'proj_refresh'});loadTree();};
 /* collapsible sections: clicking the header toggles; restore saved state */
-['secFav','secRecent','secFolder'].forEach(id=>{
+['secFav','secRecent'].forEach(id=>{
   const h=$('#'+id+' .sb-h');if(h)h.onclick=()=>toggleSec(id);});
 applySecCollapse();
 /* dismiss the ⋯ card menu on outside-click, Escape, scroll or resize */
 document.addEventListener('click',e=>{if(!e.target.closest('#cardMenu')&&!e.target.closest('.skebab'))closeCardMenu();});
-document.addEventListener('keydown',e=>{if(e.key==='Escape')closeCardMenu();});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeCardMenu();
+  if(fimpOpened())fimpClose();if(pmanOpened())pmanClose();}});
 window.addEventListener('resize',closeCardMenu);
 window.addEventListener('scroll',closeCardMenu,true);
 /* model/mode pickers set the NEW-session default only (persisted). A running
@@ -3777,16 +4273,64 @@ $('#grefresh').onclick=refreshGit;
 $('#project').onchange=()=>{const c=$('#project').value==='__custom__';
   $('#cwdwrap').classList.toggle('show',c);
   if(c){if(!$('#cwd').value)$('#cwd').value=HOMEDIR?(HOMEDIR+'/'):'';$('#cwd').focus();acQuery();}else acClose();
-  loadPast();};
+  loadTree();};
 $('#cwd').addEventListener('input',acQuery);
 $('#cwd').addEventListener('focus',acQuery);
-$('#cwd').addEventListener('change',loadPast);
+$('#cwd').addEventListener('change',loadTree);
 $('#cwd').addEventListener('blur',()=>setTimeout(acClose,160));
 $('#cwd').addEventListener('keydown',e=>{const b=$('#cwdac');if(!b.classList.contains('on'))return;
   if(e.key==='ArrowDown'){e.preventDefault();acMove(1);}
   else if(e.key==='ArrowUp'){e.preventDefault();acMove(-1);}
   else if(e.key==='Enter'&&acSel>=0){e.preventDefault();acPick(acSel);}
   else if(e.key==='Escape')acClose();});
+
+/* ── Import folder ────────────────────────────────────────────────────────
+   Register a directory as a sidebar project. Folders normally reach the sidebar
+   by owning a session, so a fresh directory would otherwise be invisible until
+   its first session existed. Same /api/dircomplete backend as the path box. */
+let fimpItems=[],fimpSel=-1,fimpT=0;
+function fimpMsg(t,bad){const e=$('#fimpmsg');if(!e)return;e.textContent=t||'';e.classList.toggle('bad',!!bad);}
+function fimpOpen(){const w=$('#fimp');w.removeAttribute('hidden');fimpMsg('');
+  const i=$('#fimpq');i.value=HOMEDIR?HOMEDIR+'/':'';i.focus();fimpQuery();}
+function fimpClose(){$('#fimp').setAttribute('hidden','');fimpItems=[];fimpSel=-1;}
+function fimpOpened(){return !$('#fimp').hasAttribute('hidden');}
+function fimpMark(){const b=$('#fimpac');
+  b.querySelectorAll('.acitem').forEach((el,i)=>el.classList.toggle('sel',i===fimpSel));
+  const cur=b.querySelector('.acitem.sel');if(cur)cur.scrollIntoView({block:'nearest'});}
+function fimpRender(j){const b=$('#fimpac');fimpItems=(j&&j.dirs)||[];fimpSel=-1;
+  if(!fimpItems.length){b.innerHTML='<div class="acmore">no matching folder</div>';return;}
+  b.innerHTML=fimpItems.map((p,i)=>'<div class="acitem" data-i="'+i+'"><div class="acname">'+
+    esc(p.split('/').filter(Boolean).slice(-1)[0]||p)+'</div><div class="acpath">'+esc(p)+'</div></div>').join('')
+    +((j&&j.more)?'<div class="acmore">… keep typing to narrow</div>':'');
+  b.querySelectorAll('.acitem').forEach(el=>el.onclick=()=>{
+    $('#fimpq').value=fimpItems[+el.dataset.i]+'/';$('#fimpq').focus();fimpQuery();});}
+function fimpQuery(){clearTimeout(fimpT);
+  fimpT=setTimeout(()=>fetch('api/dircomplete?q='+encodeURIComponent($('#fimpq').value))
+    .then(r=>r.json()).then(fimpRender).catch(()=>{}),130);}
+function fimpAdd(){
+  let p=$('#fimpq').value.trim();
+  if(p.length>1)p=p.replace(/\/+$/,'');
+  if(!p){fimpMsg('type a folder path',true);return;}
+  fimpMsg('adding…');
+  fetch('api/pinfolder',{method:'POST',headers:{'Content-Type':'application/json'},
+                         body:JSON.stringify({path:p})})
+    .then(r=>r.json()).then(j=>{
+      if(j&&j.ok){fimpClose();addNotice('📁 project « '+(j.name||p)+' » added to the sidebar');loadTree();}
+      else fimpMsg((j&&j.error)||'could not add that folder',true);})
+    .catch(e=>fimpMsg(String(e),true));}
+$('#fimpbtn').onclick=fimpOpen;
+$('#fimpx').onclick=fimpClose;
+$('#fimpcancel').onclick=fimpClose;
+$('#fimpok').onclick=fimpAdd;
+$('#fimp').addEventListener('mousedown',e=>{if(e.target.id==='fimp')fimpClose();});
+$('#fimpq').addEventListener('input',fimpQuery);
+$('#fimpq').addEventListener('keydown',e=>{
+  if(e.key==='ArrowDown'){e.preventDefault();if(fimpItems.length){fimpSel=Math.min(fimpSel+1,fimpItems.length-1);fimpMark();}}
+  else if(e.key==='ArrowUp'){e.preventDefault();if(fimpItems.length){fimpSel=Math.max(fimpSel-1,0);fimpMark();}}
+  else if(e.key==='Enter'){e.preventDefault();
+    if(fimpSel>=0){$('#fimpq').value=fimpItems[fimpSel]+'/';fimpSel=-1;fimpQuery();}
+    else fimpAdd();}
+  else if(e.key==='Escape'){e.preventDefault();fimpClose();}});
 
 /* project picker: recent project dirs (+ Custom path…) */
 (async function(){try{const r=await fetch('api/projects');const j=await r.json();HOMEDIR=j.home||'';const sel=$('#project');
@@ -3799,13 +4343,13 @@ $('#cwd').addEventListener('keydown',e=>{const b=$('#cwdac');if(!b.classList.con
   const first=recent[0];
   sel.value=first?first.path:'__custom__';
   $('#cwdwrap').classList.toggle('show',sel.value==='__custom__');
-  loadPast();
+  loadTree();
   refreshImportHint();   /* HOMEDIR and the default project are only known now */
 }catch(e){}})();
 
 setInterval(()=>reqList(),8000);
-setInterval(loadPast,30000);
-loadPast();
+setInterval(loadTree,30000);
+loadTree();
 loadUsage();
 setInterval(loadUsage,60000);
 loadModels();
@@ -3857,11 +4401,14 @@ def _recap_tick():
 
 
 def main():
+    moved = migrate_session_favs_to_projects()
     app = tornado.web.Application([
         (r"/", ConsoleHandler),
         (r"/console", ConsoleHandler),
         (r"/api/projects", ProjectsHandler),
         (r"/api/resumable", ResumableHandler),
+        (r"/api/tree", TreeHandler),
+        (r"/api/pinfolder", PinFolderHandler),
         (r"/api/dircomplete", DirCompleteHandler),
         (r"/api/diff", DiffHandler),
         (r"/api/usage", UsageHandler),
@@ -3891,6 +4438,8 @@ def main():
     print("  claude transcripts: %s" % CLAUDE_ROOT)
     print("  codex transcripts:  %s" % CODEX_ROOT)
     print("  auth: %s" % ("enabled" if AUTH else "disabled"))
+    if moved:
+        print("  migrated %d starred session(s) onto their project folders" % moved)
     if not loopback and not AUTH:
         print("  ⚠️  EXPOSED on %s WITHOUT auth — this serves your agent"
               " transcripts and code diffs. Set CLAUDE_CONSOLE_AUTH=user:pass." % BIND)
