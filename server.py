@@ -2533,7 +2533,7 @@ CONSOLE_HTML = r"""<!DOCTYPE html>
   --acc:#907aa9;--usr:#286983;--add:#5b8a3a;--del:#b4637a;--tool:#ea9d34;--think:#736d83;--onacc:#faf4ed}
 :root[data-theme="one-light"]{
   --bg:#fafafa;--bg2:#f0f0f0;--bg3:#e5e5e6;--line:#d4d4d6;--fg:#383a42;--mut:#72737b;
-  --acc:#2d6af1;--usr:#017bb0;--add:#50a14f;--del:#db3021;--tool:#9b6a01;--think:#72737b;--onacc:#ffffff}
+  --acc:#4078f2;--usr:#0184bc;--add:#50a14f;--del:#e45649;--tool:#c18401;--think:#72737b;--onacc:#ffffff}
 :root[data-theme="ayu-light"]{
   --bg:#fcfcfc;--bg2:#f3f4f5;--bg3:#e7e8e9;--line:#dcdde0;--fg:#5c6166;--mut:#70757d;
   --acc:#399ee6;--usr:#55b4d4;--add:#86b300;--del:#e65050;--tool:#f2ae49;--think:#70757d;--onacc:#ffffff}
@@ -2757,8 +2757,17 @@ pre code{background:none;border:none;padding:0}
 /* shared segmented meter: 5 cells × 20%, whole bar coloured by the total % (Context + Usage) */
 .cells{display:inline-flex;gap:2px;align-items:center}
 .cells .cell{width:7px;height:13px;border-radius:2px;background:var(--bg3);border:1px solid var(--line);box-sizing:border-box;transition:background .25s,box-shadow .25s}
-.cells.lv-g{color:var(--add)}.cells.lv-y{color:var(--tool)}
-.cells.lv-o{color:color-mix(in srgb, var(--tool) 55%, var(--del))}.cells.lv-r{color:var(--del)}
+/* Meter signal ramp — FIXED hues, deliberately not the semantic tokens.
+   green/amber/orange/red mean the same thing in every theme, and the semantic
+   tokens are tuned for text: pushing them to a text contrast ratio turns the
+   ramp muddy (a dark olive "yellow"). Light themes get the same hues one notch
+   deeper, because a bright yellow on a white ground is otherwise invisible. */
+:root{--mg:#2fbf4f;--my:#ecc020;--mo:#ff8c1a;--mr:#f5483b}
+:root[data-theme="light"],:root[data-theme="solarized-light"],:root[data-theme="catppuccin-latte"],
+:root[data-theme="gruvbox-light"],:root[data-theme="rose-pine-dawn"],:root[data-theme="one-light"],
+:root[data-theme="ayu-light"]{--mg:#22a83f;--my:#d9a800;--mo:#f57c00;--mr:#ef3f31}
+.cells.lv-g{color:var(--mg)}.cells.lv-y{color:var(--my)}
+.cells.lv-o{color:var(--mo)}.cells.lv-r{color:var(--mr)}
 .cells .cell.on{background:currentColor;border-color:currentColor;box-shadow:0 0 4px currentColor}
 @media(max-width:680px){.usage{display:none!important}}
 #shell{flex:1;display:flex;min-height:0;position:relative}
