@@ -1767,13 +1767,16 @@ class ChatSession:
                 # after a compaction (which slashes the token count)
                 if any(e["kind"] in ("turn_done", "ready", "compacted") for e in evs):
                     await self._refresh_context()
-                # a turn just settled → send the next queued message, if any
+                # a turn just settled → send the next queued message, if any.
+                # Queued messages are NO LONGER auto-steered at tool boundaries:
+                # the CLI delivers a steered message only as a <system-reminder>
+                # aside ("address it as you continue this turn"), which the model
+                # is free to note and never answer — measured compliance was ~1/3
+                # even though API captures showed 100% delivery. Held messages
+                # become first-class turns instead, which always get a reply;
+                # steering is still available per message via the chip's ⚡.
                 if any(e["kind"] == "turn_done" for e in evs):
                     self._drain_queue()
-                # steering: at a tool boundary, inject queued messages into the
-                # running turn so Claude sees them at its next step (like the CLI)
-                elif self.busy and self.queue and any(e["kind"] == "tool_use" for e in evs):
-                    self._flush_queue_midturn()
         except Exception as ex:
             self._emit({"type": "stderr", "text": "stream ended: %r" % ex})
         self.busy = False
@@ -2088,22 +2091,33 @@ class ChatSession:
                 self._drain_queue()    # don't strand the rest of the queue
         tornado.ioloop.IOLoop.current().spawn_callback(_q)
 
-    def _flush_queue_midturn(self):
-        """Steering: inject every pending queued message into the running turn
-        now (write to the CLI), so Claude sees them at its next step. Echoes are
-        emitted immediately; the writes are serialized in one coroutine."""
-        if not self.queue or not self.client or self.ended:
+    def steer_now(self, qid):
+        """Explicit per-message steering (the queue chip's ⚡). Writes the message
+        into the running turn immediately — the CLI absorbs it at its own next
+        boundary and shows it to the model as a <system-reminder> beside a tool
+        result. Delivery is reliable (verified by API capture); a *visible reply*
+        is not guaranteed, because the reminder tells the model to carry on with
+        the current turn. That trade-off is why this is opt-in per message."""
+        if not self.client or self.ended:
             return
-        items, self.queue = self.queue, []
-        payloads = []
-        for it in items:
-            self._echo_user(it["text"], it["images"], qid=it["qid"], start=False)
-            payloads.append(self._make_payload(it["text"], it["images"]))
+        for i, it in enumerate(self.queue):
+            if it["qid"] == qid:
+                self.queue.pop(i)
+                break
+        else:
+            return
+        if not self.busy:                      # turn already over → normal dispatch
+            self._dispatch(it["text"], it["images"], qid=it["qid"], start=True)
+            return
+        self._echo_user(it["text"], it["images"], qid=it["qid"], start=False)
+        self._push([{"kind": "notice",
+                     "text": "⚡ steered into the running turn — Claude sees it at its "
+                             "next step but may answer only after finishing current work"}])
+        payload = self._make_payload(it["text"], it["images"])
         client = self.client
         async def _q():
             try:
-                for p in payloads:
-                    await client.query(p)
+                await client.query(payload)
             except Exception as ex:
                 self._push([{"kind": "notice", "text": "steer failed: %r" % ex}])
         tornado.ioloop.IOLoop.current().spawn_callback(_q)
@@ -2397,6 +2411,8 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             self.session.send_user(msg.get("text", ""), msg.get("images"))
         elif mt == "unqueue" and self.session:
             self.session.unqueue(msg.get("qid"))
+        elif mt == "steer" and self.session:
+            self.session.steer_now(msg.get("qid"))
         elif mt == "del_resumable":
             # Sidebar 🗑: move a resumable session's transcript to the trash.
             cc = msg.get("cc")
@@ -2672,6 +2688,9 @@ pre code{background:none;border:none;padding:0}
 #queue .qmsg .qtext{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #queue .qmsg .qx{flex:none;color:var(--mut);font-size:13px;padding:0 2px}
 #queue .qmsg:hover .qx{color:var(--del)}
+#queue .qmsg .qsteer{flex:none;color:var(--mut);font-size:12px;padding:0 2px;cursor:pointer}
+#queue .qmsg:hover .qsteer{color:var(--tool)}
+#queue .qmsg .qsteer:hover{filter:brightness(1.25)}
 #ta{flex:1;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:10px;
   padding:9px 12px;font-size:14px;font-family:inherit;resize:none;max-height:160px;line-height:1.4}
 #ta:focus{outline:1px solid var(--acc)}
@@ -3761,6 +3780,9 @@ function projGroup(p){
   r.querySelector('.skebab').onclick=ev=>{ev.stopPropagation();
     const items=[{label:'＋ New session here',fn:()=>newSessionIn(p.path)},
       {label:'☑ Manage sessions…',fn:()=>pmanOpen(p)},
+      /* browse the project directory in web-file-manager (same ?open= scheme as
+         file links — its openPath() loads a directory as a folder view) */
+      {label:'📂 Open folder',fn:()=>window.open(webfmOpenUrl(p.path),'_blank')},
       {label:'✎ Rename project',fn:()=>renameProject(p)},
       {label:p.fav?'★ Unfavorite':'☆ Favorite',fn:()=>wsSend({type:'proj_fav',path:p.path,fav:!p.fav})}];
     if(p.pinned)items.push({label:'✕ Remove from sidebar',danger:true,fn:()=>{
@@ -4173,11 +4195,15 @@ function sendMsg(){const t=ta.value.trim();
 let queued={};
 function renderQueue(){const q=$('#queue');if(!q)return;const ids=Object.keys(queued);
   q.classList.toggle('on',ids.length>0);
-  q.innerHTML=ids.map(id=>'<div class="qmsg" data-q="'+id+'" title="click to edit · ✕ to discard">'+
+  q.innerHTML=ids.map(id=>'<div class="qmsg" data-q="'+id+'" title="sends when the current turn ends · click to edit · ✕ to discard">'+
     '<span class="qicon">⏳</span><span class="qtext">'+esc(queued[id].text||'')+
-    (queued[id].images?(' 🖼×'+queued[id].images):'')+'</span><span class="qx" title="discard">✕</span></div>').join('');
+    (queued[id].images?(' 🖼×'+queued[id].images):'')+'</span>'+
+    '<span class="qsteer" title="steer into the RUNNING turn now — Claude sees it immediately but may reply only after finishing current work">⚡</span>'+
+    '<span class="qx" title="discard">✕</span></div>').join('');
   q.querySelectorAll('.qmsg').forEach(el=>{const id=el.dataset.q;
     el.querySelector('.qx').onclick=ev=>{ev.stopPropagation();discardQueued(id);};
+    el.querySelector('.qsteer').onclick=ev=>{ev.stopPropagation();
+      if(ws&&ws.readyState===1)wsSend({type:'steer',qid:id});};
     el.onclick=()=>editQueued(id);});}
 function addQueued(ev){queued[ev.qid]={text:ev.text||'',images:ev.images||0};renderQueue();}
 function removeQueued(qid){if(queued[qid]){delete queued[qid];renderQueue();}}
