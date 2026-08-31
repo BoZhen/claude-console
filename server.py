@@ -155,6 +155,14 @@ def _strip_injected(s):
     return _INJECTED_RE.sub("", s) if isinstance(s, str) else s
 
 
+# Claude's task list, as the CLI exposes it: TaskCreate {subject, description,
+# activeForm} then TaskUpdate {taskId, status}. There is no whole-plan event, and
+# TaskCreate never reports the id it was given — that comes back only in the tool
+# RESULT text, "Task #3 created successfully: Fix lint".
+TASK_ID_RE = re.compile(r"[Tt]ask #(\d+)")
+TASK_FIELDS = ("subject", "description", "activeForm", "status")
+
+
 def parse_claude(rec, idx):
     t = rec.get("type")
     base = {"ts": rec.get("timestamp"), "id": rec.get("uuid") or ("L%d" % idx)}
@@ -1628,11 +1636,16 @@ class ChatSession:
         self.recap_busy = False   # True while a recap generation is in flight
         self._compact_turn = False  # was the in-flight turn a manual /compact? (no "Baked" line)
         self.bg_tasks = {}        # live run_in_background tasks: task_id -> {desc, tool_use_id}
+        # the plan, folded out of TaskCreate/TaskUpdate tool traffic (see _fold_tasks)
+        self.tasks = {}           # task id -> {subject, description, activeForm, status}
+        self._task_open = {}      # TaskCreate tool_use id -> the task, until a result names it
+        self._task_seq = 0        # creation ordinal; the fallback id if that text ever changes
 
     def preload(self):
         """Populate history from the on-disk transcript before resuming."""
         if self.resume_cc:
             self.log = load_transcript_events(self.resume_cc)
+            self._fold_tasks(self.log)   # the plan the session was left holding
 
     def title(self):
         """Custom label if the user set one, else the first user message."""
@@ -2214,7 +2227,65 @@ class ChatSession:
             except Exception:
                 self.viewers.discard(v)
 
+    def _fold_tasks(self, evs):
+        """Fold TaskCreate/TaskUpdate tool traffic into the current task list.
+
+        Codex hands its console a whole plan per update; Claude does not, so the
+        list has to be rebuilt from the individual calls. A create is parked under
+        its tool_use id until its own result names it, because the id is assigned
+        by the CLI and appears nowhere in the input. When that result text does not
+        parse, the id falls back to the creation ordinal — which is what the CLI is
+        counting anyway, so a reworded message costs ordering at worst, never the plan.
+
+        Returns True if anything moved, so the caller knows to push a snapshot."""
+        changed = False
+        for e in evs:
+            k = e.get("kind")
+            if k == "tool_use":
+                inp = e.get("input")
+                if not isinstance(inp, dict):
+                    continue
+                if e.get("tool") == "TaskCreate":
+                    self._task_open[e.get("toolId") or ""] = {
+                        f: inp[f] for f in TASK_FIELDS if inp.get(f)}
+                elif e.get("tool") == "TaskUpdate":
+                    tid = str(inp.get("taskId") or "").strip()
+                    if not tid:
+                        continue
+                    # an id we never saw created means the create scrolled out of the
+                    # window (long session, or a resume that starts mid-plan). Keep the
+                    # row anyway: a status with no title still says work is moving.
+                    t = self.tasks.setdefault(tid, {})
+                    for f in TASK_FIELDS:
+                        if inp.get(f):
+                            t[f] = inp[f]
+                    changed = True
+            elif k == "tool_result":
+                t = self._task_open.pop(e.get("toolId") or "", None)
+                if t is None or e.get("isError"):
+                    continue
+                m = TASK_ID_RE.search(e.get("content") or "")
+                self._task_seq = max(self._task_seq + 1, int(m.group(1)) if m else 0)
+                tid = m.group(1) if m else str(self._task_seq)
+                t.setdefault("status", "pending")
+                self.tasks.setdefault(tid, {}).update(t)
+                changed = True
+        return changed
+
+    def plan_tasks(self):
+        """The task list on the wire, in the CLI's own order (its ids count up)."""
+        def key(kv):
+            try:
+                return (0, int(kv[0]))
+            except ValueError:
+                return (1, 0)   # unparsable id: keep it after the rest, in arrival order
+        return [dict(t, id=tid) for tid, t in sorted(self.tasks.items(), key=key)]
+
     def _push(self, evs):
+        # one snapshot per batch, appended after the calls that caused it, so a
+        # replayed history converges on the same plan the live viewers are showing
+        if self._fold_tasks(evs):
+            evs = list(evs) + [{"kind": "plan", "tasks": self.plan_tasks()}]
         self.log.extend(evs)
         if len(self.log) > 1500:
             self.log = self.log[-1500:]
@@ -2318,7 +2389,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "model": sess.model or "default", "mode": sess.mode,
                        "busy": sess.busy, "ended": sess.ended, "events": sess.log,
                        "turn_age": sess.turn_age(), "word": sess.turn_word, "effort": sess.effort,
-                       "compacting": sess.compacting})
+                       "compacting": sess.compacting, "tasks": sess.plan_tasks()})
             # returning to an idle session that's been quiet a while → recap it now
             # (the periodic sweep may not have ticked yet); guarded against busy/dup
             if (RECAP_ENABLED and not sess.busy and not sess.ended and not sess.compacting
@@ -2362,7 +2433,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "model": sess.model or "default", "mode": sess.mode,
                        "busy": sess.busy, "ended": sess.ended, "events": sess.log,
                        "turn_age": sess.turn_age(), "word": sess.turn_word, "effort": sess.effort,
-                       "compacting": sess.compacting, "resumed": True})
+                       "compacting": sess.compacting, "resumed": True, "tasks": sess.plan_tasks()})
         elif mt == "approve" and self.session:
             self.session.resolve_approval(msg.get("aid"), bool(msg.get("allow")), bool(msg.get("always")))
         elif mt == "answer" and self.session:
@@ -2636,6 +2707,40 @@ header input#cwd{flex:1;min-width:120px;display:none}
 .msg.asst.streaming .scaret{display:inline-block;width:2px;height:1em;margin-left:1px;
   vertical-align:text-bottom;background:var(--acc);opacity:.8;animation:scaretb 1s steps(2,start) infinite}
 @keyframes scaretb{50%{opacity:0}}
+/* Plan dock — the current task list, pinned to the top of the chat viewport so it
+   stays readable while the answer scrolls under it. Claude has no whole-plan
+   event, so the server folds TaskCreate/TaskUpdate into one list (see _fold_tasks)
+   and pushes the whole thing on every change; this only ever paints a snapshot.
+   Opaque background, because content scrolls behind it once it sticks. */
+.plandock{position:sticky;top:0;z-index:7;max-width:820px;margin:0 auto 10px;
+  padding:0 0 8px;background:var(--bg);
+  /* #chat carries 14px of padding, and a scroll container's padding scrolls WITH
+     its content — so a sticky child pins below it and messages ride up through
+     the gap above the card. The shadow is that gap, painted opaque. Keep it equal
+     to #chat's padding-top. */
+  box-shadow:0 -14px 0 var(--bg)}
+.plandock[hidden]{display:none}
+.plandock .plan{margin:0;box-shadow:0 7px 18px rgba(0,0,0,.18)}
+.plan{border:1px solid var(--line);border-radius:8px;background:var(--bg2);overflow:hidden}
+.plan .ph{display:flex;align-items:center;gap:7px;padding:6px 10px;color:var(--acc);
+  font-weight:650;font-size:12.5px}
+.plan .ptitle{flex:1;min-width:0}
+.plan .pcount{color:var(--mut);font-weight:400;font-family:var(--fmono);font-size:11.5px}
+.plan .ptoggle{width:24px;height:22px;flex:none;display:inline-flex;align-items:center;
+  justify-content:center;border:0;background:none;color:var(--mut);cursor:pointer;
+  border-radius:5px;font-size:11px;line-height:1}
+.plan .ptoggle:hover{color:var(--acc);background:var(--bg3)}
+.plan .psteps{display:flex;flex-direction:column;border-top:1px solid var(--line)}
+.plan .pst{display:grid;grid-template-columns:18px 1fr;gap:6px;align-items:start;
+  padding:5px 10px;font-size:13px;line-height:1.35}
+.plan .pst + .pst{border-top:1px solid color-mix(in srgb,var(--line) 55%,transparent)}
+.plan .pi{font-family:var(--fmono);color:var(--mut);text-align:center}
+.plan .psub{color:var(--fg);min-width:0;overflow-wrap:anywhere}
+.plan .pst.done .pi{color:var(--add)}
+.plan .pst.done .psub{color:var(--mut);text-decoration:line-through}
+.plan .pst.active .pi{color:var(--tool)}
+.plan .pst.active .psub{font-weight:600}
+.plan .pempty{padding:6px 10px;border-top:1px solid var(--line);font-size:12px;color:var(--mut)}
 .think{color:var(--think);font-style:italic;font-size:13px;border-left:2px solid var(--line);padding:3px 0 3px 10px;margin-bottom:12px;white-space:pre-wrap}
 .think.hide{display:none}
 .notice{color:var(--mut);font-size:11.5px;margin:6px 0}
@@ -3151,7 +3256,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
     </div>
   </div></div>
   <div id="mainCol">
-    <div id="chat"><div class="wrap" id="stream"></div></div>
+    <div id="chat"><div class="plandock" id="planDock" hidden></div><div class="wrap" id="stream"></div></div>
     <div id="composer">
       <div class="pillrow">
         <div id="thinking"><div class="twrap"><span class="dot" id="dot"></span><span class="glyph">✶</span><span class="word">idle</span><span class="meta"></span></div></div>
@@ -3310,10 +3415,13 @@ function atBottom(){if(replaying)return false;const c=$('#chat');return c.scroll
 function scroll(){if(replaying)return;const c=$('#chat');c.scrollTop=c.scrollHeight;}
 
 const ICON={Edit:'✏️',MultiEdit:'✏️',Write:'📝',Bash:'▶',Read:'📖',Glob:'🔍',Grep:'🔍',Task:'🤖',
-  WebFetch:'🌐',WebSearch:'🌐',TodoWrite:'☑️',NotebookEdit:'📓'};
+  WebFetch:'🌐',WebSearch:'🌐',TodoWrite:'☑️',NotebookEdit:'📓',
+  TaskCreate:'☑️',TaskUpdate:'☑️',TaskList:'☑️',TaskGet:'☑️'};
 function primaryArg(i){if(!i)return '';if(typeof i==='string')return i.slice(0,80);
   if(i.file_path)return i.file_path.split('/').slice(-2).join('/');
   if(i.command)return (''+i.command).split('\n')[0].slice(0,90);
+  if(i.subject)return i.subject.slice(0,80);   /* TaskCreate: the task, not its description */
+  if(i.taskId!==undefined)return '#'+i.taskId+(i.status?' → '+i.status:'');
   if(i.pattern)return i.pattern;if(i.description)return i.description.slice(0,80);
   if(i.url)return i.url;return '';}
 function counts(ev){const i=ev.input||{};
@@ -3435,6 +3543,50 @@ function addNotice(t){const d=document.createElement('div');d.className='notice'
 function addRecap(t){const s=atBottom();const d=document.createElement('div');d.className='recap';
   d.innerHTML='<span class="rk">※ recap:</span> <span class="rt"></span>';
   d.querySelector('.rt').textContent=t;stream.appendChild(d);if(s)scroll();}
+/* ── plan dock ────────────────────────────────────────────────────────────────
+   Claude exposes its task list only as individual TaskCreate/TaskUpdate calls, so
+   the server folds them and pushes the WHOLE list on every change. That is what
+   makes this simple: there is no incremental state to keep in sync here, every
+   `plan` event is a complete snapshot, and replaying a history just converges on
+   whatever the last one said. The dock is sticky rather than inline because a plan
+   is a statement about the present, and inline it would scroll away into history. */
+let planTasks=[],planCollapsed=false,planHideT=0;
+const PLAN_HIDE_MS=2000;
+const PLAN_MARK={completed:['done','✔'],in_progress:['active','▸'],pending:['todo','○']};
+function planMark(st){return PLAN_MARK[(''+(st||'pending')).toLowerCase()]||PLAN_MARK.pending;}
+function planDone(t){return planMark(t.status)[0]==='done';}
+function planAllDone(ts){return ts.length>0&&ts.every(planDone);}
+function renderPlan(){
+  const host=$('#planDock');if(!host)return;
+  if(!planTasks.length){host.hidden=true;host.innerHTML='';return;}
+  /* collapsed shows only what is being worked on right now — the whole point of a
+     pinned plan is the current step, the rest is reference */
+  const shown=planCollapsed?planTasks.filter(t=>planMark(t.status)[0]==='active'):planTasks;
+  let h='<div class="plan"><div class="ph"><span class="ptitle">☑ Plan</span>'+
+    '<span class="pcount">'+planTasks.filter(planDone).length+'/'+planTasks.length+'</span>'+
+    '<button type="button" class="ptoggle" aria-expanded="'+(!planCollapsed)+'" title="'+
+    (planCollapsed?'Expand plan':'Collapse plan')+'">'+(planCollapsed?'▼':'▲')+'</button></div>';
+  if(shown.length){h+='<div class="psteps">';
+    shown.forEach(t=>{const mk=planMark(t.status);
+      h+='<div class="pst '+mk[0]+'" title="'+escAttr(t.description||'')+'">'+
+         '<span class="pi">'+mk[1]+'</span><span class="psub">'+
+         esc(t.subject||t.activeForm||('task #'+t.id))+'</span></div>';});
+    h+='</div>';}
+  else h+='<div class="pempty">no active task</div>';
+  host.innerHTML=h+'</div>';host.hidden=false;
+  const tg=host.querySelector('.ptoggle');if(tg)tg.onclick=togglePlan;}
+function togglePlan(){planCollapsed=!planCollapsed;renderPlan();}
+/* A finished plan is just clutter, so it retires itself. Re-checked when the timer
+   fires: the session may have been switched, or new work may have reopened it. */
+function schedulePlanHide(){
+  if(planHideT){clearTimeout(planHideT);planHideT=0;}
+  if(replaying||!planAllDone(planTasks))return;
+  const owner=sid;
+  planHideT=setTimeout(()=>{planHideT=0;
+    if(sid===owner&&planAllDone(planTasks)){const h=$('#planDock');if(h)h.hidden=true;}},PLAN_HIDE_MS);}
+function setPlan(ts){planTasks=Array.isArray(ts)?ts:[];renderPlan();schedulePlanHide();}
+function clearPlan(){if(planHideT){clearTimeout(planHideT);planHideT=0;}
+  planTasks=[];planCollapsed=false;const h=$('#planDock');if(h){h.hidden=true;h.innerHTML='';}}
 /* turn-complete footer line — ✻ {past verb} for {N}s · {YYYY-MM-DD HH:MM:SS} UTC (server-stamped) */
 function utcStamp(sec){const d=new Date(sec*1000),p=n=>String(n).padStart(2,'0');
   return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+
@@ -3561,7 +3713,7 @@ function fmtSecs(ms){const s=Math.max(0,Math.round(ms/1000));if(s<60)return s+'s
 function doInterrupt(){if(!running)return;wsSend({type:'interrupt'});addNotice('⏹ interrupt sent');}
 function clearUI(){stream.innerHTML='';$('#edits').innerHTML='<div class="empty">no file changes yet</div>';
   $('#gitc').innerHTML='<div class="empty">—</div>';tools={};editCount=0;updateEditBadge();renderCtx(null);ready=false;
-  queued={};renderQueue();stopThinking();
+  queued={};renderQueue();stopThinking();clearPlan();
   endStream();}   /* also cancels a pending frame, which would else refill the cleared stream */
 
 /* file edits → out of chat, into the Changes drawer */
@@ -3657,6 +3809,7 @@ function route(ev){
   else if(ev.kind==='dequeued'||ev.kind==='unqueued')removeQueued(ev.qid);
   else if(ev.kind==='notice')addNotice(ev.text);
   else if(ev.kind==='recap')addRecap(ev.text);
+  else if(ev.kind==='plan')setPlan(ev.tasks);
 }
 
 /* persistent server-side session: attach / reattach / switch */
@@ -3669,6 +3822,7 @@ function onMsg(e){const m=JSON.parse(e.data);
   else if(m.type==='attached'){clearUI();pendingStart=false;sid=m.id;curCC=m.cc||null;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
     ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));setEffortPill(m.effort);renderCtx(m.ctx);statset(m.ended?'ended':'ready');
     replaying=true;m.events.forEach(route);replaying=false;
+    setPlan(m.tasks);   /* authoritative: the log window may predate the plan */
     compacting=!!m.compacting;setBusy(!!m.busy,m.word,(m.turn_age||0)*1000);loadDraft(sid);
     if(m.ended){markEnded('— this session has ended (history shown · you can resume it from disk) —');}
     else{ta.disabled=false;sendBtn.disabled=false;addNotice('— '+(m.resumed?'resumed':'reattached to')+' « '+(m.name||'')+' » ('+m.events.length+' events)'+(m.effort?' with '+m.effort+' effort':'')+' —');}
