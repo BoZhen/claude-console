@@ -1977,9 +1977,17 @@ class ChatSession:
                            + (u.get("cache_read_input_tokens") or 0)
                            + (u.get("cache_creation_input_tokens") or 0))
         elif et == "content_block_delta":
+            d = e.get("delta") or {}
+            # live prose → viewers as it arrives. Ephemeral on purpose: the
+            # authoritative text lands later as a logged `asst` event, so streaming
+            # deltas must never enter self.log or a reattach would replay the answer
+            # twice. Only top-level assistant text — thinking has its own lane and a
+            # subagent's text belongs to its tool card, not this bubble.
+            if d.get("text") and not getattr(msg, "parent_tool_use_id", None):
+                self._emit({"type": "events",
+                            "events": [{"kind": "stream_text", "text": d["text"]}]})
             if self._tok_exact:
                 return
-            d = e.get("delta") or {}
             t = d.get("text") or d.get("thinking") or d.get("partial_json") or ""
             if t:
                 self._tok_chars += len(t)
@@ -2619,6 +2627,15 @@ header input#cwd{flex:1;min-width:120px;display:none}
 .msg.user{display:flex;justify-content:flex-end}
 .msg.user .b{background:var(--sel);border:1px solid var(--selln);border-radius:10px;padding:8px 12px;max-width:85%;white-space:pre-wrap}
 .msg.asst .b{color:var(--fg);text-wrap:pretty}
+/* The streaming bubble inherits the finished bubble's box and typography, so the
+   one swap at completion changes inline formatting only and the block does not
+   jump. pre-wrap keeps the raw newlines the model emits; text-wrap:pretty is off
+   here because rebalancing the last lines on every append is itself a wobble. */
+.msg.asst.streaming .b{text-wrap:auto}
+.msg.asst.streaming .stxt{white-space:pre-wrap;word-break:break-word}
+.msg.asst.streaming .scaret{display:inline-block;width:2px;height:1em;margin-left:1px;
+  vertical-align:text-bottom;background:var(--acc);opacity:.8;animation:scaretb 1s steps(2,start) infinite}
+@keyframes scaretb{50%{opacity:0}}
 .think{color:var(--think);font-style:italic;font-size:13px;border-left:2px solid var(--line);padding:3px 0 3px 10px;margin-bottom:12px;white-space:pre-wrap}
 .think.hide{display:none}
 .notice{color:var(--mut);font-size:11.5px;margin:6px 0}
@@ -3046,7 +3063,8 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
 @media(prefers-reduced-motion:reduce){
   *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;
     transition-duration:.01ms!important}
-  .dot.busy,.srow .sdot.busy,.prow .sdot.busy,#thinking .glyph{animation:none!important;opacity:1!important}
+  .dot.busy,.srow .sdot.busy,.prow .sdot.busy,#thinking .glyph,
+  .msg.asst.streaming .scaret{animation:none!important;opacity:1!important}
 }
 </style>
 <link rel="stylesheet" href="/static/katex/katex.min.css">
@@ -3314,6 +3332,103 @@ function addUser(text,nImg){const s=atBottom();const d=document.createElement('d
   stream.appendChild(d);scroll();}
 function addAsst(text){const s=atBottom();const d=document.createElement('div');d.className='msg asst';
   d.innerHTML='<div class="b bubble">'+md(text)+'</div>';typesetMath(d);stream.appendChild(d);if(s)scroll();}
+/* ── live streaming bubble ────────────────────────────────────────────────────
+   Deltas render as PLAIN TEXT, appended to a text node and never re-parsed. That
+   is deliberate: running md()+KaTeX on every delta would re-parse the whole answer
+   dozens of times a second, destroying and rebuilding each already-typeset formula,
+   and half-arrived math ($\frac{a) would typeset as an error and then flip once the
+   closing delimiter lands — the text would visibly shiver. Appending to a text node
+   can only ever add glyphs, so nothing above the caret moves.
+
+   The finished text arrives separately as the logged `asst` event, which replaces
+   this bubble with the real md()+KaTeX render. So each block reflows exactly once,
+   at completion, instead of continuously.
+
+   PACING. The CLI does not stream token by token: measured, it emits a median
+   137-char chunk every ~316 ms. Painting each chunk on arrival puts a sentence and
+   a half on screen three times a second, which reads as stuttering. The first fix
+   drained a fixed FRACTION of the backlog per frame, which is worse than it looks.
+   A fresh chunk leaves at ~16 chars/frame and its tail at ~2, so the speed swung
+   4.7x within every 316 ms cycle: a 3 Hz pulse of fast-then-slow, which is the
+   "waits, then spits" feel rather than typing.
+
+   So this is a jitter buffer instead, the same trick audio playback uses. Arriving
+   text is held back by STREAM_LAG worth of reading, and played out at a rate that
+   is smoothed over about a second (STREAM_ATK/STREAM_REL) rather than recomputed
+   from scratch each frame. The backlog is what absorbs the source's silence, so
+   the rate only has to track the AVERAGE arrival rate and a 316 ms gap costs
+   nothing. Simulated against the real cadence this holds the speed inside
+   420-480 chars/s (1.1x, down from 4.7x) with the caret about 200 chars behind.
+   That lag is the price: when the `asst` event swaps this bubble out, those ~200
+   chars land at once. They land inside the one reflow the swap already causes.
+
+   Genuinely slow sources still show gaps. If the CLI is silent for 1.2 s there is
+   nothing to play out, and trickling a pause-free stream anyway would only misreport
+   how fast the model is going. */
+let streamEl=null, streamBuf='', streamRAF=0, streamRate=0, streamCarry=0, streamPrev=0;
+const STREAM_LAG=500;    /* ms of text kept buffered — must exceed the source's gap */
+const STREAM_ATK=900;    /* ms time constant for speeding up */
+const STREAM_REL=1500;   /* ms for slowing down — slower, so a lull does not stall us */
+const STREAM_MAX=3;      /* chars/ms ceiling while catching up */
+const STREAM_DUMP=2500;  /* backlog past which this is not typing any more — paste it */
+function streamTake(n){
+  const L=streamBuf.length;
+  if(n>L)n=L;
+  /* Hold back a trailing run of newlines. Emitting a line break with nothing after
+     it opens a blank line that then sits empty until the next chunk lands, and that
+     empty line opening and then filling is the jolt the eye catches at paragraph
+     breaks. Held newlines leave the buffer non-empty, so streamFlush must not
+     reschedule after an empty take or it would spin at 60fps doing nothing. */
+  let keep=L;while(keep>0&&streamBuf.charCodeAt(keep-1)===10)keep--;
+  if(!keep)return '';
+  if(n>keep)n=keep;
+  else{
+    while(n<keep&&streamBuf.charCodeAt(n-1)===10)n++;   /* break + next glyphs together */
+    const c=streamBuf.charCodeAt(n-1);
+    if(c>=0xD800&&c<=0xDBFF&&n<keep)n++;                /* never split a surrogate pair */
+  }
+  const out=streamBuf.slice(0,n);streamBuf=streamBuf.slice(n);return out;}
+function streamFlush(ts){
+  streamRAF=0;
+  if(!streamBuf)return;
+  let dt=streamPrev?ts-streamPrev:16;streamPrev=ts;
+  if(!(dt>0))dt=16;else if(dt>120)dt=120;  /* a backgrounded tab must not burst on return */
+  let take;
+  if(streamBuf.length>=STREAM_DUMP){take=streamBuf;streamBuf='';streamRate=0;streamCarry=0;}
+  else{
+    const want=streamBuf.length/STREAM_LAG;
+    if(!streamRate)streamRate=want;        /* first frame of a block: start up to speed */
+    else streamRate+=(want-streamRate)*(1-Math.exp(-dt/(want>streamRate?STREAM_ATK:STREAM_REL)));
+    if(streamRate>STREAM_MAX)streamRate=STREAM_MAX;
+    streamCarry+=streamRate*dt;
+    const n=Math.floor(streamCarry);
+    if(n<1){streamRAF=requestAnimationFrame(streamFlush);return;}
+    streamCarry-=n;take=streamTake(n);
+  }
+  if(take){
+    if(!streamEl){
+      const s0=atBottom();
+      const d=document.createElement('div');d.className='msg asst streaming';
+      d.innerHTML='<div class="b bubble"><span class="stxt"></span><span class="scaret"></span></div>';
+      stream.appendChild(d);streamEl=d.querySelector('.stxt');
+      if(s0)scroll();
+    }
+    const s=atBottom();
+    streamEl.appendChild(document.createTextNode(take));
+    if(s)scroll();
+    if(streamBuf)streamRAF=requestAnimationFrame(streamFlush);
+  }
+  /* took nothing: only held-back newlines remain — park until more text arrives */}
+function addStreamText(t){
+  if(!t)return;
+  streamBuf+=t;
+  /* restarting from parked: forget the stale clock and part-character, keep the rate */
+  if(!streamRAF){streamPrev=0;streamCarry=0;streamRAF=requestAnimationFrame(streamFlush);}}
+/* the provisional bubble is dropped the moment any authoritative event lands */
+function endStream(){
+  streamBuf='';streamRate=0;streamCarry=0;streamPrev=0;
+  if(streamRAF){cancelAnimationFrame(streamRAF);streamRAF=0;}
+  if(streamEl){const w=streamEl.closest('.msg');if(w)w.remove();streamEl=null;}}
 function addThink(text){const s=atBottom();const d=document.createElement('div');d.className='think'+(showThink?'':' hide');d.dataset.t=1;
   d.textContent=text;stream.appendChild(d);if(s)scroll();}
 function addNotice(t){const d=document.createElement('div');d.className='notice';d.textContent=t;stream.appendChild(d);}
@@ -3446,7 +3561,8 @@ function fmtSecs(ms){const s=Math.max(0,Math.round(ms/1000));if(s<60)return s+'s
 function doInterrupt(){if(!running)return;wsSend({type:'interrupt'});addNotice('⏹ interrupt sent');}
 function clearUI(){stream.innerHTML='';$('#edits').innerHTML='<div class="empty">no file changes yet</div>';
   $('#gitc').innerHTML='<div class="empty">—</div>';tools={};editCount=0;updateEditBadge();renderCtx(null);ready=false;
-  queued={};renderQueue();stopThinking();}
+  queued={};renderQueue();stopThinking();
+  endStream();}   /* also cancels a pending frame, which would else refill the cleared stream */
 
 /* file edits → out of chat, into the Changes drawer */
 function updateEditBadge(){$('#editN').textContent=editCount;}
@@ -3519,7 +3635,11 @@ function route(ev){
   /* if activity resumes while we think we're idle (e.g. the CLI ran an injected
      queued message as its own turn), step back into the busy state */
   if(!running&&(ev.kind==='assistant_text'||ev.kind==='thinking'||ev.kind==='tool_use'))setBusy(true);
-  if(ev.kind==='user_text')addUser(ev.text,ev.images);
+  /* every logged event is authoritative, so it supersedes the provisional
+     streaming bubble — drop it before rendering whatever really landed */
+  if(ev.kind!=='stream_text')endStream();
+  if(ev.kind==='stream_text')addStreamText(ev.text);
+  else if(ev.kind==='user_text')addUser(ev.text,ev.images);
   else if(ev.kind==='ready'){ready=true;cwd=ev.cwd||cwd;curCC=ev.session_id||curCC;if(ev.model)setResolvedModel(ev.model);addNotice('● session ready · '+(ev.model||'')+(ev.effort?' · '+ev.effort+' effort':'')+' · '+(ev.cwd||''));}
   else if(ev.kind==='assistant_text')addAsst(ev.text);
   else if(ev.kind==='thinking')addThink(ev.text);
