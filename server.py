@@ -1640,11 +1640,15 @@ class ChatSession:
         self.tasks = {}           # task id -> {subject, description, activeForm, status}
         self._task_open = {}      # TaskCreate tool_use id -> the task, until a result names it
         self._task_seq = 0        # creation ordinal; the fallback id if that text ever changes
+        self.event_seq = 0        # monotonic event number, so a viewer can ask for the gap
 
     def preload(self):
         """Populate history from the on-disk transcript before resuming."""
         if self.resume_cc:
             self.log = load_transcript_events(self.resume_cc)
+            for ev in self.log:
+                self.event_seq += 1
+                ev["_seq"] = self.event_seq
             self._fold_tasks(self.log)   # the plan the session was left holding
 
     def title(self):
@@ -2286,10 +2290,35 @@ class ChatSession:
         # replayed history converges on the same plan the live viewers are showing
         if self._fold_tasks(evs):
             evs = list(evs) + [{"kind": "plan", "tasks": self.plan_tasks()}]
+        for ev in evs:
+            self.event_seq += 1
+            ev["_seq"] = self.event_seq
         self.log.extend(evs)
         if len(self.log) > 1500:
             self.log = self.log[-1500:]
         self._emit({"type": "events", "events": evs})
+
+    def events_since(self, after_seq=None):
+        """What a viewer has not seen yet, when the window still reaches back that far.
+
+        Returns (events, is_delta). is_delta False means "here is the whole log,
+        build it from scratch": the viewer asked for nothing, or asked for a point
+        that has since fallen out of the 1500-event window. Otherwise it gets only
+        the gap, which is what makes returning to a long session cost the time you
+        were away rather than the whole conversation."""
+        if after_seq is None:
+            return self.log, False
+        try:
+            after = int(after_seq)
+        except (TypeError, ValueError):
+            return self.log, False
+        if after < 0 or after > self.event_seq:
+            return self.log, False    # nonsense, or a sequence from before a restart
+        if not self.log:
+            return [], True
+        if after < int(self.log[0].get("_seq") or 1) - 1:
+            return self.log, False    # the gap itself has been trimmed away
+        return [ev for ev in self.log if int(ev.get("_seq") or 0) > after], True
 
     def terminate(self):
         self.ended = True
@@ -2383,11 +2412,13 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                 self.session.detach(self)
             self.session = sess
             sess.attach(self)
+            events, events_delta = sess.events_since(msg.get("after_seq"))
             self._say({"type": "attached", "id": sess.id, "cwd": sess.cwd,
                        "name": os.path.basename(sess.cwd) or sess.cwd, "cc": sess.cc_id,
                        "title": sess.title(), "ctx": sess.ctx,
                        "model": sess.model or "default", "mode": sess.mode,
-                       "busy": sess.busy, "ended": sess.ended, "events": sess.log,
+                       "busy": sess.busy, "ended": sess.ended, "events": events,
+                       "events_delta": events_delta, "event_seq": sess.event_seq,
                        "turn_age": sess.turn_age(), "word": sess.turn_word, "effort": sess.effort,
                        "compacting": sess.compacting, "tasks": sess.plan_tasks()})
             # returning to an idle session that's been quiet a while → recap it now
@@ -2433,7 +2464,16 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "model": sess.model or "default", "mode": sess.mode,
                        "busy": sess.busy, "ended": sess.ended, "events": sess.log,
                        "turn_age": sess.turn_age(), "word": sess.turn_word, "effort": sess.effort,
-                       "compacting": sess.compacting, "resumed": True, "tasks": sess.plan_tasks()})
+                       "compacting": sess.compacting, "resumed": True, "tasks": sess.plan_tasks(),
+                       "events_delta": False, "event_seq": sess.event_seq})
+        elif mt == "detach":
+            # closing the last tab stops the VIEW, never the session: drop this
+            # socket's subscription so a background turn is not rendered into a
+            # console that is showing nothing.
+            if self.session:
+                self.session.detach(self)
+                self.session = None
+            self._say({"type": "detached"})
         elif mt == "approve" and self.session:
             self.session.resolve_approval(msg.get("aid"), bool(msg.get("allow")), bool(msg.get("always")))
         elif mt == "answer" and self.session:
@@ -2566,7 +2606,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                  "name": os.path.basename(s.cwd) or s.cwd,
                  "cc": s.cc_id, "model": s.model or "default", "mode": s.mode,
                  "effort": s.effort, "title": s.title(),
-                 "busy": s.busy, "ended": s.ended}
+                 "busy": s.busy, "ended": s.ended, "event_seq": s.event_seq}
                 for s in CHAT_SESSIONS.values()]})
 
     def on_close(self):
@@ -2913,6 +2953,43 @@ pre code{background:none;border:none;padding:0}
 @media(max-width:680px){.usage{display:none!important}}
 #shell{flex:1;display:flex;min-height:0;position:relative}
 #mainCol{flex:1;display:flex;flex-direction:column;min-width:0}
+/* Session tabs — the working set of THIS browser, not the list of what is running.
+   LIVE in the sidebar answers "what exists"; this strip answers "what do I have
+   open". Closing a tab is a view action and never touches the process, which is
+   why the close control says so and sits apart from End session. */
+#sessionTabs{flex:0 0 33px;height:33px;display:flex;align-items:stretch;
+  overflow-x:auto;overflow-y:hidden;background:var(--bg2);
+  border-bottom:1px solid var(--line);scrollbar-width:thin}
+#sessionTabs[hidden]{display:none}
+.stab{position:relative;display:flex;align-items:center;gap:6px;padding:0 5px 0 10px;
+  max-width:210px;min-width:0;border-right:1px solid var(--line);color:var(--mut);
+  font-size:12.5px;cursor:pointer;white-space:nowrap;user-select:none}
+.stab:hover{background:var(--bg3);color:var(--fg)}
+.stab.active{background:var(--bg);color:var(--fg)}
+.stab.active::after{content:"";position:absolute;left:0;right:0;bottom:0;height:2px;background:var(--acc)}
+.stab:focus-visible{outline:2px solid var(--acc);outline-offset:-2px}
+/* state carries a shape as well as a colour, so it survives colour-blindness and themes */
+.stab .sdot{flex:none;width:6px;height:6px;border-radius:50%;background:var(--line)}
+.stab.busy .sdot{background:var(--acc);animation:stabpulse 1.1s ease-in-out infinite}
+.stab.unread .sdot{background:var(--tool);box-shadow:0 0 0 2px color-mix(in srgb,var(--tool) 30%,transparent)}
+.stab.ended .sdot{background:transparent;box-shadow:inset 0 0 0 1px var(--mut)}
+.stab .stt{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.stab.ended .stt{opacity:.7;text-decoration:line-through}
+.stab.unread .stt{color:var(--fg);font-weight:600}
+.stab .sx{flex:none;width:17px;height:17px;display:inline-flex;align-items:center;
+  justify-content:center;border-radius:4px;font-size:10px;opacity:.4}
+.stab .sx:hover{opacity:1;background:var(--del);color:#fff}
+@keyframes stabpulse{50%{opacity:.35}}
+/* The chat keeps only a recent window of rendered rows; this marks what was dropped
+   and points at the one place the rest is still readable — the history index. */
+.trimmark{display:flex;align-items:center;gap:8px;margin:0 0 14px;padding:5px 10px;
+  border:1px dashed var(--line);border-radius:8px;color:var(--mut);font-size:12px}
+.trimmark .tmx{font-family:var(--fmono)}
+.trimmark .tmt{flex:1;min-width:0}
+.trimmark .tmb{flex:none;background:none;border:0;padding:0;color:var(--acc);
+  font-size:12px;cursor:pointer;text-decoration:underline}
+.trimmark .tmb:hover{color:var(--fg)}
+@media (prefers-reduced-motion:reduce){.stab.busy .sdot{animation:none}}
 #sidebar{width:var(--sbw,270px);flex-shrink:0;background:var(--bg2);border-right:1px solid var(--line);display:flex;flex-direction:column;overflow-y:auto}
 #sidebar.collapsed{display:none}
 /* desktop: drag handle on the sidebar's right edge to resize */
@@ -3256,6 +3333,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
     </div>
   </div></div>
   <div id="mainCol">
+    <div id="sessionTabs" role="tablist" aria-label="Open sessions" hidden></div>
     <div id="chat"><div class="plandock" id="planDock" hidden></div><div class="wrap" id="stream"></div></div>
     <div id="composer">
       <div class="pillrow">
@@ -3575,7 +3653,8 @@ function renderPlan(){
   else h+='<div class="pempty">no active task</div>';
   host.innerHTML=h+'</div>';host.hidden=false;
   const tg=host.querySelector('.ptoggle');if(tg)tg.onclick=togglePlan;}
-function togglePlan(){planCollapsed=!planCollapsed;renderPlan();}
+function togglePlan(){planCollapsed=!planCollapsed;
+  const t=tabById(sid);if(t){t.planCollapsed=planCollapsed;persistTabs();}renderPlan();}
 /* A finished plan is just clutter, so it retires itself. Re-checked when the timer
    fires: the session may have been switched, or new work may have reopened it. */
 function schedulePlanHide(){
@@ -3713,7 +3792,7 @@ function fmtSecs(ms){const s=Math.max(0,Math.round(ms/1000));if(s<60)return s+'s
 function doInterrupt(){if(!running)return;wsSend({type:'interrupt'});addNotice('⏹ interrupt sent');}
 function clearUI(){stream.innerHTML='';$('#edits').innerHTML='<div class="empty">no file changes yet</div>';
   $('#gitc').innerHTML='<div class="empty">—</div>';tools={};editCount=0;updateEditBadge();renderCtx(null);ready=false;
-  queued={};renderQueue();stopThinking();clearPlan();
+  queued={};renderQueue();stopThinking();clearPlan();trimHidden=0;
   endStream();}   /* also cancels a pending frame, which would else refill the cleared stream */
 
 /* file edits → out of chat, into the Changes drawer */
@@ -3784,6 +3863,11 @@ function fmtCompacted(ev){let s='🗜 context compacted';
   if(ev.ms)s+=' · '+Math.round(ev.ms/1000)+'s';
   return s;}
 function route(ev){
+  /* the cursor this tab can resume from — every switch back asks for what follows it */
+  const _s=Number(ev&&ev._seq||0);
+  if(_s){const _t=tabById(sid);
+    if(_t){_t.lastSeq=Math.max(Number(_t.lastSeq||0),_s);
+           _t.serverSeq=Math.max(Number(_t.serverSeq||0),_t.lastSeq);}}
   /* if activity resumes while we think we're idle (e.g. the CLI ran an injected
      queued message as its own turn), step back into the busy state */
   if(!running&&(ev.kind==='assistant_text'||ev.kind==='thinking'||ev.kind==='tool_use'))setBusy(true);
@@ -3810,6 +3894,7 @@ function route(ev){
   else if(ev.kind==='notice')addNotice(ev.text);
   else if(ev.kind==='recap')addRecap(ev.text);
   else if(ev.kind==='plan')setPlan(ev.tasks);
+  if(!replaying&&stream.children.length>CHAT_KEEP_ITEMS+120)trimChatWindow();
 }
 
 /* persistent server-side session: attach / reattach / switch */
@@ -3818,16 +3903,34 @@ function markEnded(msg){ready=false;ta.disabled=true;sendBtn.disabled=true;$('#d
 function onMsg(e){const m=JSON.parse(e.data);
   if(m.type==='started'){pendingStart=false;sid=m.id;cwd=m.cwd;bindProject(m.cwd);localStorage.setItem(SKEY,sid);loadDraft(sid);
     ready=true;setBusy(false);ta.focus();setCurname(m.name||'session');setEffortPill(m.effort);renderCtx(null);statset('ready');
+    const startedTab=ensureTab(m,true);
+    if(startedTab){startedTab.lastSeq=0;startedTab.serverSeq=0;persistTabs();renderTabs();}
+    restoredViewId=m.id;
     addNotice('new session « '+(m.name||'')+' »'+(m.effort?' · '+m.effort+' effort':'')+' in '+m.cwd+' — type your first message to begin');reqList();loadTree();}
-  else if(m.type==='attached'){clearUI();pendingStart=false;sid=m.id;curCC=m.cc||null;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
+  else if(m.type==='attached'){
+    /* a delta is only safe on top of the view it was measured against */
+    const incremental=!!m.events_delta&&restoredViewId===m.id,stick=incremental&&atBottom();
+    if(!incremental){clearUI();restoredViewId='';}
+    pendingStart=false;sid=m.id;curCC=m.cc||null;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
     ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));setEffortPill(m.effort);renderCtx(m.ctx);statset(m.ended?'ended':'ready');
+    const tab=ensureTab(m,true);if(tab&&!incremental)planCollapsed=!!tab.planCollapsed;
     replaying=true;m.events.forEach(route);replaying=false;
     setPlan(m.tasks);   /* authoritative: the log window may predate the plan */
+    trimChatWindow();
     compacting=!!m.compacting;setBusy(!!m.busy,m.word,(m.turn_age||0)*1000);loadDraft(sid);
     if(m.ended){markEnded('— this session has ended (history shown · you can resume it from disk) —');}
-    else{ta.disabled=false;sendBtn.disabled=false;addNotice('— '+(m.resumed?'resumed':'reattached to')+' « '+(m.name||'')+' » ('+m.events.length+' events)'+(m.effort?' with '+m.effort+' effort':'')+' —');}
-    scroll();requestAnimationFrame(scroll);reqList();loadTree();}
-  else if(m.type==='no_session'){localStorage.removeItem(SKEY);sid=null;ready=false;setBusy(false);setCurname('');renderCtx(null);statset('idle');
+    else{ta.disabled=false;sendBtn.disabled=false;
+      if(!incremental)addNotice('— '+(m.resumed?'resumed':'reattached to')+' « '+(m.name||'')+' » ('+m.events.length+' events)'+(m.effort?' with '+m.effort+' effort':'')+' —');}
+    const at=tabById(m.id);
+    if(at){at.lastSeq=Math.max(Number(at.lastSeq||0),Number(m.event_seq||0));
+           at.serverSeq=at.lastSeq;at.unread=false;persistTabs();renderTabs();}
+    restoredViewId=m.id;
+    if(incremental){if(stick){scroll();requestAnimationFrame(scroll);}}
+    else{scroll();requestAnimationFrame(scroll);}
+    reqList();loadTree();}
+  else if(m.type==='detached'){if(!sid){ready=false;ta.disabled=true;sendBtn.disabled=true;statset('idle');}}
+  else if(m.type==='no_session'){localStorage.removeItem(SKEY);sid=null;restoredViewId='';ready=false;setBusy(false);setCurname('');renderCtx(null);statset('idle');
+    if(m.id)dropTab(m.id);
     addNotice('that session is no longer running — pick it under “Resume from disk”, or ＋ New.');reqList();loadTree();}
   else if(m.type==='events')m.events.forEach(route);
   else if(m.type==='stderr')addErr(m.text);
@@ -3843,7 +3946,7 @@ function onMsg(e){const m=JSON.parse(e.data);
         pmanBatch=null;reqList();loadTree();}}
     else{addNotice(m.ok?'🗑 session moved to trash':('delete failed: '+(m.error||'?')));loadTree();}}
   else if(m.type==='renamed'){if(m.ok){if(m.cc&&m.cc===curCC&&m.name)setCurname(m.name);addNotice('✎ renamed');reqList();loadTree();}else addNotice('rename failed');}
-  else if(m.type==='sessions')renderLive(m.sessions);
+  else if(m.type==='sessions'){renderLive(m.sessions);syncTabs(m.sessions);}
   else if(m.type==='context')renderCtx(m.ctx);
   else if(m.type==='tokens'){tokUp=m.up||0;tokOut=m.out||0;tokShow=true;
     if(m.word!=null&&m.word!==lastWordSeed){lastWordSeed=m.word;if(running&&!compacting)setWord(m.word);}}
@@ -3851,8 +3954,15 @@ function onMsg(e){const m=JSON.parse(e.data);
 }
 function openWs(cb){const proto=location.protocol==='https:'?'wss:':'ws:';
   ws=new WebSocket(proto+'//'+location.host+'/ws/chat');
-  ws.onopen=()=>{clearTimeout(reconnectT);$('#dot').className='dot '+(ready?'on':'');if(cb)cb();reqList();
-    const saved=localStorage.getItem(SKEY);if(saved&&!sid&&!pendingStart){statset('reattaching…');ws.send(JSON.stringify({type:'attach',id:saved}));}};
+  ws.onopen=()=>{clearTimeout(reconnectT);$('#dot').className='dot '+(ready?'on':'');reqList();
+    if(cb){cb();return;}
+    /* a dropped socket left the server with no subscription, so re-attach even
+       when sid still looks set — and if the rendered view survived the drop, ask
+       for the gap instead of the whole conversation */
+    const saved=localStorage.getItem(SKEY);
+    if(saved&&!pendingStart){const req={type:'attach',id:saved},t=tabById(saved);
+      if(restoredViewId===saved&&t)req.after_seq=Number(t.lastSeq||0);else statset('reattaching…');
+      ws.send(JSON.stringify(req));}};
   ws.onclose=()=>{$('#dot').className='dot';statset('disconnected');ta.disabled=true;sendBtn.disabled=true;
     clearTimeout(reconnectT);reconnectT=setTimeout(()=>openWs(),1800);};
   ws.onmessage=onMsg;}
@@ -3871,7 +3981,7 @@ function cellBar(pct){const p=Math.max(0,Math.min(100,pct)),lit=Math.min(5,Math.
   let s='<span class="cells lv-'+meterLvl(p)+'">';
   for(let i=1;i<=5;i++)s+='<span class="cell'+(i<=lit?' on':'')+'"></span>';
   return s+'</span>';}
-function renderCtx(c){const el=$('#ctx');
+function renderCtx(c){const el=$('#ctx');curCtx=c||null;
   if(!c||c.percentage==null){el.style.display='none';return;}
   const pct=Math.round(c.percentage);
   el.className='ctx';el.style.display='inline-flex';
@@ -4423,24 +4533,218 @@ function acMove(d){const els=$('#cwdac').querySelectorAll('.acitem');if(!els.len
 function acQuery(){clearTimeout(acTimer);const q=$('#cwd').value;
   acTimer=setTimeout(()=>fetch('api/dircomplete?q='+encodeURIComponent(q)).then(r=>r.json()).then(acRender).catch(acClose),130);}
 
-function switchSession(id){if(!id||id===sid)return;saveDraft();clearUI();statset('switching…');wsSend({type:'attach',id:id});
+/* ── session tabs, cached views, bounded chat window ──────────────────────────
+   Switching used to cost a full rebuild: clearUI() threw the rendered chat away
+   and the server re-sent its whole log, so returning to the session you talk to
+   most was the slowest thing the console did (measured on a real thread: 1000
+   events, 1.0 MB of JSON, 180 markdown re-renders, 762 tool cards — every time).
+   Nothing about that was ever needed. The session had not gone anywhere: the
+   server has always kept it running and only dropped the subscription.
+
+   So two things are kept instead of rebuilt. The rendered DOM goes into a cache
+   keyed by session, and comes back as a DocumentFragment; and every event now
+   carries a sequence number, so an attach can say "I have through 412" and get
+   back only the gap. A switch is then a swap plus whatever happened while away.
+
+   Tabs are the visible half. The sidebar's LIVE list answers "what is running";
+   this strip answers "what do I have open", which is a smaller and much more
+   stable set. The two must not be confused, hence: closing a tab never ends a
+   session, and the close control says so. */
+const TABKEY='cc_session_tabs';
+let tabState=[],tabsValidated=false,viewCache=new Map(),restoredViewId='',curCtx=null;
+try{const sv=JSON.parse(localStorage.getItem(TABKEY)||'[]');
+  if(Array.isArray(sv))tabState=sv.filter(t=>t&&typeof t.id==='string').slice(0,24);}catch(e){}
+function tabById(id){return tabState.find(t=>t.id===id)||null;}
+function tabLabel(t){return t.title||t.name||('session '+String(t.id||'').slice(0,6));}
+/* persist the shape explicitly — a tab record also carries live-only junk (scroll
+   metrics) that has no business surviving a reload half-updated */
+function persistTabs(){try{localStorage.setItem(TABKEY,JSON.stringify(tabState.map(t=>({
+    id:t.id,cc:t.cc||null,title:t.title||'',name:t.name||'',cwd:t.cwd||'',
+    busy:!!t.busy,ended:!!t.ended,unread:!!t.unread,lastSeq:Number(t.lastSeq||0),
+    serverSeq:Number(t.serverSeq||0),scrollTop:Number(t.scrollTop||0),
+    atBottom:t.atBottom!==false,planCollapsed:!!t.planCollapsed}))));}catch(e){}}
+function renderTabs(){
+  const host=$('#sessionTabs');if(!host)return;
+  /* before the first session list lands we cannot tell which stored tabs are still
+     real, so an unvalidated strip with nothing open stays out of the way */
+  host.hidden=!tabState.length||(!tabsValidated&&!sid);
+  host.innerHTML='';if(host.hidden)return;
+  tabState.forEach(t=>{
+    const el=document.createElement('div');
+    el.className='stab'+(t.id===sid?' active':'')+(t.busy?' busy':'')+
+      (t.unread&&t.id!==sid?' unread':'')+(t.ended?' ended':'');
+    el.setAttribute('role','tab');el.setAttribute('aria-selected',t.id===sid?'true':'false');
+    el.tabIndex=t.id===sid?0:-1;
+    el.title=tabLabel(t)+(t.cwd?'\n'+shortPath(t.cwd):'')+(t.ended?'\nended':'');
+    el.innerHTML='<span class="sdot"></span><span class="stt"></span>'+
+      '<span class="sx" role="button" tabindex="-1" aria-label="Close tab" '+
+      'title="Close tab — the session keeps running">✕</span>';
+    el.querySelector('.stt').textContent=tabLabel(t);
+    el.onclick=ev=>{if(!ev.target.classList.contains('sx'))switchSession(t.id);};
+    el.querySelector('.sx').onclick=ev=>{ev.stopPropagation();closeTab(t.id);};
+    el.onauxclick=ev=>{if(ev.button===1){ev.preventDefault();closeTab(t.id);}};
+    el.onkeydown=tabKeydown;
+    host.appendChild(el);});
+  const act=host.querySelector('.stab.active');
+  if(act&&act.scrollIntoView)act.scrollIntoView({block:'nearest',inline:'nearest'});}
+function tabKeydown(ev){
+  if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();ev.currentTarget.click();return;}
+  if(!['ArrowLeft','ArrowRight','Home','End'].includes(ev.key))return;
+  const tabs=[...$('#sessionTabs').querySelectorAll('.stab')];let i=tabs.indexOf(ev.currentTarget);
+  if(i<0||!tabs.length)return;
+  if(ev.key==='Home')i=0;else if(ev.key==='End')i=tabs.length-1;
+  else i=(i+(ev.key==='ArrowRight'?1:-1)+tabs.length)%tabs.length;
+  ev.preventDefault();tabs[i].focus();tabs[i].click();}
+/* a tab appears when a session is OPENED here, not merely because it is running */
+function ensureTab(s,active){
+  if(!s||!s.id)return null;
+  let t=tabById(s.id);
+  if(!t){t={id:s.id,cc:s.cc||null,title:'',name:'',cwd:'',busy:false,ended:false,unread:false,
+    lastSeq:0,serverSeq:0,scrollTop:0,atBottom:true,planCollapsed:false};tabState.push(t);}
+  if(s.cc)t.cc=s.cc;if(s.title)t.title=s.title;if(s.name)t.name=s.name;if(s.cwd)t.cwd=s.cwd;
+  if(s.busy!==undefined)t.busy=!!s.busy;
+  if(s.ended!==undefined)t.ended=!!s.ended;
+  const ss=Number(s.event_seq||0);if(ss)t.serverSeq=Math.max(Number(t.serverSeq||0),ss);
+  if(active)t.unread=false;
+  tabsValidated=true;persistTabs();renderTabs();return t;}
+/* the session list is the authority on what still exists: a tab whose process is
+   gone is a dead view, and its cached DOM is just memory */
+function syncTabs(list){
+  const by=new Map((list||[]).map(s=>[s.id,s]));
+  tabState.forEach(t=>{if(!by.has(t.id))viewCache.delete(t.id);});
+  tabState=tabState.filter(t=>by.has(t.id));
+  tabState.forEach(t=>{const s=by.get(t.id);
+    t.busy=!!s.busy;t.ended=!!s.ended;
+    if(s.cc)t.cc=s.cc;if(s.title)t.title=s.title;if(s.name)t.name=s.name;if(s.cwd)t.cwd=s.cwd;
+    const ss=Number(s.event_seq||0);if(ss)t.serverSeq=Math.max(Number(t.serverSeq||0),ss);
+    if(t.id!==sid&&Number(t.serverSeq||0)>Number(t.lastSeq||0))t.unread=true;});
+  tabsValidated=true;persistTabs();renderTabs();}
+function dropTab(id){const i=tabState.findIndex(t=>t.id===id);
+  if(i>=0){tabState.splice(i,1);persistTabs();renderTabs();}viewCache.delete(id);}
+function closeTab(id){
+  const i=tabState.findIndex(t=>t.id===id);if(i<0)return;
+  const active=id===sid;
+  if(active){saveDraft();rememberTabView();}
+  viewCache.delete(id);tabState.splice(i,1);persistTabs();renderTabs();
+  if(!active)return;
+  const next=tabState[Math.min(i,tabState.length-1)];
+  if(next){switchSession(next.id);return;}
+  /* last tab closed: stop viewing, do not stop working */
+  wsSend({type:'detach'});sid=null;restoredViewId='';localStorage.removeItem(SKEY);
+  clearUI();ready=false;setBusy(false);setCurname('');renderCtx(null);statset('idle');
+  ta.disabled=true;sendBtn.disabled=true;
+  addNotice('— tab closed · that session is still running · reopen it from Live —');}
+
+/* ── cached views ──────────────────────────────────────────────────────────── */
+function takeChildren(el){const f=document.createDocumentFragment();
+  if(el)while(el.firstChild)f.appendChild(el.firstChild);return f;}
+function restoreChildren(el,frag){if(!el)return;el.innerHTML='';if(frag)el.appendChild(frag);}
+function rememberTabView(){const t=tabById(sid),c=$('#chat');if(!t||!c)return;
+  t.scrollTop=c.scrollTop;t.atBottom=c.scrollHeight-c.scrollTop-c.clientHeight<140;}
+function restoreTabView(id){const t=tabById(id),c=$('#chat');if(!t||!c)return;
+  /* after the fragment is in the document but before paint, so it never flashes */
+  requestAnimationFrame(()=>{c.scrollTop=(t.atBottom!==false)?c.scrollHeight:(t.scrollTop||0);});}
+function stashView(id){
+  if(!id)return false;const t=tabById(id);if(!t)return false;
+  endStream();trimChatWindow();rememberTabView();
+  if(planHideT){clearTimeout(planHideT);planHideT=0;}
+  viewCache.set(id,{stream:takeChildren(stream),plan:takeChildren($('#planDock')),
+    planHidden:$('#planDock').hidden,edits:takeChildren($('#edits')),git:takeChildren($('#gitc')),
+    tools:tools,editCount:editCount,queued:queued,planTasks:planTasks,planCollapsed:planCollapsed,
+    trimHidden:trimHidden,ctx:curCtx,cwd:cwd,cc:curCC,ready:ready,running:running,
+    compacting:compacting,word:lastWordSeed,elapsed:running?Math.max(0,Date.now()-thinkStart):0,
+    tokUp:tokUp,tokOut:tokOut,tokShow:tokShow,effort:curEffort,
+    title:$('#curname').textContent||tabLabel(t)});
+  persistTabs();return true;}
+function restoreView(id){
+  const v=viewCache.get(id);if(!v)return false;
+  restoreChildren(stream,v.stream);
+  restoreChildren($('#planDock'),v.plan);$('#planDock').hidden=!!v.planHidden;
+  restoreChildren($('#edits'),v.edits);restoreChildren($('#gitc'),v.git);
+  tools=v.tools||{};editCount=v.editCount||0;queued=v.queued||{};
+  planTasks=v.planTasks||[];planCollapsed=!!v.planCollapsed;trimHidden=Number(v.trimHidden||0);
+  cwd=v.cwd||'';curCC=v.cc||null;compacting=!!v.compacting;
+  tokUp=v.tokUp||0;tokOut=v.tokOut||0;tokShow=!!v.tokShow;
+  ready=!!v.ready;                       /* before setBusy: it gates the composer on it */
+  bindProject(cwd);setCurname(v.title);renderCtx(v.ctx);setEffortPill(v.effort);
+  updateEditBadge();renderQueue();
+  running=false;setBusy(!!v.running,v.word,v.elapsed);   /* restarts the timer where it was */
+  loadDraft(id);restoreTabView(id);restoredViewId=id;return true;}
+
+/* ── bounded chat window ───────────────────────────────────────────────────────
+   Several cached tabs at once is several rendered conversations held in memory,
+   so each keeps only a recent window. What falls out is not lost — it is on disk
+   and in the history index — so the marker that replaces it links straight there. */
+const CHAT_KEEP_ITEMS=400;
+const CHAT_KEEP_CHARS=250000;
+let trimHidden=0;
+/* never drop something the user still has to act on, or the live bubble */
+function trimBlocked(n){const c=n.classList;return !!c&&(
+  (c.contains('approval')&&!c.contains('done'))||
+  (c.contains('question')&&!c.contains('done'))||c.contains('streaming'));}
+function trimChatWindow(){
+  /* the marker is bookkeeping, not content: keep it out of the candidate list
+     entirely, or a trim that has nothing left to drop removes the marker itself
+     and then returns early without putting it back */
+  const kids=[...stream.children].filter(n=>!n.classList.contains('trimmark'));
+  let keep=0,chars=0,i=kids.length-1;
+  for(;i>=0;i--){
+    keep++;chars+=(kids[i].textContent||'').length;
+    if(keep>=CHAT_KEEP_ITEMS||chars>=CHAT_KEEP_CHARS)break;}
+  if(i<=0)return;
+  let cut=0;for(;cut<i;cut++)if(trimBlocked(kids[cut]))break;
+  if(!cut)return;
+  for(let k=0;k<cut;k++)kids[k].remove();
+  trimHidden+=cut;
+  /* tool cards live in this map by id; the pruned ones would be detached forever */
+  for(const id in tools)if(!tools[id].isConnected)delete tools[id];
+  renderTrimMark();}
+function renderTrimMark(){
+  let m=stream.querySelector('.trimmark');
+  if(!trimHidden){if(m)m.remove();return;}
+  if(!m){m=document.createElement('div');m.className='trimmark';
+    m.innerHTML='<span class="tmx">⋯</span><span class="tmt"></span>'+
+      '<button type="button" class="tmb">search this conversation</button>';
+    m.querySelector('.tmb').onclick=()=>{const sc=$('#srchscope');
+      if(sc)sc.value='session';openSearch();};}
+  m.querySelector('.tmt').textContent=trimHidden+' earlier '+
+    (trimHidden===1?'item':'items')+' hidden to keep this tab fast';
+  if(stream.firstChild!==m)stream.insertBefore(m,stream.firstChild);}
+/* A switch is now: put the old view away, take the new one out, ask only for the
+   gap. The uncached path is the old one — a full replay — so a session opened for
+   the first time this page-load still works exactly as before, just once. */
+function switchSession(id){
+  if(!id)return;
+  if(id===sid){const cur=tabById(id);
+    if(cur&&cur.unread){cur.unread=false;persistTabs();renderTabs();}
+    if(window.innerWidth<=860)closeSidebar();return;}
+  const live=liveSessions.find(s=>s.id===id);if(live)ensureTab(live,false);
+  stashView(sid);saveDraft();clearUI();restoredViewId='';
+  sid=id;const t=tabById(id);if(t)t.unread=false;
+  localStorage.setItem(SKEY,id);persistTabs();renderTabs();
+  const cached=restoreView(id);if(!cached)statset('switching…');
+  const go=()=>{const req={type:'attach',id:id};
+    if(cached)req.after_seq=Number((tabById(id)||{}).lastSeq||0);wsSend(req);};
+  if(ws&&ws.readyState===1)go();else openWs(go);
   if(window.innerWidth<=860)closeSidebar();}
-function resumeSession(s){if(!s||!s.cc)return;saveDraft();clearUI();pendingStart=true;sid=null;statset('resuming…');
+function resumeSession(s){if(!s||!s.cc)return;
+  stashView(sid);saveDraft();clearUI();restoredViewId='';pendingStart=true;sid=null;
+  renderTabs();statset('resuming…');
   const go=()=>wsSend({type:'resume',cc:s.cc,cwd:s.cwd,model:$('#model').value,mode:$('#mode').value});
   if(ws&&ws.readyState===1)go();else openWs(go);
   if(window.innerWidth<=860)closeSidebar();}
 function newSession(){const proj=$('#project').value;const dir=proj==='__custom__'?$('#cwd').value.trim():proj;
   if(!dir){addErr('pick a project directory first');return;}
   /* keep any current session alive in the background — just spin up another */
-  saveDraft();clearUI();pendingStart=true;sid=null;
+  stashView(sid);saveDraft();clearUI();restoredViewId='';pendingStart=true;sid=null;renderTabs();
   const start=()=>wsSend({type:'start',cwd:dir,model:$('#model').value,mode:$('#mode').value,effort:curEffort});
   if(ws&&ws.readyState===1)start();else openWs(start);statset('starting…');
   if(window.innerWidth<=860)closeSidebar();}
 function endSessionById(id,name){if(!id)return;
   if(!confirm('End session '+(name?'« '+name+' »':'')+'?\nIts claude process stops; you can still resume it from disk later.'))return;
   wsSend({type:'end',id:id});
-  if(id===sid){sid=null;setCurname('');markEnded('session ended');}
-  reqList();loadTree();}
+  if(id===sid){sid=null;restoredViewId='';setCurname('');markEnded('session ended');}
+  dropTab(id);reqList();loadTree();}
 /* image attachments: paste (Ctrl/Cmd+V) an image into the composer */
 let pendingImages=[];
 const MAX_IMG=8, MAX_IMG_BYTES=5*1024*1024, OK_IMG=['image/png','image/jpeg','image/gif','image/webp'];
