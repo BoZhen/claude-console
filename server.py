@@ -2906,6 +2906,16 @@ pre code{background:none;border:none;padding:0}
 .srow .ssub{font-size:11px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .srow .skebab{flex-shrink:0;font-size:18px;line-height:1;padding:1px 6px;color:var(--fg);cursor:pointer;opacity:.9;border-radius:5px;user-select:none}
 .srow:hover .skebab{opacity:1}.srow .skebab:hover{color:var(--acc);background:var(--bg3)}
+/* A project's actions button is a horizontal ··· in a padded box: the vertical ⋮
+   stays the session affordance, so the two never read as the same control, and
+   the 26x24 target is hittable — the bare glyph was a ~10px-wide tap area.
+   Drawn as three dots rather than typed, so it can't shift with the font. */
+.prow .pkebab{flex-shrink:0;display:flex;align-items:center;justify-content:center;
+  gap:2.5px;width:26px;height:24px;padding:0;border-radius:6px;opacity:.55}
+.prow .pkebab::before,.prow .pkebab::after,.prow .pkebab>i{content:"";width:3px;height:3px;
+  border-radius:50%;background:currentColor}
+.prow:hover .pkebab{opacity:1}
+.prow .pkebab:hover{color:var(--acc);background:var(--bg3)}
 /* project groups — the sidebar is grouped by folder, so a row is a project and
    the sessions it owns nest under it. A project is Live when one of its sessions
    is running, which is why the Live section lists folders, not threads. */
@@ -3751,9 +3761,16 @@ function buildProjects(){
     p.sortKey=p.liveS.length?now:(p.mtime||0);
     return p;}).sort((a,b)=>(b.sortKey||0)-(a.sortKey||0));}
 
+/* Live is sorted by NAME, not recency. Every live project shares the same
+   activity sortKey, so a recency order has nothing to break ties with and the
+   rows reshuffle on each refresh — the section you watch while working is the
+   one that must hold still. Favorites and Recent stay newest-first: there the
+   ordering carries real information. */
+const byName=(a,b)=>(a.name||'').localeCompare(b.name||'',undefined,
+                                               {numeric:true,sensitivity:'base'});
 function renderSidebar(){
   const all=buildProjects();
-  const live=all.filter(p=>p.isLive);
+  const live=all.filter(p=>p.isLive).sort(byName);
   const fav=all.filter(p=>!p.isLive&&p.fav);
   const rest=all.filter(p=>!p.isLive&&!p.fav).slice(0,40);
   $('#liveN').textContent=live.length;
@@ -3773,7 +3790,8 @@ function projGroup(p){
   r.innerHTML='<span class="caret"></span>'+
     '<div class="pmeta"><div class="pname">'+esc(p.name)+(p.fav?' <span class="pstar">★</span>':'')+'</div>'+
     '<div class="psub">'+esc(p.sub||shortPath(p.path))+'</div></div>'+
-    '<span class="pn">'+p.total+'</span><span class="skebab" title="more">⋮</span>';
+    '<span class="pn">'+p.total+'</span>'+
+    '<span class="skebab pkebab" title="project actions" aria-label="project actions"><i></i></span>';
   r.onclick=ev=>{if(ev.target.closest('.skebab'))return;
     if(pExp.has(p.path))pExp.delete(p.path);else pExp.add(p.path);
     saveExp();g.classList.toggle('open');};
