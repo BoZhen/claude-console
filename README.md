@@ -1,5 +1,7 @@
 # Claude Console
 
+English | [简体中文](README.zh-CN.md)
+
 An interactive, browser-driven GUI for **Claude Code** that separates the two
 things a raw terminal tangles together:
 
