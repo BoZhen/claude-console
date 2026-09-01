@@ -6,5 +6,11 @@ __pycache__/
 .omx/
 .claude/
 .venv/
+
+# The repository carries the program and what a stranger needs to run it.
+# Design notes, recovery snapshots and local test scratch are working material
+# rather than the product, and some of it is simply personal.
+DESIGN.md
 docs/snapshot.md
 session_snapshot/
+tests/
