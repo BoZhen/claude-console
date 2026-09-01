@@ -7,3 +7,4 @@ __pycache__/
 .claude/
 .venv/
 docs/snapshot.md
+session_snapshot/
