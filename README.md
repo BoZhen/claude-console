@@ -9,11 +9,16 @@ things a raw terminal tangles together:
   live `git diff` of the working directory (ground truth)
 
 <p align="center">
-  <img src="figs/light-theme.png" alt="Claude Console — One Light theme, AskUserQuestion" width="49%">
-  <img src="figs/approve.png" alt="Claude Console — per-action approval (Approve / Always / Deny)" width="49%">
+  <img src="figs/chat-plan-math-links.png" width="49%"
+       alt="Claude Console — the plan pinned above the chat, KaTeX math, and file paths as links">
+  <img src="figs/choices-and-attachments.png" width="49%"
+       alt="Claude Console — an AskUserQuestion card with options, and a file waiting in the composer">
 </p>
 <p align="center">
-  <img src="figs/dark-theme.png" alt="Claude Console — Dracula theme, LaTeX rendering" width="49%">
+  <sub>Left: the plan stays pinned while the answer scrolls under it; math renders with KaTeX and
+  file paths become links that open in a web file manager. Right: the agent asking <em>you</em> a
+  question, with the plan folded to just the active task and a file attached to the next message.
+  Both in the One Light theme.</sub>
 </p>
 
 It drives Claude Code through the **Claude Agent SDK** (which runs the real
@@ -24,37 +29,87 @@ which is the whole point.
 
 ## Features
 
+### Reading what it is doing
+
 - **Chat / code split** — prose in the stream; tool calls as collapsible change
   cards. Click **see Changes** on any edit to open the drawer focused on *just
   that file*, or switch to the live **Git diff** tab for the whole working tree.
-- **Multi-session sidebar** — Live / Favorites / Recent / In-folder sections
-  (each collapsible). Each card has a `⋮` menu: rename, favorite, delete, end.
-  Drag the sidebar's right edge to resize (double-click to reset).
+- **Streaming answers** — replies appear as they are written. The CLI emits in
+  bursts, so the text is played out of a small jitter buffer at a steady rate
+  instead of arriving a sentence and a half at a time; formatting and math are
+  typeset once, when the block completes, so nothing reflows mid-sentence.
+- **Folded tool runs** — consecutive calls to the *same* tool collapse into one
+  row (`▶ Bash ×5  ruff check .  1 failed`) that expands to the individual
+  cards. Anything in between — an answer, an edit, an approval — ends the run.
+- **Plan dock** — when Claude keeps a task list, it is pinned above the chat
+  with the current step, a progress count, and a fold to just the active task.
+  It retires itself a couple of seconds after the last task is done.
+- **LaTeX rendering** — `$…$`, `$$…$$`, `\(…\)`, `\[…\]` in replies render with
+  KaTeX (vendored, offline).
+- **Clickable file paths** — a path in a reply (`~/work/lattice-qmc/observables.py`)
+  renders as a link; clicking it opens **that file in a web file manager** in a new
+  tab, so you can look at what the agent is talking about without leaving the
+  conversation. Point `CLAUDE_CONSOLE_WEBFM_URL` at yours (defaults to this host
+  on `:7701`); markdown links to local paths work the same way.
+
+### Working across sessions
+
+- **Session tabs** — the sessions you have open, above the chat. Switching is a
+  swap, not a reload: the rendered view is kept and the server sends only what
+  happened while you were away. **Closing a tab never ends the session** — the
+  sidebar's LIVE list is what is running, the tabs are what you have open.
+- **Multi-session sidebar** — projects grouped by folder, with Live / Favorites
+  / Recent / In-folder sections (each collapsible). A project's own button opens
+  a new session there, browses the folder, favorites or renames it, or opens
+  **Manage sessions** to clean up several at once; a session's `⋮` covers
+  configure, rename, export and end (or delete to trash, for one on disk). Drag
+  the right edge to resize, double-click to reset.
 - **Resumable sessions** — reopen a project and pick up a previous Claude Code
   conversation (transcripts under `~/.claude/projects` restore history and the
   right `cwd`).
+- **Full-text history search** (`⌘/Ctrl+K`) — search everything you and Claude
+  ever said, plus the files and commands it touched, scoped to all history / this
+  folder / this conversation. Results open in a read-only viewer, so finding
+  something never disturbs the session you are in.
+- **Export / import** — take a conversation to another machine as `.jsonl`, or
+  adopt one here; **Import folder** pins a directory as a project before it has
+  any history.
+- **Session recap** — come back to a session that has been idle and it opens with
+  a short summary of where it was left.
+- **Per-session drafts** — half-typed messages stay with their session and
+  survive a reload.
+
+### Talking to it
+
 - **Interactive round-trips** — per-action approval with three choices
   (**Approve** / **Approve & don't ask again this session** / **Deny**) in 🔐
   Approve mode, plus in-browser **AskUserQuestion** cards; your pick is fed back
   to the agent.
-- **Message queue** — type while the agent is busy and the message queues; it is
-  injected into the running turn at the next tool boundary (steering). Click a
-  queued chip (or press ↑) to withdraw it back into the editor and edit it.
+- **Message queue** — type while the agent is busy and the message queues, then
+  sends when the turn ends. Click a queued chip (or press ↑) to withdraw it back
+  into the editor, or hit its **⚡** to steer it into the *running* turn. Steering
+  is per-message and opt-in because the CLI shows a mid-turn message to the model
+  as a reminder to carry on with what it was doing — it is delivered reliably,
+  but a visible reply is not guaranteed.
+- **Attachments** — 📎 in the composer, or drag-and-drop, or paste. Images go as
+  multimodal blocks; other files are **saved into the session's working
+  directory** and named in the message, so Claude can read, edit and *run* them
+  rather than only look at them. Works from a phone, which pasting did not.
 - **Thinking effort** — a `🧠` pill (low / medium / high / xhigh / max) to set
   reasoning depth, switchable on the fly (the session relaunches with the new
   `--effort`).
-- **Image paste** — paste a screenshot (`Ctrl/Cmd+V`) into the composer to send
-  it as a multimodal message.
-- **LaTeX rendering** — `$…$`, `$$…$$`, `\(…\)`, `\[…\]` in replies render with
-  KaTeX (vendored, offline).
+- Pick **project dir**, **model** (`↻` refreshes the list from the API) and
+  **permission mode** (⚡ Auto-accept / 🔐 Approve / 📋 Plan / ⏩ Full auto) when
+  starting a session, or change them per session afterwards.
+
+### Everything else
+
 - **13 color themes** — light & dark (Dark, Dracula, Nord, Tokyo Night,
   Catppuccin, Gruvbox, Light, Solarized Light, Rosé Pine Dawn, One Light, Ayu
   Light, …), switchable from the sidebar; choice persists per device.
 - **At-a-glance status** — context-window and rolling 5-hour usage meters in the
-  header; a floating status pill (ready / working timer) plus the effort pill
-  above a full-width composer.
-- Pick **project dir**, **model** (default/opus/sonnet/haiku) and **permission
-  mode** when starting a session.
+  header; a floating status pill (ready / working timer / live token counts) plus
+  the effort pill above a full-width composer.
 
 ## Run
 
@@ -74,6 +129,7 @@ cards and the **Git diff** drawer update live as the agent works.
 | `CLAUDE_CONSOLE_PORT` | `7703` | listen port |
 | `CLAUDE_CONSOLE_BIND` | `127.0.0.1` | bind address; set `0.0.0.0` for LAN access |
 | `CLAUDE_CONSOLE_AUTH` | *(disabled)* | optional HTTP Basic Auth `user:pass` |
+| `CLAUDE_CONSOLE_WEBFM_URL` | this host on `:7701` | web file manager to open clicked file paths in |
 
 The legacy `AGENTLENS_*` names are still honored as a fallback.
 
@@ -88,6 +144,13 @@ The legacy `AGENTLENS_*` names are still honored as a fallback.
 - Intentionally a single `server.py` with inline HTML/CSS/JS — **no build step**.
 - [KaTeX](https://katex.org/) is vendored under `static/katex/` (MIT) for offline
   math rendering.
+- Non-image attachments are written to `.claude-console/uploads/` inside the
+  session's working directory, so the agent can open and run them. That folder
+  ignores itself in git (it ships a `.gitignore` containing `*`), and nothing is
+  written for a queued message you withdraw before it sends.
+- Very long conversations keep a bounded window of *rendered* messages per tab;
+  older ones fold into a marker that links to the history search. Nothing is
+  deleted — the full transcript stays on disk under `~/.claude/projects`.
 
 ## License
 
