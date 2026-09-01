@@ -102,6 +102,15 @@ which is the whole point.
   The text goes to the session that started the recording, so you can switch tabs
   while it transcribes. Off unless you configure it (below); no audio leaves the
   machine, and the browser needs HTTPS or localhost to reach a microphone at all.
+- **Punctuation from the pauses you actually made** — speech models return a wall
+  of words, which is unreadable in Chinese and tiring in English. Silences are
+  measured against the word timings and become punctuation: half a second is a
+  comma, over a second is a full stop, and the ending takes a question mark when
+  the wording asks something (`是否…`, `…吗`, `what/why/how…`). Both thresholds
+  are yours to set, because where a comma belongs is a matter of ear.
+- **Chinese comes out Simplified** — optionally normalized with OpenCC, which
+  converts vocabulary and not just characters (`軟體` → `软件`, `記憶體` → `内存`),
+  so Taiwanese dictation does not leave Taiwanese terms in the text.
 - **Thinking effort** — a `🧠` pill (low / medium / high / xhigh / max) to set
   reasoning depth, switchable on the fly (the session relaunches with the new
   `--effort`).
@@ -141,8 +150,14 @@ CLAUDE_CONSOLE_TRANSCRIBE=1 \
 CLAUDE_CONSOLE_TRANSCRIBE_PYTHON=~/miniforge3/envs/faster-whisper/bin/python \
 CLAUDE_CONSOLE_TRANSCRIBE_MODEL=~/models/faster-whisper-large-v3-turbo \
 CLAUDE_CONSOLE_TRANSCRIBE_DEVICE=cuda CLAUDE_CONSOLE_TRANSCRIBE_COMPUTE_TYPE=float16 \
+CLAUDE_CONSOLE_TRANSCRIBE_PAUSE_PUNCTUATION=1 \
+CLAUDE_CONSOLE_TRANSCRIBE_CHINESE_CONVERSION=tw2sp \
 python claude_console.py
 ```
+
+`PAUSE_PUNCTUATION` and `CHINESE_CONVERSION` are both off by default and both
+worth turning on. Without the first, a paragraph of dictation arrives as one
+unbroken run of words.
 
 Browsers only expose a microphone in a secure context, so serve the console over
 HTTPS (a reverse proxy, or `tailscale serve`) unless you open it on `localhost`.
@@ -160,8 +175,10 @@ HTTPS (a reverse proxy, or `tailscale serve`) unless you open it on `localhost`.
 | `CLAUDE_CONSOLE_TRANSCRIBE_DEVICE_INDEX` | `0` | which GPU |
 | `CLAUDE_CONSOLE_TRANSCRIBE_COMPUTE_TYPE` | `default` | e.g. `float16`, `int8` |
 | `CLAUDE_CONSOLE_TRANSCRIBE_LANGUAGE` | *(auto-detect)* | pin the spoken language |
-| `CLAUDE_CONSOLE_TRANSCRIBE_CHINESE_CONVERSION` | `none` | `t2s` / `tw2sp` — normalize to Simplified |
-| `CLAUDE_CONSOLE_TRANSCRIBE_PAUSE_PUNCTUATION` | `0` | punctuate from word timings, and end the sentence |
+| `CLAUDE_CONSOLE_TRANSCRIBE_CHINESE_CONVERSION` | `none` | OpenCC: `t2s` converts characters, `tw2sp` also converts Taiwanese vocabulary |
+| `CLAUDE_CONSOLE_TRANSCRIBE_PAUSE_PUNCTUATION` | `0` | punctuate from the pauses, and close the sentence |
+| `CLAUDE_CONSOLE_TRANSCRIBE_COMMA_GAP` | `0.5` | silence (seconds) that reads as a comma |
+| `CLAUDE_CONSOLE_TRANSCRIBE_PERIOD_GAP` | `1.2` | silence (seconds) that reads as a full stop |
 | `CLAUDE_CONSOLE_TRANSCRIBE_LD_LIBRARY_PATH` | *(unset)* | extra CUDA library dirs for the worker |
 | `CLAUDE_CONSOLE_TRANSCRIBE_MAX_MB` | `16` | audio upload ceiling |
 | `CLAUDE_CONSOLE_TRANSCRIBE_MAX_SEC` | `120` | recording length cap |

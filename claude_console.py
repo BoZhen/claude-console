@@ -1174,6 +1174,10 @@ TRANSCRIBE_CHINESE_CONVERSION = (
 TRANSCRIBE_PAUSE_PUNCTUATION = (
     _env("TRANSCRIBE_PAUSE_PUNCTUATION", "0") or "0").lower() not in (
         "0", "false", "no", "off")
+# Silence long enough to read as punctuation. Both are judged by ear, so they are
+# configurable rather than baked in: a comma is a breath, a period is a full stop.
+TRANSCRIBE_COMMA_GAP = float(_env("TRANSCRIBE_COMMA_GAP", "0.5") or "0.5")
+TRANSCRIBE_PERIOD_GAP = float(_env("TRANSCRIBE_PERIOD_GAP", "1.2") or "1.2")
 TRANSCRIBE_LD_LIBRARY_PATH = _env("TRANSCRIBE_LD_LIBRARY_PATH", "")
 TRANSCRIBE_MAX_BYTES = max(
     1024 * 1024, int(_env("TRANSCRIBE_MAX_MB", "16") or "16") * 1024 * 1024)
@@ -1202,6 +1206,9 @@ def _transcribe_status():
     if TRANSCRIBE_CHINESE_CONVERSION not in ("none", "t2s", "tw2sp"):
         return {"enabled": True, "available": False,
                 "reason": "Chinese transcription conversion is invalid"}
+    if not 0 < TRANSCRIBE_COMMA_GAP <= TRANSCRIBE_PERIOD_GAP:
+        return {"enabled": True, "available": False,
+                "reason": "transcription pause thresholds are invalid"}
     if (os.path.isabs(TRANSCRIBE_MODEL)
             and not os.path.isfile(os.path.join(TRANSCRIBE_MODEL, "model.bin"))):
         return {"enabled": True, "available": False,
@@ -1223,7 +1230,7 @@ class TranscriberManager:
     def __init__(self, python_path=None, worker_path=None, model=None,
                  device=None, device_index=None, compute_type=None,
                  language=None, chinese_conversion=None,
-                 pause_punctuation=None,
+                 pause_punctuation=None, comma_gap=None, period_gap=None,
                  idle_seconds=None, timeout_seconds=None,
                  max_seconds=None, library_path=None):
         self.python_path = python_path or TRANSCRIBE_PYTHON
@@ -1240,6 +1247,10 @@ class TranscriberManager:
         self.pause_punctuation = (TRANSCRIBE_PAUSE_PUNCTUATION
                                   if pause_punctuation is None
                                   else bool(pause_punctuation))
+        self.comma_gap = (TRANSCRIBE_COMMA_GAP if comma_gap is None
+                          else float(comma_gap))
+        self.period_gap = (TRANSCRIBE_PERIOD_GAP if period_gap is None
+                           else float(period_gap))
         self.idle_seconds = idle_seconds or TRANSCRIBE_IDLE_SECONDS
         self.timeout_seconds = timeout_seconds or TRANSCRIBE_TIMEOUT_SECONDS
         self.max_seconds = max_seconds or TRANSCRIBE_MAX_SECONDS
@@ -1270,7 +1281,9 @@ class TranscriberManager:
         if self.chinese_conversion and self.chinese_conversion != "none":
             command += ["--chinese-conversion", self.chinese_conversion]
         if self.pause_punctuation:
-            command.append("--pause-punctuation")
+            command += ["--pause-punctuation",
+                        "--comma-gap", repr(self.comma_gap),
+                        "--period-gap", repr(self.period_gap)]
         env = os.environ.copy()
         if self.library_path:
             env["LD_LIBRARY_PATH"] = self.library_path + (

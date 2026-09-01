@@ -78,7 +78,15 @@ def _duration_seconds(path):
         return None
 
 
-def _join_segments(segments, language, pause_punctuation=False):
+# How long a silence has to be before it reads as punctuation. Tuned by ear, so
+# they are knobs rather than constants: COMMA_GAP is a breath, PERIOD_GAP is a
+# full stop. Below COMMA_GAP the pause is just how someone talks.
+COMMA_GAP = 0.5
+PERIOD_GAP = 1.2
+
+
+def _join_segments(segments, language, pause_punctuation=False,
+                   comma_gap=COMMA_GAP, period_gap=PERIOD_GAP):
     segments = list(segments)
     if not pause_punctuation:
         return "".join(segment.text for segment in segments).strip()
@@ -93,11 +101,11 @@ def _join_segments(segments, language, pause_punctuation=False):
         current = "".join(out).rstrip()
         gap = ((float(start) - previous_end)
                if start is not None and previous_end is not None else 0.0)
-        if (gap >= 0.65 and current and not _has_terminal_punctuation(current)
+        if (gap >= comma_gap and current and not _has_terminal_punctuation(current)
                 and current[-1] not in _PUNCTUATION
                 and piece.lstrip()[:1] not in _PUNCTUATION):
             out.append(("。" if is_chinese else ".")
-                       if gap >= 1.4 else ("，" if is_chinese else ","))
+                       if gap >= period_gap else ("，" if is_chinese else ","))
         out.append(piece)
         if end is not None:
             previous_end = float(end)
@@ -124,6 +132,8 @@ def main():
     parser.add_argument("--chinese-conversion", default="none",
                         choices=("none", "t2s", "tw2sp"))
     parser.add_argument("--pause-punctuation", action="store_true")
+    parser.add_argument("--comma-gap", type=float, default=COMMA_GAP)
+    parser.add_argument("--period-gap", type=float, default=PERIOD_GAP)
     parser.add_argument("--idle-seconds", type=int, default=600)
     parser.add_argument("--max-seconds", type=int, default=120)
     args = parser.parse_args()
@@ -176,7 +186,8 @@ def main():
                 word_timestamps=args.pause_punctuation,
             )
             text = _join_segments(segments, getattr(info, "language", ""),
-                                  args.pause_punctuation)
+                                  args.pause_punctuation,
+                                  args.comma_gap, args.period_gap)
             if args.chinese_conversion != "none":
                 if chinese_converter is None:
                     from opencc import OpenCC
