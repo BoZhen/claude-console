@@ -2811,6 +2811,35 @@ header input#cwd{flex:1;min-width:120px;display:none}
 .tool .tb{display:none;border-top:1px solid var(--line);padding:8px 10px}
 .tool.open .tb{display:block}
 .tool.err .tn{color:var(--del)}
+/* Consecutive calls to the SAME tool fold into one row. A run of eight Bash calls
+   otherwise pushes the answer off screen, and Claude routinely fires several tool
+   calls in a single message, so these runs are common rather than exceptional.
+   Folding costs almost nothing: a tool card is already collapsed by default, so
+   what disappears is N-1 header rows, not content. The group header carries the
+   count and the newest call's argument, so a folded run still says what is
+   happening right now. */
+.toolgroup{border:1px solid var(--line);border-radius:8px;margin:6px 0 12px;background:var(--bg2);overflow:hidden}
+.toolgroup>.tgh{padding:7px 10px;cursor:pointer;display:flex;gap:8px;align-items:center;user-select:none}
+.toolgroup>.tgh:hover{background:var(--bg3)}
+.toolgroup>.tgh .ico{flex-shrink:0}
+.toolgroup>.tgh .tn{color:var(--tool);font-weight:600;font-family:var(--fmono);font-size:12.5px;flex-shrink:0}
+.toolgroup>.tgh .tgcount{color:var(--mut);font-family:var(--fmono);font-size:11.5px;flex-shrink:0}
+.toolgroup>.tgh .tp{color:var(--mut);font-family:var(--fmono);font-size:12px;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}
+.toolgroup>.tgh .tgstate{font-family:var(--fmono);font-size:11.5px;flex-shrink:0;color:var(--tool)}
+.toolgroup.err>.tgh .tgstate{color:var(--del)}
+/* the eye is scoped to the group's own header — nested cards keep their own */
+.toolgroup>.tgh .eye{color:var(--mut);flex-shrink:0;display:inline-flex;align-items:center;transition:color .15s}
+.toolgroup>.tgh .eye svg{width:16px;height:16px;display:block}
+.toolgroup>.tgh .eye .e-open{display:none}
+.toolgroup.open>.tgh .eye .e-shut{display:none}
+.toolgroup.open>.tgh .eye .e-open{display:block}
+.toolgroup>.tgh:hover .eye{color:var(--fg)}
+.toolgroup>.tgb{display:none;border-top:1px solid var(--line)}
+.toolgroup.open>.tgb{display:block}
+/* inside a group the cards give up their own frame: the group owns the box */
+.toolgroup>.tgb>.tool{border:0;border-radius:0;margin:0;background:transparent}
+.toolgroup>.tgb>.tool+.tool{border-top:1px solid var(--line)}
 pre{background:var(--codebg);border:1px solid var(--line);border-radius:6px;padding:8px;overflow-x:auto;margin:5px 0;
   font-family:var(--fmono);font-size:12.5px;line-height:1.45}
 code{font-family:var(--fmono);font-size:12.5px;background:var(--codebg);border:1px solid var(--line);border-radius:3px;padding:0 4px}
@@ -3684,18 +3713,61 @@ function addBgRunning(list){const s=atBottom();const n=list.length;const d=docum
   d.querySelector('.bgt').textContent=labels.length?(' · '+labels.join(' · ')):'';
   stream.appendChild(d);if(s)scroll();}
 function addErr(t){const d=document.createElement('div');d.className='errline';d.textContent=t;stream.appendChild(d);if(atBottom())scroll();}
+/* ── consecutive same-tool calls fold into one group ──────────────────────────
+   Only ADJACENCY groups: the check is against stream.lastElementChild, so any
+   answer text, edit marker or approval between two calls ends the run. That is
+   the whole semantic — a group means "these happened back to back with nothing
+   in between", which is exactly the noise worth folding and exactly the context
+   worth keeping. */
+function toolGroupKey(ev){return (''+((ev&&ev.tool)||'')).trim().toLowerCase();}
+function groupCards(g){return [...g.querySelectorAll(':scope>.tgb>.tool')];}
+function refreshToolGroup(g){
+  if(!g)return;
+  const cards=groupCards(g);if(!cards.length)return;
+  const last=cards[cards.length-1]._ev||{};
+  const errs=cards.filter(c=>c.classList.contains('err')).length;
+  const open=cards.filter(c=>!c.classList.contains('done')).length;
+  g.querySelector('.tgcount').textContent='×'+cards.length;
+  /* the newest call's argument: a folded run still shows what it is doing now */
+  g.querySelector('.tp').textContent=primaryArg(last.input)||'';
+  g.classList.toggle('err',errs>0);
+  g.querySelector('.tgstate').textContent=errs?(errs+' failed'):(open?'running':'');}
+function makeToolGroup(first,second,key){
+  const ev=first._ev||second._ev||{};
+  const g=document.createElement('div');g.className='toolgroup';g.dataset.tkey=key;
+  g.innerHTML='<div class="tgh"><span class="ico">'+(ICON[ev.tool]||'🔧')+'</span>'+
+    '<span class="tn">'+esc(ev.tool||'tool')+'</span><span class="tgcount"></span>'+
+    '<span class="tp"></span><span class="tgstate"></span>'+TOOL_EYE+'</div><div class="tgb"></div>';
+  first.replaceWith(g);                      /* the group takes the first card's place */
+  const body=g.querySelector('.tgb');
+  body.appendChild(first);body.appendChild(second);
+  g.querySelector('.tgh').onclick=()=>g.classList.toggle('open');
+  /* a card the user had opened must not vanish behind a fold it did not ask for */
+  if(first.classList.contains('open'))g.classList.add('open');
+  refreshToolGroup(g);return g;}
+function placeToolCard(c,ev){
+  const key=toolGroupKey(ev),prev=stream.lastElementChild;
+  if(prev&&key){
+    if(prev.classList.contains('toolgroup')&&prev.dataset.tkey===key){
+      prev.querySelector(':scope>.tgb').appendChild(c);refreshToolGroup(prev);return;}
+    if(prev.classList.contains('tool')&&toolGroupKey(prev._ev)===key){
+      makeToolGroup(prev,c,key);return;}}
+  stream.appendChild(c);}
+const TOOL_EYE='<span class="eye"><svg class="e-shut" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 11c3 4 7 6 10 6s7-2 10-6"/><line x1="5.5" y1="15.5" x2="4.3" y2="18"/><line x1="12" y1="17.5" x2="12" y2="20"/><line x1="18.5" y1="15.5" x2="19.7" y2="18"/></svg><svg class="e-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></span>';
 function addTool(ev){const s=atBottom();const c=document.createElement('div');c.className='tool';
   const cn=counts(ev);const cnt=cn?('<span class="a">+'+cn.a+'</span> <span class="d">−'+cn.d+'</span>'):'';
   c.innerHTML='<div class="th"><span class="ico">'+(ICON[ev.tool]||'🔧')+'</span><span class="tn">'+esc(ev.tool)+'</span>'+
-    '<span class="tp">'+esc(primaryArg(ev.input))+'</span><span class="cnt">'+cnt+'</span><span class="eye"><svg class="e-shut" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 11c3 4 7 6 10 6s7-2 10-6"/><line x1="5.5" y1="15.5" x2="4.3" y2="18"/><line x1="12" y1="17.5" x2="12" y2="20"/><line x1="18.5" y1="15.5" x2="19.7" y2="18"/></svg><svg class="e-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></span></div>'+
+    '<span class="tp">'+esc(primaryArg(ev.input))+'</span><span class="cnt">'+cnt+'</span>'+TOOL_EYE+'</div>'+
     '<div class="tb"><div class="res"></div></div>';
   c._ev=ev;   /* lazy: build the (maybe large) body only on first expand */
   c.querySelector('.th').onclick=()=>{const open=c.classList.toggle('open');
     if(open&&!c._bodyDone){c._bodyDone=1;c.querySelector('.res').insertAdjacentHTML('beforebegin',toolBody(c._ev));}};
-  stream.appendChild(c);if(ev.toolId)tools[ev.toolId]=c;if(s)scroll();}
+  placeToolCard(c,ev);if(ev.toolId)tools[ev.toolId]=c;if(s)scroll();}
 function addResult(ev){const c=tools[ev.toolId];if(!c)return;if(ev.isError)c.classList.add('err');
   const b=(ev.content||'').trim();c.querySelector('.res').innerHTML='<div class="reslabel">'+(ev.isError?'error ⤵':'output ⤵')+
-    '</div><pre><code>'+esc(b.length>2200?b.slice(0,2200)+'\n…':b)+'</code></pre>';}
+    '</div><pre><code>'+esc(b.length>2200?b.slice(0,2200)+'\n…':b)+'</code></pre>';
+  c.classList.add('done');   /* a card with its result in is no longer in flight */
+  if(c.closest)refreshToolGroup(c.closest('.toolgroup'));}
 
 function statset(t){const el=$('#thinking');if(!el)return;
   const w=el.querySelector('.word');if(w)w.textContent=t;
