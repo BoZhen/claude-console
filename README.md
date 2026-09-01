@@ -149,7 +149,7 @@ Voice input is optional and off by default. To turn it on, install
 
 ```bash
 CLAUDE_CONSOLE_TRANSCRIBE=1 \
-CLAUDE_CONSOLE_TRANSCRIBE_PYTHON=~/miniforge3/envs/faster-whisper/bin/python \
+CLAUDE_CONSOLE_TRANSCRIBE_PYTHON=/path/to/whisper-env/bin/python \
 CLAUDE_CONSOLE_TRANSCRIBE_MODEL=~/models/faster-whisper-large-v3-turbo \
 CLAUDE_CONSOLE_TRANSCRIBE_DEVICE=cuda CLAUDE_CONSOLE_TRANSCRIBE_COMPUTE_TYPE=float16 \
 CLAUDE_CONSOLE_TRANSCRIBE_PAUSE_PUNCTUATION=1 \
