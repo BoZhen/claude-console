@@ -99,11 +99,11 @@ which is the whole point.
   rather than only look at them. Works from a phone, which pasting did not.
 - **Voice input** — a 🎙 button beside 📎 (or **Alt+M**) records, transcribes on
   *your* machine with [faster-whisper](https://github.com/SYSTRAN/faster-whisper),
-  and drops the text into the composer **as an editable draft**. It never sends by
-  itself: dictation misreads words, and a wrong word in a prompt is a wrong turn.
-  The text goes to the session that started the recording, so you can switch tabs
-  while it transcribes. Off unless you configure it (below); no audio leaves the
-  machine, and the browser needs HTTPS or localhost to reach a microphone at all.
+  and shows a revisable draft while you speak. Pressing the mic prewarms the model;
+  confirmed words and punctuation stay fixed, the latest 10 Chinese characters
+  remain revisable, and stopping re-runs the whole recording to correct whatever
+  was not confirmed yet. It never sends by itself,
+  and the text stays with the session that started the recording.
 - **Punctuation from the pauses you actually made** — speech models return a wall
   of words, which is unreadable in Chinese and tiring in English. Silences are
   measured against the word timings and become punctuation: half a second is a
@@ -207,9 +207,9 @@ The legacy `AGENTLENS_*` names are still honored as a fallback.
   session's working directory, so the agent can open and run them. That folder
   ignores itself in git (it ships a `.gitignore` containing `*`), and nothing is
   written for a queued message you withdraw before it sends.
-- A recording is streamed to a `0600` temp file, transcribed, and deleted when the
-  request finishes — including when it fails. The transcript reaches Claude only
-  when you send the draft you edited.
+- Every live preview and final correction uses a `0600` temp file that is deleted
+  when the request finishes, including when it fails. The transcript reaches
+  Claude only when you send the draft you edited.
 - Voice icon from Microsoft's [Fluent Emoji](https://github.com/microsoft/fluentui-emoji)
   (MIT), under `static/icons/`.
 - Very long conversations keep a bounded window of *rendered* messages per tab;
