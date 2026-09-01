@@ -95,6 +95,13 @@ which is the whole point.
   multimodal blocks; other files are **saved into the session's working
   directory** and named in the message, so Claude can read, edit and *run* them
   rather than only look at them. Works from a phone, which pasting did not.
+- **Voice input** — a 🎙 button beside 📎 (or **Alt+M**) records, transcribes on
+  *your* machine with [faster-whisper](https://github.com/SYSTRAN/faster-whisper),
+  and drops the text into the composer **as an editable draft**. It never sends by
+  itself: dictation misreads words, and a wrong word in a prompt is a wrong turn.
+  The text goes to the session that started the recording, so you can switch tabs
+  while it transcribes. Off unless you configure it (below); no audio leaves the
+  machine, and the browser needs HTTPS or localhost to reach a microphone at all.
 - **Thinking effort** — a `🧠` pill (low / medium / high / xhigh / max) to set
   reasoning depth, switchable on the fly (the session relaunches with the new
   `--effort`).
@@ -124,12 +131,42 @@ CLAUDE_CONSOLE_BIND=0.0.0.0 CLAUDE_CONSOLE_AUTH=me:secret python claude_console.
 Open `http://<host>:7703`, pick a project dir, and start chatting; the change
 cards and the **Git diff** drawer update live as the agent works.
 
+Voice input is optional and off by default. To turn it on, install
+`faster-whisper` (and `opencc`, if you want Chinese script conversion) into
+*some* Python — it does not have to be the one running the console — and point
+`CLAUDE_CONSOLE_TRANSCRIBE_PYTHON` at it:
+
+```bash
+CLAUDE_CONSOLE_TRANSCRIBE=1 \
+CLAUDE_CONSOLE_TRANSCRIBE_PYTHON=~/miniforge3/envs/faster-whisper/bin/python \
+CLAUDE_CONSOLE_TRANSCRIBE_MODEL=~/models/faster-whisper-large-v3-turbo \
+CLAUDE_CONSOLE_TRANSCRIBE_DEVICE=cuda CLAUDE_CONSOLE_TRANSCRIBE_COMPUTE_TYPE=float16 \
+python claude_console.py
+```
+
+Browsers only expose a microphone in a secure context, so serve the console over
+HTTPS (a reverse proxy, or `tailscale serve`) unless you open it on `localhost`.
+
 | Env | Default | Meaning |
 |---|---|---|
 | `CLAUDE_CONSOLE_PORT` | `7703` | listen port |
 | `CLAUDE_CONSOLE_BIND` | `127.0.0.1` | bind address; set `0.0.0.0` for LAN access |
 | `CLAUDE_CONSOLE_AUTH` | *(disabled)* | optional HTTP Basic Auth `user:pass` |
 | `CLAUDE_CONSOLE_WEBFM_URL` | this host on `:7701` | web file manager to open clicked file paths in |
+| `CLAUDE_CONSOLE_TRANSCRIBE` | `0` | enable local voice input |
+| `CLAUDE_CONSOLE_TRANSCRIBE_PYTHON` | current python | interpreter that has `faster-whisper` |
+| `CLAUDE_CONSOLE_TRANSCRIBE_MODEL` | *(unset)* | CTranslate2 model directory, or a model name to fetch |
+| `CLAUDE_CONSOLE_TRANSCRIBE_DEVICE` | `auto` | `cpu` / `cuda` |
+| `CLAUDE_CONSOLE_TRANSCRIBE_DEVICE_INDEX` | `0` | which GPU |
+| `CLAUDE_CONSOLE_TRANSCRIBE_COMPUTE_TYPE` | `default` | e.g. `float16`, `int8` |
+| `CLAUDE_CONSOLE_TRANSCRIBE_LANGUAGE` | *(auto-detect)* | pin the spoken language |
+| `CLAUDE_CONSOLE_TRANSCRIBE_CHINESE_CONVERSION` | `none` | `t2s` / `tw2sp` — normalize to Simplified |
+| `CLAUDE_CONSOLE_TRANSCRIBE_PAUSE_PUNCTUATION` | `0` | punctuate from word timings, and end the sentence |
+| `CLAUDE_CONSOLE_TRANSCRIBE_LD_LIBRARY_PATH` | *(unset)* | extra CUDA library dirs for the worker |
+| `CLAUDE_CONSOLE_TRANSCRIBE_MAX_MB` | `16` | audio upload ceiling |
+| `CLAUDE_CONSOLE_TRANSCRIBE_MAX_SEC` | `120` | recording length cap |
+| `CLAUDE_CONSOLE_TRANSCRIBE_TIMEOUT_SEC` | `180` | give up on a transcription after this |
+| `CLAUDE_CONSOLE_TRANSCRIBE_IDLE_SEC` | `600` | worker exits after this, releasing the model's memory |
 
 The legacy `AGENTLENS_*` names are still honored as a fallback.
 
@@ -142,12 +179,20 @@ The legacy `AGENTLENS_*` names are still honored as a fallback.
 ## Notes
 
 - Intentionally a single `claude_console.py` with inline HTML/CSS/JS — **no build step**.
+  The one exception is `faster_whisper_worker.py`, because speech models want a
+  different Python than the console runs in, and a separate process is also how
+  the model's memory gets released — it exits on its own when idle.
 - [KaTeX](https://katex.org/) is vendored under `static/katex/` (MIT) for offline
   math rendering.
 - Non-image attachments are written to `.claude-console/uploads/` inside the
   session's working directory, so the agent can open and run them. That folder
   ignores itself in git (it ships a `.gitignore` containing `*`), and nothing is
   written for a queued message you withdraw before it sends.
+- A recording is streamed to a `0600` temp file, transcribed, and deleted when the
+  request finishes — including when it fails. The transcript reaches Claude only
+  when you send the draft you edited.
+- Voice icon from Microsoft's [Fluent Emoji](https://github.com/microsoft/fluentui-emoji)
+  (MIT), under `static/icons/`.
 - Very long conversations keep a bounded window of *rendered* messages per tab;
   older ones fold into a marker that links to the history search. Nothing is
   deleted — the full transcript stays on disk under `~/.claude/projects`.

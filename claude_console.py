@@ -12,6 +12,8 @@ Env (legacy AGENTLENS_* names still accepted as a fallback):
   CLAUDE_CONSOLE_AUTH   optional HTTP Basic Auth "user:pass" (default disabled)
   CLAUDE_CONSOLE_WEBFM_URL  web-file-manager base URL — makes file paths in chat
                         clickable (opens the file there). Default: this host on :7701
+  CLAUDE_CONSOLE_TRANSCRIBE  set to 1 to enable local voice input (see the README
+                        for the full CLAUDE_CONSOLE_TRANSCRIBE_* set)
 """
 
 import asyncio
@@ -22,10 +24,13 @@ import json
 import os
 import re
 import secrets
+import select
 import shutil
 import signal
 import sqlite3
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -1142,6 +1147,335 @@ class AuthMixin:
         self.set_header("WWW-Authenticate", 'Basic realm="claude-console"')
         self.finish()
         return False
+
+
+
+# ───────────────────── voice input (optional, local) ─────────────────────
+#
+# Dictation, done locally. The browser records; this transcribes with
+# faster-whisper in a separate process and hands the text back as an *editable
+# draft*. Nothing is sent to the model until the user presses send, and no audio
+# leaves the machine.
+#
+# It stays off unless CLAUDE_CONSOLE_TRANSCRIBE=1 and a model is configured, so
+# the console still runs with nothing installed beyond tornado.
+TRANSCRIBE_ENABLED = (_env("TRANSCRIBE", "0") or "0").lower() not in (
+    "0", "false", "no", "off")
+# The console itself runs in whatever env has the SDK; faster-whisper and its
+# CUDA wheels usually live somewhere else, so the worker gets its own interpreter.
+TRANSCRIBE_PYTHON = os.path.expanduser(_env("TRANSCRIBE_PYTHON", sys.executable))
+TRANSCRIBE_MODEL = os.path.expanduser(_env("TRANSCRIBE_MODEL", ""))
+TRANSCRIBE_DEVICE = _env("TRANSCRIBE_DEVICE", "auto") or "auto"
+TRANSCRIBE_DEVICE_INDEX = int(_env("TRANSCRIBE_DEVICE_INDEX", "0") or "0")
+TRANSCRIBE_COMPUTE_TYPE = _env("TRANSCRIBE_COMPUTE_TYPE", "default") or "default"
+TRANSCRIBE_LANGUAGE = _env("TRANSCRIBE_LANGUAGE", "")
+TRANSCRIBE_CHINESE_CONVERSION = (
+    _env("TRANSCRIBE_CHINESE_CONVERSION", "none") or "none").lower()
+TRANSCRIBE_PAUSE_PUNCTUATION = (
+    _env("TRANSCRIBE_PAUSE_PUNCTUATION", "0") or "0").lower() not in (
+        "0", "false", "no", "off")
+TRANSCRIBE_LD_LIBRARY_PATH = _env("TRANSCRIBE_LD_LIBRARY_PATH", "")
+TRANSCRIBE_MAX_BYTES = max(
+    1024 * 1024, int(_env("TRANSCRIBE_MAX_MB", "16") or "16") * 1024 * 1024)
+TRANSCRIBE_MAX_SECONDS = max(10, int(_env("TRANSCRIBE_MAX_SEC", "120") or "120"))
+TRANSCRIBE_TIMEOUT_SECONDS = max(
+    30, int(_env("TRANSCRIBE_TIMEOUT_SEC", "180") or "180"))
+TRANSCRIBE_IDLE_SECONDS = max(
+    30, int(_env("TRANSCRIBE_IDLE_SEC", "600") or "600"))
+TRANSCRIBE_WORKER = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "faster_whisper_worker.py")
+
+
+def _transcribe_status():
+    """Why the microphone button is (or is not) live, in the words the UI shows."""
+    if not TRANSCRIBE_ENABLED:
+        return {"enabled": False, "available": False,
+                "reason": "voice transcription is disabled"}
+    python_path = (TRANSCRIBE_PYTHON if os.path.isabs(TRANSCRIBE_PYTHON)
+                   else shutil.which(TRANSCRIBE_PYTHON))
+    if not python_path or not os.path.isfile(python_path):
+        return {"enabled": True, "available": False,
+                "reason": "transcription runtime is unavailable"}
+    if not TRANSCRIBE_MODEL:
+        return {"enabled": True, "available": False,
+                "reason": "transcription model is not configured"}
+    if TRANSCRIBE_CHINESE_CONVERSION not in ("none", "t2s", "tw2sp"):
+        return {"enabled": True, "available": False,
+                "reason": "Chinese transcription conversion is invalid"}
+    if (os.path.isabs(TRANSCRIBE_MODEL)
+            and not os.path.isfile(os.path.join(TRANSCRIBE_MODEL, "model.bin"))):
+        return {"enabled": True, "available": False,
+                "reason": "transcription model is unavailable"}
+    if not os.path.isfile(TRANSCRIBE_WORKER):
+        return {"enabled": True, "available": False,
+                "reason": "transcription worker is unavailable"}
+    return {"enabled": True, "available": True, "reason": ""}
+
+
+class TranscriberManager:
+    """One lazy worker process, so model VRAM is held only while it is being used.
+
+    The worker loads the model on its first request and exits by itself after
+    --idle-seconds of silence; the next request starts a fresh one. That is the
+    whole memory policy — no unloading logic here, just a process that goes away.
+    """
+
+    def __init__(self, python_path=None, worker_path=None, model=None,
+                 device=None, device_index=None, compute_type=None,
+                 language=None, chinese_conversion=None,
+                 pause_punctuation=None,
+                 idle_seconds=None, timeout_seconds=None,
+                 max_seconds=None, library_path=None):
+        self.python_path = python_path or TRANSCRIBE_PYTHON
+        self.worker_path = worker_path or TRANSCRIBE_WORKER
+        self.model = model or TRANSCRIBE_MODEL
+        self.device = device or TRANSCRIBE_DEVICE
+        self.device_index = (TRANSCRIBE_DEVICE_INDEX if device_index is None
+                             else int(device_index))
+        self.compute_type = compute_type or TRANSCRIBE_COMPUTE_TYPE
+        self.language = TRANSCRIBE_LANGUAGE if language is None else language
+        self.chinese_conversion = (TRANSCRIBE_CHINESE_CONVERSION
+                                   if chinese_conversion is None
+                                   else chinese_conversion)
+        self.pause_punctuation = (TRANSCRIBE_PAUSE_PUNCTUATION
+                                  if pause_punctuation is None
+                                  else bool(pause_punctuation))
+        self.idle_seconds = idle_seconds or TRANSCRIBE_IDLE_SECONDS
+        self.timeout_seconds = timeout_seconds or TRANSCRIBE_TIMEOUT_SECONDS
+        self.max_seconds = max_seconds or TRANSCRIBE_MAX_SECONDS
+        self.library_path = (TRANSCRIBE_LD_LIBRARY_PATH if library_path is None
+                             else library_path)
+        self.proc = None
+        self._lock = threading.Lock()
+
+    def _start_locked(self):
+        if self.proc and self.proc.poll() is None:
+            return self.proc
+        self._stop_locked()
+        python_path = (self.python_path if os.path.isabs(self.python_path)
+                       else shutil.which(self.python_path))
+        if not python_path:
+            raise RuntimeError("transcription runtime is unavailable")
+        command = [
+            python_path, "-u", self.worker_path,
+            "--model", self.model,
+            "--device", self.device,
+            "--device-index", str(self.device_index),
+            "--compute-type", self.compute_type,
+            "--idle-seconds", str(self.idle_seconds),
+            "--max-seconds", str(self.max_seconds),
+        ]
+        if self.language:
+            command += ["--language", self.language]
+        if self.chinese_conversion and self.chinese_conversion != "none":
+            command += ["--chinese-conversion", self.chinese_conversion]
+        if self.pause_punctuation:
+            command.append("--pause-punctuation")
+        env = os.environ.copy()
+        if self.library_path:
+            env["LD_LIBRARY_PATH"] = self.library_path + (
+                (":" + env["LD_LIBRARY_PATH"]) if env.get("LD_LIBRARY_PATH") else "")
+        if os.path.isdir(self.model):
+            env["HF_HUB_OFFLINE"] = "1"   # a local model directory needs no hub
+        self.proc = subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1,
+            env=env)
+        return self.proc
+
+    def _stop_locked(self):
+        proc, self.proc = self.proc, None
+        if not proc:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        for stream in (proc.stdin, proc.stdout):
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    def shutdown(self):
+        with self._lock:
+            self._stop_locked()
+
+    def transcribe(self, path):
+        """Blocking; call it off the IOLoop. One request at a time, by the lock."""
+        with self._lock:
+            proc = self._start_locked()
+            request_id = secrets.token_hex(8)
+            try:
+                proc.stdin.write(json.dumps({
+                    "type": "transcribe", "id": request_id, "path": path}) + "\n")
+                proc.stdin.flush()
+            except Exception as exc:
+                self._stop_locked()
+                raise RuntimeError("transcription worker did not start") from exc
+            readable, _, _ = select.select(
+                [proc.stdout], [], [], self.timeout_seconds)
+            if not readable:
+                self._stop_locked()
+                raise TimeoutError("transcription timed out")
+            line = proc.stdout.readline()
+            if not line:
+                self._stop_locked()
+                raise RuntimeError("transcription worker exited")
+            try:
+                result = json.loads(line)
+            except Exception as exc:
+                self._stop_locked()
+                raise RuntimeError("invalid transcription worker response") from exc
+            # A stale reply means the stream is out of step; a fresh worker is the
+            # only way back to a known state.
+            if result.get("id") != request_id:
+                self._stop_locked()
+                raise RuntimeError("mismatched transcription worker response")
+            if not result.get("ok"):
+                error = RuntimeError(result.get("error") or "transcription failed")
+                error.code = result.get("code") or ""
+                raise error
+            return result
+
+
+_TRANSCRIBER = TranscriberManager()
+# The GPU fits one transcription at a time; a second caller is told to wait
+# rather than queued behind a lock holding an open request.
+_TRANSCRIBER_GATE = threading.BoundedSemaphore(1)
+_AUDIO_TYPES = {
+    "audio/webm": ".webm", "video/webm": ".webm",
+    "audio/mp4": ".m4a", "video/mp4": ".m4a",
+    "audio/ogg": ".ogg", "audio/wav": ".wav", "audio/x-wav": ".wav",
+    "application/octet-stream": ".audio",
+}
+
+
+@tornado.web.stream_request_body
+class TranscribeHandler(AuthMixin, tornado.web.RequestHandler):
+    """GET reports what voice input can do here; POST takes the audio and
+    returns text. The upload streams to a 0600 temp file that on_finish always
+    deletes, so a recording exists on disk only for the length of one request."""
+
+    def initialize(self):
+        self._upload = None
+        self._upload_path = ""
+        self._upload_bytes = 0
+
+    def _json(self, payload, status=200):
+        self.set_status(status)
+        self.set_header("Content-Type", "application/json")
+        self.set_header("Cache-Control", "no-store")
+        self.write(json.dumps(payload, ensure_ascii=False))
+
+    def write_error(self, status_code, **kwargs):
+        exc_info = kwargs.get("exc_info")
+        reason = exc_info[1] if exc_info else None
+        message = getattr(reason, "reason", "") or self._reason or "request failed"
+        if not self._finished:
+            self._json({"ok": False, "error": message}, status_code)
+
+    def prepare(self):
+        # Runs before any body arrives: auth, size and type are settled while
+        # refusing still costs nothing.
+        if not self._ok_auth() or self.request.method != "POST":
+            return
+        status = _transcribe_status()
+        if not status["available"]:
+            raise tornado.web.HTTPError(503, reason=status["reason"])
+        content_length = self.request.headers.get("Content-Length", "")
+        try:
+            if content_length and int(content_length) > TRANSCRIBE_MAX_BYTES:
+                raise tornado.web.HTTPError(413, reason="audio exceeds the upload limit")
+        except ValueError:
+            raise tornado.web.HTTPError(400, reason="invalid content length")
+        media_type = self.request.headers.get("Content-Type", "").split(";", 1)[0].lower()
+        suffix = _AUDIO_TYPES.get(media_type)
+        if not suffix:
+            raise tornado.web.HTTPError(415, reason="unsupported audio type")
+        upload = tempfile.NamedTemporaryFile(
+            prefix="claude-console-voice-", suffix=suffix, delete=False)
+        os.chmod(upload.name, 0o600)
+        self._upload = upload
+        self._upload_path = upload.name
+
+    def data_received(self, chunk):
+        if not self._upload:
+            return
+        self._upload_bytes += len(chunk)
+        # Content-Length can lie, so the cap is enforced again on what arrives.
+        if self._upload_bytes > TRANSCRIBE_MAX_BYTES:
+            self._upload.close()
+            self._upload = None
+            raise tornado.web.HTTPError(413, reason="audio exceeds the upload limit")
+        self._upload.write(chunk)
+
+    def get(self):
+        if not self._ok_auth():
+            return
+        self._json({
+            "ok": True, **_transcribe_status(),
+            "maxBytes": TRANSCRIBE_MAX_BYTES,
+            "maxSeconds": TRANSCRIBE_MAX_SECONDS,
+        })
+
+    async def post(self):
+        if not self._upload or not self._upload_bytes:
+            raise tornado.web.HTTPError(400, reason="empty audio")
+        self._upload.close()
+        self._upload = None
+        try:
+            duration_ms = int(self.request.headers.get("X-Audio-Duration-Ms", "0") or "0")
+        except ValueError:
+            duration_ms = 0
+        if duration_ms > (TRANSCRIBE_MAX_SECONDS + 2) * 1000:
+            raise tornado.web.HTTPError(413, reason="recording is too long")
+        if not _TRANSCRIBER_GATE.acquire(blocking=False):
+            raise tornado.web.HTTPError(429, reason="another transcription is running")
+        try:
+            loop = tornado.ioloop.IOLoop.current()
+            result = await loop.run_in_executor(
+                None, _TRANSCRIBER.transcribe, self._upload_path)
+        except TimeoutError as exc:
+            raise tornado.web.HTTPError(504, reason=str(exc))
+        except Exception as exc:
+            if getattr(exc, "code", "") == "too_long":
+                raise tornado.web.HTTPError(413, reason=str(exc))
+            raise tornado.web.HTTPError(500, reason=(str(exc) or "transcription failed")[:1000])
+        finally:
+            _TRANSCRIBER_GATE.release()
+        if not (result.get("text") or "").strip():
+            raise tornado.web.HTTPError(422, reason="no speech detected")
+        self._json({
+            "ok": True,
+            "text": result.get("text") or "",
+            "language": result.get("language") or "",
+            "duration": result.get("duration"),
+            "elapsed": result.get("elapsed"),
+        })
+
+    def on_finish(self):
+        # Every exit path lands here, including the raised HTTPErrors above, so
+        # this is the one place the recording has to be removed.
+        if self._upload:
+            try:
+                self._upload.close()
+            except Exception:
+                pass
+            self._upload = None
+        if self._upload_path:
+            try:
+                os.unlink(self._upload_path)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+            self._upload_path = ""
 
 
 # ─────────────────── history search index ───────────────────
@@ -2997,7 +3331,7 @@ pre code{background:none;border:none;padding:0}
 #queue .qmsg .qsteer{flex:none;color:var(--mut);font-size:12px;padding:0 2px;cursor:pointer}
 #queue .qmsg:hover .qsteer{color:var(--tool)}
 #queue .qmsg .qsteer:hover{filter:brightness(1.25)}
-#ta{flex:1;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:10px;
+#ta{flex:1;min-width:0;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:10px;
   padding:9px 12px;font-size:14px;font-family:inherit;resize:none;max-height:160px;line-height:1.4}
 #ta:focus{outline:1px solid var(--acc)}
 #send{background:var(--acc);color:var(--onacc);border:none;border-radius:10px;width:38px;height:38px;flex:none;display:inline-flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;cursor:pointer}
@@ -3006,11 +3340,29 @@ pre code{background:none;border:none;padding:0}
    was no way in at all — no clipboard image, no file picker, nothing. One control
    covers both: the native picker offers camera, photos and files, and the same
    handler takes drag-and-drop on the desktop. */
-#attachBtn{background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:10px;
+#attachBtn,#voiceBtn{background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:10px;
   width:38px;height:38px;flex:none;display:inline-flex;align-items:center;justify-content:center;
   font-size:16px;cursor:pointer;padding:0}
-#attachBtn:hover:not(:disabled){background:var(--line)}
-#attachBtn:disabled{color:var(--mut);cursor:default;opacity:.6}
+#attachBtn:hover:not(:disabled),#voiceBtn:hover:not(:disabled){background:var(--line)}
+#attachBtn:disabled,#voiceBtn:disabled{color:var(--mut);cursor:default;opacity:.6}
+/* Dictate button. The stop glyph is drawn rather than emoji so it inherits the
+   recording colour; the mic itself is a flat icon that reads at 24px on a phone. */
+#voiceBtn .voice-mic-icon{width:24px;height:24px;display:block;object-fit:contain}
+#voiceBtn:disabled .voice-mic-icon{filter:grayscale(1)}
+#voiceBtn svg{width:19px;height:19px;display:block;fill:none;stroke:currentColor;
+  stroke-width:2.25;stroke-linecap:round;stroke-linejoin:round}
+#voiceBtn.recording{color:var(--delfg);border-color:var(--del);background:var(--nobg)}
+#voiceBtn.recording:hover:not(:disabled){background:var(--nobg)}
+/* status line above the composer: recording clock, then transcribing, then gone */
+#voiceBar{height:28px;display:flex;align-items:center;gap:7px;padding:0 2px 7px;
+  color:var(--mut);font:11.5px var(--fmono)}
+#voiceBar[hidden]{display:none}
+#voiceBar .vmark{width:7px;height:7px;border-radius:50%;background:var(--del);flex:none}
+#voiceBar.transcribing .vmark{background:var(--acc);animation:pulse 1.1s ease-in-out infinite}
+#voiceLabel{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#voiceCancel{width:24px;height:24px;flex:none;border:0;background:transparent;color:var(--mut);
+  cursor:pointer;padding:0;font-size:13px;line-height:1}
+#voiceCancel:hover{color:var(--del)}
 #composer.drop .wrap2{outline:2px dashed var(--acc);outline-offset:4px;border-radius:12px}
 /* a file chip is a name, not a thumbnail: there is nothing to preview */
 #attach .fatt{display:inline-flex;align-items:center;gap:7px;height:28px;padding:0 6px 0 9px;
@@ -3507,9 +3859,11 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
       </div>
       <div id="queue"></div>
       <div id="attach"></div>
+      <div id="voiceBar" hidden><span class="vmark"></span><span id="voiceLabel"></span><button id="voiceCancel" type="button" title="Cancel voice input" aria-label="Cancel voice input">✕</button></div>
       <div class="wrap2">
       <input type="file" id="filePick" accept="image/png,image/jpeg,image/gif,image/webp,text/*,application/json,application/xml,application/javascript,application/x-yaml,application/pdf,.py,.ipynb,.js,.jsx,.ts,.tsx,.json,.jsonl,.yaml,.yml,.toml,.md,.rst,.tex,.bib,.c,.h,.cpp,.hpp,.cc,.rs,.go,.java,.kt,.sh,.bash,.zsh,.fish,.sql,.html,.css,.scss,.xml,.csv,.tsv,.ini,.cfg,.conf,.log,.diff,.patch,.mk,.m,.jl,.r,.f90,.cu,.pdf" multiple hidden>
       <button id="attachBtn" type="button" title="Attach images or files" aria-label="Attach files" disabled>📎</button>
+      <button id="voiceBtn" type="button" title="Voice input" aria-label="Start voice input" disabled><img class="voice-mic-icon" src="/static/icons/fluent-studio-microphone.png" alt=""></button>
       <textarea id="ta" rows="1" placeholder="Type a message…  (Enter to send · Shift+Enter newline · 📎 or paste to attach)" disabled></textarea>
       <button id="stop" title="interrupt / stop" style="display:none">⏹</button>
       <button id="send" disabled>➤</button>
@@ -3552,7 +3906,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
 
 <script>
 const $=s=>document.querySelector(s);
-const stream=$('#stream'), ta=$('#ta'), sendBtn=$('#send');
+const stream=$('#stream'), ta=$('#ta'), sendBtn=$('#send'), voiceBtn=$('#voiceBtn');
 let ws=null, running=false, ready=false, compacting=false, cwd='', tools={};
 let tokUp=0,tokOut=0,tokShow=false;   /* live streaming token counts shown in the pill */
 let sid=null, curCC=null, editCount=0, pendingStart=false, reconnectT=0;
@@ -3922,7 +4276,7 @@ function setBusy(b,wordSeed,elapsedMs){running=b;$('#dot').className='dot '+(b?'
   $('#thinking').classList.toggle('busy',b);
   if(!b&&ready)statset('ready');      /* busy: startThinking owns the word + timer */
   ta.disabled=!ready;
-  $('#attachBtn').disabled=!ready;
+  attachOff(!ready);
   sendBtn.disabled=!ready;            /* send stays available while busy → queues */
   $('#stop').style.display=b?'':'none';   /* interrupt button only while busy */
   sendBtn.style.display='';               /* send always visible */
@@ -4978,7 +5332,7 @@ let pendingFiles=[];
    flight as well as what has arrived — otherwise picking fourteen files at once
    passes fourteen synchronous "is there room?" checks before any of them lands. */
 let filesLoading=0, imgsLoading=0;
-function attachOff(off){const b=$('#attachBtn');if(b)b.disabled=!!off;}
+function attachOff(off){const b=$('#attachBtn');if(b)b.disabled=!!off;syncVoiceButton();}
 function fmtBytes(n){return n>=1048576?((n/1048576).toFixed(1)+' MB')
   :(n>=1024?((n/1024).toFixed(1)+' KB'):(n+' B'));}
 function addUploadFile(file){
@@ -5036,6 +5390,99 @@ function loadDraft(id){const d=drafts[id]||{text:'',images:[],files:[]};ta.value
   ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,160)+'px';
   pendingImages=(d.images||[]).slice();pendingFiles=(d.files||[]).slice();renderAttach();}
 function dropDraft(id){if(id&&drafts[id]){delete drafts[id];persistDrafts();}}
+
+/* ── voice input ───────────────────────────────────────────────────────────────
+   Records in the browser, transcribes on this machine (faster-whisper, in its own
+   process), and drops the text into the composer as an editable draft. It never
+   sends: dictation misreads words, so the turn only starts when you press send.
+   The text goes to the session that started the recording — switch tabs while it
+   transcribes and it lands in that session's draft, not the one you moved to. */
+let voiceCaps={enabled:false,available:false,maxBytes:16*1024*1024,maxSeconds:120,reason:'loading voice input…'};
+let voiceJob=null,voiceSeq=0;
+const VOICE_MIC_ICON='<img class="voice-mic-icon" src="/static/icons/fluent-studio-microphone.png" alt="">';
+const VOICE_STOP_ICON='<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="1"></rect></svg>';
+function voiceUnavailableReason(){
+  /* getUserMedia is gated on a secure context: over plain http the button can
+     never work, so say why instead of failing on click. */
+  if(!window.isSecureContext)return 'Voice input requires HTTPS';
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia)return 'Microphone access is unavailable';
+  if(typeof MediaRecorder==='undefined')return 'Audio recording is unsupported';
+  if(!voiceCaps.available)return voiceCaps.reason||'Voice transcription is unavailable';
+  return '';}
+function fmtVoiceTime(ms){const s=Math.max(0,Math.floor(ms/1000));return Math.floor(s/60)+':'+String(s%60).padStart(2,'0');}
+function syncVoiceButton(){if(typeof voiceBtn==='undefined'||!voiceBtn)return;
+  const reason=voiceUnavailableReason(),recording=voiceJob&&voiceJob.mode==='recording';
+  voiceBtn.disabled=!!reason||(!ready&&!recording)||!!(voiceJob&&voiceJob.mode!=='recording');
+  voiceBtn.classList.toggle('recording',!!recording);voiceBtn.innerHTML=recording?VOICE_STOP_ICON:VOICE_MIC_ICON;
+  voiceBtn.title=reason||((recording?'Stop and transcribe':'Voice input')+' · Alt+M');
+  voiceBtn.setAttribute('aria-label',reason||(recording?'Stop voice recording':'Start voice input'));
+  voiceBtn.setAttribute('aria-keyshortcuts','Alt+M');}
+function renderVoiceState(){const bar=$('#voiceBar'),label=$('#voiceLabel');if(!bar||!label)return;
+  if(!voiceJob){bar.hidden=true;bar.className='';syncVoiceButton();return;}
+  bar.hidden=false;bar.className=voiceJob.mode==='transcribing'?'transcribing':'';
+  if(voiceJob.mode==='starting')label.textContent='microphone…';
+  else if(voiceJob.mode==='transcribing')label.textContent='transcribing…';
+  else label.textContent='recording · '+fmtVoiceTime(Date.now()-voiceJob.startedAt)+' / '+fmtVoiceTime(voiceCaps.maxSeconds*1000);
+  syncVoiceButton();}
+/* releasing the tracks is what turns the browser's recording indicator off */
+function stopVoiceTracks(job){if(job&&job.stream){job.stream.getTracks().forEach(t=>t.stop());job.stream=null;}}
+function clearVoiceTimers(job){if(!job)return;clearInterval(job.tick);clearTimeout(job.limit);job.tick=job.limit=0;}
+function cleanupVoiceJob(job){clearVoiceTimers(job);stopVoiceTracks(job);if(voiceJob===job){voiceJob=null;renderVoiceState();}}
+function voiceMime(){const choices=['audio/webm;codecs=opus','audio/mp4','audio/ogg;codecs=opus','audio/webm'];
+  for(const type of choices){try{if(!MediaRecorder.isTypeSupported||MediaRecorder.isTypeSupported(type))return type;}catch(e){}}
+  return '';}
+/* a space only where two word characters would otherwise collide — CJK needs none */
+function voiceSpacing(left,right){return /[A-Za-z0-9_]$/.test(left||'')&&/^[A-Za-z0-9_]/.test(right||'')?' ':'';}
+function insertVoiceValue(value,start,end,text){start=Math.max(0,Math.min(Number(start)||0,value.length));end=Math.max(start,Math.min(Number(end)||start,value.length));
+  const before=value.slice(0,start),after=value.slice(end),clean=(text||'').trim();
+  const inserted=voiceSpacing(before,clean)+clean+voiceSpacing(clean,after);
+  return {value:before+inserted+after,start:start,end:start+inserted.length};}
+function insertVoiceDraft(job,text){if(!job||!job.targetSid||!(text||'').trim())return;
+  if(job.targetSid===sid){const out=insertVoiceValue(ta.value,job.insertStart,job.insertEnd,text);ta.value=out.value;
+    ta.setSelectionRange(out.end,out.end);ta.dispatchEvent(new Event('input',{bubbles:true}));ta.focus();return;}
+  const d=drafts[job.targetSid]||{text:'',images:[],files:[]};d.images=d.images||[];d.files=d.files||[];
+  const out=insertVoiceValue(d.text||'',job.insertStart,job.insertEnd,text);d.text=out.value;drafts[job.targetSid]=d;persistDrafts();}
+function voiceErrorMessage(err){const name=err&&err.name;if(name==='NotAllowedError')return 'Microphone permission was denied';
+  if(name==='NotFoundError')return 'No microphone was found';if(name==='NotReadableError')return 'The microphone is already in use';
+  return (err&&err.message)||String(err||'Voice input failed');}
+async function loadVoiceCapabilities(){try{const r=await fetch('api/transcribe',{cache:'no-store'}),j=await r.json();
+    voiceCaps=Object.assign(voiceCaps,j||{});if(!r.ok)voiceCaps.available=false;
+  }catch(e){voiceCaps.available=false;voiceCaps.reason='Voice transcription is unreachable';}syncVoiceButton();}
+async function uploadVoice(job,blob){if(job.cancelled)return;
+  if(!blob.size){addNotice('⚠ no audio was recorded');cleanupVoiceJob(job);return;}
+  if(blob.size>voiceCaps.maxBytes){addNotice('⚠ voice recording exceeds the upload limit');cleanupVoiceJob(job);return;}
+  job.mode='transcribing';job.controller=new AbortController();renderVoiceState();
+  try{const r=await fetch('api/transcribe',{method:'POST',headers:{'Content-Type':blob.type||'application/octet-stream',
+      'X-Audio-Duration-Ms':String(job.durationMs||0)},body:blob,signal:job.controller.signal});
+    let j={};try{j=await r.json();}catch(e){}
+    if(!r.ok||!j.ok)throw new Error(j.error||('transcription failed ('+r.status+')'));
+    if(!job.cancelled)insertVoiceDraft(job,j.text||'');
+  }catch(e){if(!job.cancelled&&e.name!=='AbortError')addNotice('⚠ '+voiceErrorMessage(e));}
+  finally{cleanupVoiceJob(job);}}
+function recorderStopped(job){stopVoiceTracks(job);if(job.cancelled){cleanupVoiceJob(job);return;}
+  const type=(job.recorder&&job.recorder.mimeType)||job.mime||'application/octet-stream';
+  uploadVoice(job,new Blob(job.chunks,{type:type}));}
+function stopVoiceInput(){const job=voiceJob;if(!job||job.mode!=='recording')return;
+  /* insert wherever the caret is NOW, not where it was when recording started */
+  job.insertStart=job.targetSid===sid?ta.selectionStart:job.insertStart;job.insertEnd=job.targetSid===sid?ta.selectionEnd:job.insertEnd;
+  job.durationMs=Math.max(0,Date.now()-job.startedAt);clearVoiceTimers(job);job.mode='transcribing';renderVoiceState();
+  try{if(job.recorder&&job.recorder.state!=='inactive')job.recorder.stop();else recorderStopped(job);}catch(e){addNotice('⚠ '+voiceErrorMessage(e));cleanupVoiceJob(job);}}
+function cancelVoiceInput(){const job=voiceJob;if(!job)return;job.cancelled=true;clearVoiceTimers(job);
+  if(job.controller)job.controller.abort();try{if(job.recorder&&job.recorder.state!=='inactive')job.recorder.stop();}catch(e){}
+  cleanupVoiceJob(job);}
+async function startVoiceInput(){const reason=voiceUnavailableReason();if(reason||!ready||!sid){if(reason)addNotice('⚠ '+reason);return;}
+  const job=voiceJob={id:++voiceSeq,mode:'starting',targetSid:sid,insertStart:ta.selectionStart,insertEnd:ta.selectionEnd,
+    chunks:[],stream:null,recorder:null,startedAt:0,durationMs:0,cancelled:false};renderVoiceState();
+  try{const stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
+    /* the permission prompt can outlive the job that asked for it */
+    if(voiceJob!==job||job.cancelled){stream.getTracks().forEach(t=>t.stop());return;}job.stream=stream;job.mime=voiceMime();
+    job.recorder=job.mime?new MediaRecorder(stream,{mimeType:job.mime,audioBitsPerSecond:64000}):new MediaRecorder(stream);
+    job.recorder.ondataavailable=e=>{if(e.data&&e.data.size)job.chunks.push(e.data);};
+    job.recorder.onerror=e=>{if(!job.cancelled)addNotice('⚠ '+voiceErrorMessage(e.error||e));cancelVoiceInput();};
+    job.recorder.onstop=()=>recorderStopped(job);job.startedAt=Date.now();job.mode='recording';job.recorder.start(1000);
+    job.tick=setInterval(renderVoiceState,250);job.limit=setTimeout(stopVoiceInput,voiceCaps.maxSeconds*1000);renderVoiceState();
+  }catch(e){if(!job.cancelled)addNotice('⚠ '+voiceErrorMessage(e));cleanupVoiceJob(job);}}
+function toggleVoiceInput(){if(voiceJob&&voiceJob.mode==='recording')stopVoiceInput();else if(!voiceJob)startVoiceInput();}
 function sendMsg(){const t=ta.value.trim();
   if((!t&&!pendingImages.length&&!pendingFiles.length)||!ready||!sid||!ws||ws.readyState!==1)return;
   if(filesLoading||imgsLoading){   /* sending now would silently drop the attachment */
@@ -5117,6 +5564,13 @@ ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefa
     e.preventDefault();const ids=Object.keys(queued);editQueued(ids[ids.length-1]);}});
 window.addEventListener('paste',handlePaste);
 $('#attachBtn').onclick=()=>$('#filePick').click();
+voiceBtn.onclick=toggleVoiceInput;
+$('#voiceCancel').onclick=cancelVoiceInput;
+/* a live recording must not survive the page */
+window.addEventListener('beforeunload',cancelVoiceInput);
+/* capture phase: the textarea has the focus while dictating */
+document.addEventListener('keydown',e=>{if(e.repeat||!e.altKey||e.ctrlKey||e.metaKey||e.shiftKey||e.key.toLowerCase()!=='m')return;
+  e.preventDefault();e.stopPropagation();toggleVoiceInput();},true);
 /* clearing the value lets the same file be picked twice in a row */
 $('#filePick').onchange=e=>{takeFiles(e.target.files);e.target.value='';};
 (function(){const comp=$('#composer');let depth=0;   /* depth: dragleave also fires for children */
@@ -5283,6 +5737,7 @@ setInterval(loadUsage,60000);
 loadModels();
 wireImport();
 wireSearch();
+loadVoiceCapabilities();
 /* manual model-list refresh: the ↻ button next to the picker re-queries the API,
    bypassing the server's 1h cache — so a just-shipped model appears on click,
    no page reload. Spins while fetching; no automatic polling by design. */
@@ -5345,6 +5800,7 @@ def main():
         (r"/api/import", ImportHandler),
         (r"/api/search", SearchHandler),
         (r"/api/thread", ThreadHandler),
+        (r"/api/transcribe", TranscribeHandler),
         (r"/ws/chat", ChatSocket),
         (r"/static/(.*)", tornado.web.StaticFileHandler,
          {"path": os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")}),
@@ -5366,6 +5822,9 @@ def main():
     print("  claude transcripts: %s" % CLAUDE_ROOT)
     print("  codex transcripts:  %s" % CODEX_ROOT)
     print("  auth: %s" % ("enabled" if AUTH else "disabled"))
+    _voice = _transcribe_status()
+    print("  voice input: %s" % ("enabled" if _voice["available"]
+                                 else "off — " + _voice["reason"]))
     if moved:
         print("  migrated %d starred session(s) onto their project folders" % moved)
     if not loopback and not AUTH:
@@ -5378,6 +5837,7 @@ def main():
                 s.terminate()
             except Exception:
                 pass
+        _TRANSCRIBER.shutdown()
         os._exit(0)
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
