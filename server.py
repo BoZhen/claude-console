@@ -163,6 +163,99 @@ TASK_ID_RE = re.compile(r"[Tt]ask #(\d+)")
 TASK_FIELDS = ("subject", "description", "activeForm", "status")
 
 
+# Attachments land on disk under the session's own working directory rather than
+# being inlined into the message. Inlining is what a console without tools has to
+# do; Claude has Read, Edit and Bash, so a file that exists is a file it can patch
+# and run — and the phone case this exists for ("here is my script, fix it") is
+# exactly the case where handing back a whole rewritten copy is the wrong answer.
+UPLOAD_DIR = ".claude-console/uploads"
+MAX_UPLOADS = 10
+MAX_UPLOAD_BYTES = 2 * 1024 * 1024        # per file
+MAX_UPLOAD_TOTAL = 10 * 1024 * 1024       # per message
+_UNSAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _human_bytes(n):
+    return "%.1f MB" % (n / 1048576.0) if n >= 1048576 else (
+        "%.1f KB" % (n / 1024.0) if n >= 1024 else "%d B" % n)
+
+
+def safe_upload_name(name):
+    """A name that cannot escape the uploads directory, whatever the client sent.
+
+    basename() alone is not enough: a leading dot would hide the file, and the
+    stray characters a phone puts in a filename make later shell use painful."""
+    name = os.path.basename((name or "").replace("\\", "/"))
+    name = _UNSAFE_NAME_RE.sub("_", name).lstrip(".")
+    return (name or "upload")[:100]
+
+
+def save_uploads(cwd, files):
+    """Write attachments under cwd. Returns (saved, errors), saved as [(rel, size)].
+
+    Refusals are reported, never silent — an attachment that quietly vanished
+    would have the user asking about a file the model never received."""
+    saved, errors = [], []
+    if not files:
+        return saved, errors
+    root = os.path.join(cwd, *UPLOAD_DIR.split("/"))
+    total = 0
+    if len(files) > MAX_UPLOADS:
+        errors.append("only the first %d files were attached" % MAX_UPLOADS)
+    for f in files[:MAX_UPLOADS]:
+        raw_name = (f or {}).get("name") or "upload"
+        try:
+            raw = base64.b64decode(((f or {}).get("data") or "").encode())
+        except Exception:
+            errors.append("%s: unreadable upload" % raw_name)
+            continue
+        if len(raw) > MAX_UPLOAD_BYTES:
+            errors.append("%s: %s is over the %s limit"
+                          % (raw_name, _human_bytes(len(raw)),
+                             _human_bytes(MAX_UPLOAD_BYTES)))
+            continue
+        if total + len(raw) > MAX_UPLOAD_TOTAL:
+            errors.append("%s: message would exceed the %s total"
+                          % (raw_name, _human_bytes(MAX_UPLOAD_TOTAL)))
+            break
+        try:
+            os.makedirs(root, exist_ok=True)
+            # the console's own directory ignores itself, so an upload can never
+            # ride into a commit on the back of `git add .`
+            ign = os.path.join(cwd, ".claude-console", ".gitignore")
+            if not os.path.exists(ign):
+                with open(ign, "w") as fh:
+                    fh.write("*\n")
+            name = safe_upload_name(raw_name)
+            stem, ext = os.path.splitext(name)
+            path, n = os.path.join(root, name), 2
+            while os.path.exists(path):    # never clobber an earlier upload
+                name = "%s-%d%s" % (stem, n, ext)
+                path = os.path.join(root, name)
+                n += 1
+            with open(path, "wb") as fh:
+                fh.write(raw)
+            os.chmod(path, 0o600)
+        except Exception as ex:
+            errors.append("%s: %s" % (raw_name, ex))
+            continue
+        total += len(raw)
+        saved.append((UPLOAD_DIR + "/" + name, len(raw)))
+    return saved, errors
+
+
+def uploads_note(saved):
+    """The line appended to the outgoing message so the model knows what arrived.
+    Viewers never see it — they see the file chips instead."""
+    if not saved:
+        return ""
+    lines = ["", "(%d file%s attached, saved under this session's working directory:"
+             % (len(saved), "" if len(saved) == 1 else "s")]
+    lines += ["    %s  —  %s" % (rel, _human_bytes(n)) for rel, n in saved]
+    lines.append("You can read, edit and run them in place.)")
+    return "\n".join(lines)
+
+
 def parse_claude(rec, idx):
     t = rec.get("type")
     base = {"ts": rec.get("timestamp"), "id": rec.get("uuid") or ("L%d" % idx)}
@@ -2033,22 +2126,28 @@ class ChatSession:
         re-attaching viewer resume the elapsed-time display instead of resetting."""
         return (time.time() - self.turn_started) if (self.busy and self.turn_started) else 0
 
-    def send_user(self, text, images=None):
+    def send_user(self, text, images=None, files=None):
         images = [im for im in (images or []) if im.get("data")]
-        if (not text.strip() and not images) or not self.client or self.ended:
+        files = [f for f in (files or []) if isinstance(f, dict) and f.get("data")]
+        if (not text.strip() and not images and not files) or not self.client or self.ended:
             return
         if self.busy:
             # a turn is running — queue it. It's injected into the live turn at
             # the next tool boundary (steering), or dispatched when the turn ends.
             self._qid += 1
             qid = "q%d" % self._qid
-            self.queue.append({"qid": qid, "text": text, "images": images})
+            # the bodies ride along in memory until dispatch: nothing is written
+            # to disk for a message that might still be withdrawn
+            self.queue.append({"qid": qid, "text": text, "images": images,
+                               "files": files})
             ev = {"kind": "queued", "qid": qid, "text": _cap(text)}
             if images:
                 ev["images"] = len(images)
+            if files:
+                ev["files"] = [safe_upload_name(f.get("name")) for f in files]
             self._push([ev])
             return
-        self._dispatch(text, images)
+        self._dispatch(text, images, files)
 
     def _make_payload(self, text, images):
         """A string (text-only) or an Anthropic-format async-iterable (multimodal)
@@ -2068,7 +2167,7 @@ class ChatSession:
                    "message": {"role": "user", "content": content}}
         return _gen()
 
-    def _echo_user(self, text, images, qid=None, start=False):
+    def _echo_user(self, text, images, files=None, qid=None, start=False):
         """Push the console events for one outgoing user message."""
         evs = []
         if qid:                       # came off the queue — drop its chip
@@ -2078,10 +2177,12 @@ class ChatSession:
         ue = {"kind": "user_text", "text": _cap(text)}
         if images:
             ue["images"] = len(images)
+        if files:
+            ue["files"] = list(files)    # names only: bodies never enter the log
         evs.append(ue)
         self._push(evs)
 
-    def _dispatch(self, text, images, qid=None, start=True):
+    def _dispatch(self, text, images, files=None, qid=None, start=True):
         """Send one message to the live client. start=True begins a new turn;
         start=False injects into the running turn without flipping busy."""
         if start:
@@ -2094,11 +2195,17 @@ class ChatSession:
             cmd0 = text.strip().split(None, 1)[0] if text.strip() else ""
             self.compacting = (cmd0 == "/compact")
             self._compact_turn = self.compacting
-        self._echo_user(text, images, qid=qid, start=start)
+        # written before the echo so the chips show the names that actually landed
+        # (a collision renames test.py to test-2.py, and the user should see that)
+        saved, up_errs = save_uploads(self.cwd, files)
+        self._echo_user(text, images, files=[rel.rsplit("/", 1)[-1] for rel, _ in saved],
+                        qid=qid, start=start)
+        for e in up_errs:
+            self._push([{"kind": "notice", "text": "⚠ attachment — " + e}])
         if start and self.compacting:   # surface the otherwise-silent long compaction
             self._push([{"kind": "compacting", "word": self.turn_word}])
         client = self.client
-        send_text = text
+        send_text = text + uploads_note(saved)
         if (self.effort == "ultracode" and text.strip()
                 and not text.lstrip().startswith("/")
                 and "ultracode" not in text.lower()):
@@ -2132,13 +2239,19 @@ class ChatSession:
         else:
             return
         if not self.busy:                      # turn already over → normal dispatch
-            self._dispatch(it["text"], it["images"], qid=it["qid"], start=True)
+            self._dispatch(it["text"], it["images"], it.get("files"),
+                           qid=it["qid"], start=True)
             return
-        self._echo_user(it["text"], it["images"], qid=it["qid"], start=False)
+        saved, up_errs = save_uploads(self.cwd, it.get("files"))
+        self._echo_user(it["text"], it["images"],
+                        files=[rel.rsplit("/", 1)[-1] for rel, _ in saved],
+                        qid=it["qid"], start=False)
+        for e in up_errs:
+            self._push([{"kind": "notice", "text": "⚠ attachment — " + e}])
         self._push([{"kind": "notice",
                      "text": "⚡ steered into the running turn — Claude sees it at its "
                              "next step but may answer only after finishing current work"}])
-        payload = self._make_payload(it["text"], it["images"])
+        payload = self._make_payload(it["text"] + uploads_note(saved), it["images"])
         client = self.client
         async def _q():
             try:
@@ -2153,7 +2266,8 @@ class ChatSession:
         if self.busy or self.ended or not self.client or not self.queue:
             return
         item = self.queue.pop(0)
-        self._dispatch(item["text"], item["images"], qid=item["qid"], start=True)
+        self._dispatch(item["text"], item["images"], item.get("files"),
+                       qid=item["qid"], start=True)
 
     def unqueue(self, qid):
         """Withdraw a still-pending queued message (user is editing it)."""
@@ -2527,7 +2641,8 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                                "turn_age": new.turn_age(), "word": new.turn_word,
                                "effort": new.effort, "compacting": new.compacting, "resumed": True})
         elif mt == "user" and self.session:
-            self.session.send_user(msg.get("text", ""), msg.get("images"))
+            self.session.send_user(msg.get("text", ""), msg.get("images"),
+                                   msg.get("files"))
         elif mt == "unqueue" and self.session:
             self.session.unqueue(msg.get("qid"))
         elif mt == "steer" and self.session:
@@ -2735,7 +2850,7 @@ header input#cwd{flex:1;min-width:120px;display:none}
 #chat{flex:1;overflow-y:auto;overflow-x:hidden;padding:14px;-webkit-overflow-scrolling:touch}
 .wrap{max-width:820px;margin:0 auto}
 .msg{margin-bottom:14px;line-height:1.5;word-wrap:break-word;overflow-wrap:anywhere}
-.msg.user{display:flex;justify-content:flex-end}
+.msg.user{display:flex;flex-direction:column;align-items:flex-end}
 .msg.user .b{background:var(--sel);border:1px solid var(--selln);border-radius:10px;padding:8px 12px;max-width:85%;white-space:pre-wrap}
 .msg.asst .b{color:var(--fg);text-wrap:pretty}
 /* The streaming bubble inherits the finished bubble's box and typography, so the
@@ -2887,6 +3002,27 @@ pre code{background:none;border:none;padding:0}
 #ta:focus{outline:1px solid var(--acc)}
 #send{background:var(--acc);color:var(--onacc);border:none;border-radius:10px;width:38px;height:38px;flex:none;display:inline-flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;cursor:pointer}
 #send:disabled{background:var(--line);color:var(--mut);cursor:default}
+/* Attach button. Pasting was the only way in before, which on a phone means there
+   was no way in at all — no clipboard image, no file picker, nothing. One control
+   covers both: the native picker offers camera, photos and files, and the same
+   handler takes drag-and-drop on the desktop. */
+#attachBtn{background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:10px;
+  width:38px;height:38px;flex:none;display:inline-flex;align-items:center;justify-content:center;
+  font-size:16px;cursor:pointer;padding:0}
+#attachBtn:hover:not(:disabled){background:var(--line)}
+#attachBtn:disabled{color:var(--mut);cursor:default;opacity:.6}
+#composer.drop .wrap2{outline:2px dashed var(--acc);outline-offset:4px;border-radius:12px}
+/* a file chip is a name, not a thumbnail: there is nothing to preview */
+#attach .fatt{display:inline-flex;align-items:center;gap:7px;height:28px;padding:0 6px 0 9px;
+  border:1px solid var(--line);border-radius:8px;background:var(--bg3);font-size:12px;max-width:260px}
+#attach .fatt .fn{font-family:var(--fmono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+#attach .fatt .fsz{color:var(--mut);font-family:var(--fmono);font-size:11px;flex:none}
+#attach .fatt .rm{width:17px;height:17px;flex:none;border:none;border-radius:50%;background:none;
+  color:var(--mut);cursor:pointer;font-size:11px;line-height:17px;text-align:center;padding:0}
+#attach .fatt .rm:hover{background:var(--del);color:#fff}
+/* the echoed user message names what rode along with it, under the bubble */
+.msg.user .files{margin-top:3px;font-size:11.5px;color:var(--mut);font-family:var(--fmono);
+  text-align:right;max-width:85%;overflow-wrap:anywhere}
 
 #drawer{position:fixed;top:0;right:0;width:var(--drw,min(560px,92vw));height:100%;background:var(--bg);border-left:1px solid var(--line);
   transform:translateX(100%);transition:transform .34s cubic-bezier(.32,.72,0,1);z-index:20;display:flex;flex-direction:column}
@@ -3372,7 +3508,9 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
       <div id="queue"></div>
       <div id="attach"></div>
       <div class="wrap2">
-      <textarea id="ta" rows="1" placeholder="Type a message…  (Enter to send · Shift+Enter newline · paste an image)" disabled></textarea>
+      <input type="file" id="filePick" accept="image/png,image/jpeg,image/gif,image/webp,text/*,application/json,application/xml,application/javascript,application/x-yaml,application/pdf,.py,.ipynb,.js,.jsx,.ts,.tsx,.json,.jsonl,.yaml,.yml,.toml,.md,.rst,.tex,.bib,.c,.h,.cpp,.hpp,.cc,.rs,.go,.java,.kt,.sh,.bash,.zsh,.fish,.sql,.html,.css,.scss,.xml,.csv,.tsv,.ini,.cfg,.conf,.log,.diff,.patch,.mk,.m,.jl,.r,.f90,.cu,.pdf" multiple hidden>
+      <button id="attachBtn" type="button" title="Attach images or files" aria-label="Attach files" disabled>📎</button>
+      <textarea id="ta" rows="1" placeholder="Type a message…  (Enter to send · Shift+Enter newline · 📎 or paste to attach)" disabled></textarea>
       <button id="stop" title="interrupt / stop" style="display:none">⏹</button>
       <button id="send" disabled>➤</button>
     </div></div>
@@ -3542,8 +3680,10 @@ function toolBody(ev){const i=ev.input||{},t=ev.tool;
   if(typeof i==='string')return '<pre><code>'+esc(i)+'</code></pre>';
   return '<pre><code>'+esc(JSON.stringify(i,null,2))+'</code></pre>';}
 
-function addUser(text,nImg){const s=atBottom();const d=document.createElement('div');d.className='msg user';
-  d.innerHTML='<div class="b">'+esc(text)+'</div>'+(nImg?'<div class="imgs">🖼 '+nImg+' image'+(nImg>1?'s':'')+' attached</div>':'');
+function addUser(text,nImg,files){const s=atBottom();const d=document.createElement('div');d.className='msg user';
+  d.innerHTML='<div class="b">'+esc(text)+'</div>'+
+    (nImg?'<div class="imgs">🖼 '+nImg+' image'+(nImg>1?'s':'')+' attached</div>':'')+
+    ((files&&files.length)?'<div class="files">📎 '+files.map(esc).join(' · ')+'</div>':'');
   stream.appendChild(d);scroll();}
 function addAsst(text){const s=atBottom();const d=document.createElement('div');d.className='msg asst';
   d.innerHTML='<div class="b bubble">'+md(text)+'</div>';typesetMath(d);stream.appendChild(d);if(s)scroll();}
@@ -3782,6 +3922,7 @@ function setBusy(b,wordSeed,elapsedMs){running=b;$('#dot').className='dot '+(b?'
   $('#thinking').classList.toggle('busy',b);
   if(!b&&ready)statset('ready');      /* busy: startThinking owns the word + timer */
   ta.disabled=!ready;
+  $('#attachBtn').disabled=!ready;
   sendBtn.disabled=!ready;            /* send stays available while busy → queues */
   $('#stop').style.display=b?'':'none';   /* interrupt button only while busy */
   sendBtn.style.display='';               /* send always visible */
@@ -3947,7 +4088,7 @@ function route(ev){
      streaming bubble — drop it before rendering whatever really landed */
   if(ev.kind!=='stream_text')endStream();
   if(ev.kind==='stream_text')addStreamText(ev.text);
-  else if(ev.kind==='user_text')addUser(ev.text,ev.images);
+  else if(ev.kind==='user_text')addUser(ev.text,ev.images,ev.files);
   else if(ev.kind==='ready'){ready=true;cwd=ev.cwd||cwd;curCC=ev.session_id||curCC;if(ev.model)setResolvedModel(ev.model);addNotice('● session ready · '+(ev.model||'')+(ev.effort?' · '+ev.effort+' effort':'')+' · '+(ev.cwd||''));}
   else if(ev.kind==='assistant_text')addAsst(ev.text);
   else if(ev.kind==='thinking')addThink(ev.text);
@@ -3970,7 +4111,7 @@ function route(ev){
 }
 
 /* persistent server-side session: attach / reattach / switch */
-function markEnded(msg){ready=false;ta.disabled=true;sendBtn.disabled=true;$('#dot').className='dot';statset('ended');
+function markEnded(msg){ready=false;ta.disabled=true;sendBtn.disabled=true;attachOff(true);$('#dot').className='dot';statset('ended');
   localStorage.removeItem(SKEY);if(msg)addNotice(msg);}
 function onMsg(e){const m=JSON.parse(e.data);
   if(m.type==='started'){pendingStart=false;sid=m.id;cwd=m.cwd;bindProject(m.cwd);localStorage.setItem(SKEY,sid);loadDraft(sid);
@@ -3991,7 +4132,7 @@ function onMsg(e){const m=JSON.parse(e.data);
     trimChatWindow();
     compacting=!!m.compacting;setBusy(!!m.busy,m.word,(m.turn_age||0)*1000);loadDraft(sid);
     if(m.ended){markEnded('— this session has ended (history shown · you can resume it from disk) —');}
-    else{ta.disabled=false;sendBtn.disabled=false;
+    else{ta.disabled=false;sendBtn.disabled=false;attachOff(false);
       if(!incremental)addNotice('— '+(m.resumed?'resumed':'reattached to')+' « '+(m.name||'')+' » ('+m.events.length+' events)'+(m.effort?' with '+m.effort+' effort':'')+' —');}
     const at=tabById(m.id);
     if(at){at.lastSeq=Math.max(Number(at.lastSeq||0),Number(m.event_seq||0));
@@ -4000,7 +4141,7 @@ function onMsg(e){const m=JSON.parse(e.data);
     if(incremental){if(stick){scroll();requestAnimationFrame(scroll);}}
     else{scroll();requestAnimationFrame(scroll);}
     reqList();loadTree();}
-  else if(m.type==='detached'){if(!sid){ready=false;ta.disabled=true;sendBtn.disabled=true;statset('idle');}}
+  else if(m.type==='detached'){if(!sid){ready=false;ta.disabled=true;sendBtn.disabled=true;attachOff(true);statset('idle');}}
   else if(m.type==='no_session'){localStorage.removeItem(SKEY);sid=null;restoredViewId='';ready=false;setBusy(false);setCurname('');renderCtx(null);statset('idle');
     if(m.id)dropTab(m.id);
     addNotice('that session is no longer running — pick it under “Resume from disk”, or ＋ New.');reqList();loadTree();}
@@ -4035,7 +4176,7 @@ function openWs(cb){const proto=location.protocol==='https:'?'wss:':'ws:';
     if(saved&&!pendingStart){const req={type:'attach',id:saved},t=tabById(saved);
       if(restoredViewId===saved&&t)req.after_seq=Number(t.lastSeq||0);else statset('reattaching…');
       ws.send(JSON.stringify(req));}};
-  ws.onclose=()=>{$('#dot').className='dot';statset('disconnected');ta.disabled=true;sendBtn.disabled=true;
+  ws.onclose=()=>{$('#dot').className='dot';statset('disconnected');ta.disabled=true;sendBtn.disabled=true;attachOff(true);
     clearTimeout(reconnectT);reconnectT=setTimeout(()=>openWs(),1800);};
   ws.onmessage=onMsg;}
 function wsSend(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));}
@@ -4704,7 +4845,7 @@ function closeTab(id){
   /* last tab closed: stop viewing, do not stop working */
   wsSend({type:'detach'});sid=null;restoredViewId='';localStorage.removeItem(SKEY);
   clearUI();ready=false;setBusy(false);setCurname('');renderCtx(null);statset('idle');
-  ta.disabled=true;sendBtn.disabled=true;
+  ta.disabled=true;sendBtn.disabled=true;attachOff(true);
   addNotice('— tab closed · that session is still running · reopen it from Live —');}
 
 /* ── cached views ──────────────────────────────────────────────────────────── */
@@ -4819,16 +4960,59 @@ function endSessionById(id,name){if(!id)return;
   dropTab(id);reqList();loadTree();}
 /* image attachments: paste (Ctrl/Cmd+V) an image into the composer */
 let pendingImages=[];
+/* ── attachments ──────────────────────────────────────────────────────────────
+   Images go to the model as image blocks, unchanged. Everything else is WRITTEN
+   TO DISK under the session's working directory and named in the message, which
+   is the one place this console should not copy codex: codex has to inline file
+   bodies because its app-server has no file input, but Claude has Read, Edit and
+   Bash. A file that exists is a file it can patch and run — and the case this
+   feature exists for, attaching a script from a phone and asking for a fix, is
+   exactly the case where getting a whole rewritten copy back is the wrong answer.
+
+   Bodies are held in memory only. persistDrafts() already stores nothing but
+   text, so nothing ever reaches localStorage, and the server writes them only at
+   dispatch — a queued message that gets withdrawn leaves no file behind. */
+const MAX_FILES=10, MAX_FILE_BYTES=2*1024*1024;
+let pendingFiles=[];
+/* FileReader lands asynchronously, so the caps have to count what is still in
+   flight as well as what has arrived — otherwise picking fourteen files at once
+   passes fourteen synchronous "is there room?" checks before any of them lands. */
+let filesLoading=0, imgsLoading=0;
+function attachOff(off){const b=$('#attachBtn');if(b)b.disabled=!!off;}
+function fmtBytes(n){return n>=1048576?((n/1048576).toFixed(1)+' MB')
+  :(n>=1024?((n/1024).toFixed(1)+' KB'):(n+' B'));}
+function addUploadFile(file){
+  if(pendingFiles.length+filesLoading>=MAX_FILES){addNotice('⚠ up to '+MAX_FILES+' files at once');return;}
+  if(file.size>MAX_FILE_BYTES){
+    addNotice('⚠ '+file.name+' is too large ('+fmtBytes(file.size)+', max '+fmtBytes(MAX_FILE_BYTES)+')');return;}
+  const r=new FileReader();filesLoading++;
+  r.onerror=()=>{filesLoading--;addNotice('⚠ could not read '+file.name);};
+  r.onload=()=>{filesLoading--;const u=''+r.result;
+    pendingFiles.push({name:file.name,size:file.size,data:u.slice(u.indexOf(',')+1)});
+    renderAttach();};
+  r.readAsDataURL(file);}
+/* one entry point for the picker, drag-and-drop and paste: images take the image
+   path, everything else takes the upload path */
+function takeFiles(list){[...(list||[])].forEach(f=>{
+  if(f&&OK_IMG.indexOf(f.type)>=0)addImageFile(f);else if(f)addUploadFile(f);});}
 const MAX_IMG=8, MAX_IMG_BYTES=5*1024*1024, OK_IMG=['image/png','image/jpeg','image/gif','image/webp'];
-function renderAttach(){const a=$('#attach');a.classList.toggle('on',pendingImages.length>0);
-  a.innerHTML=pendingImages.map((im,i)=>'<div class="att"><img src="'+im.url+'"><button class="rm" data-i="'+i+'" title="remove">✕</button></div>').join('');
-  a.querySelectorAll('.rm').forEach(b=>b.onclick=()=>{pendingImages.splice(+b.dataset.i,1);renderAttach();});}
+function renderAttach(){const a=$('#attach');
+  a.classList.toggle('on',pendingImages.length+pendingFiles.length>0);
+  a.innerHTML=pendingImages.map((im,i)=>'<div class="att"><img src="'+im.url+'"><button class="rm" data-i="'+i+'" title="remove">✕</button></div>').join('')
+    +pendingFiles.map((f,i)=>'<div class="fatt" title="'+escAttr(f.name)+'"><span class="fn">📎 '+esc(f.name)+
+      '</span><span class="fsz">'+fmtBytes(f.size)+'</span><button class="rm" data-f="'+i+'" title="remove">✕</button></div>').join('');
+  a.querySelectorAll('.rm').forEach(b=>b.onclick=()=>{
+    if(b.dataset.f!==undefined)pendingFiles.splice(+b.dataset.f,1);
+    else pendingImages.splice(+b.dataset.i,1);
+    renderAttach();});}
 function addImageFile(file){
-  if(pendingImages.length>=MAX_IMG){addNotice('⚠ up to '+MAX_IMG+' images at once');return;}
+  if(pendingImages.length+imgsLoading>=MAX_IMG){addNotice('⚠ up to '+MAX_IMG+' images at once');return;}
   if(OK_IMG.indexOf(file.type)<0){addNotice('⚠ unsupported image type: '+(file.type||'?'));return;}
   if(file.size>MAX_IMG_BYTES){addNotice('⚠ image too large ('+Math.round(file.size/1048576)+'MB, max 5MB)');return;}
-  const r=new FileReader();
-  r.onload=()=>{const url=''+r.result;pendingImages.push({media_type:file.type,data:url.split(',')[1]||'',url:url});renderAttach();};
+  const r=new FileReader();imgsLoading++;
+  r.onerror=()=>{imgsLoading--;addNotice('⚠ could not read '+file.name);};
+  r.onload=()=>{imgsLoading--;const url=''+r.result;
+    pendingImages.push({media_type:file.type,data:url.split(',')[1]||'',url:url});renderAttach();};
   r.readAsDataURL(file);}
 function handlePaste(e){const cd=e.clipboardData;if(!cd)return;
   /* Word / rich-text copies put BOTH the text AND a rendered image on the clipboard.
@@ -4846,15 +5030,19 @@ let drafts={}, _dpT=0;
 try{const sv=JSON.parse(localStorage.getItem(DKEY)||'{}');for(const k in sv)drafts[k]={text:sv[k]||'',images:[]};}catch(e){}
 function persistDrafts(){const t={};for(const k in drafts){const v=drafts[k];if(v&&v.text&&v.text.trim())t[k]=v.text;}try{localStorage.setItem(DKEY,JSON.stringify(t));}catch(e){}}
 function schedulePersist(){clearTimeout(_dpT);_dpT=setTimeout(persistDrafts,500);}
-function saveDraft(){if(sid)drafts[sid]={text:ta.value,images:pendingImages.slice()};persistDrafts();}
-function loadDraft(id){const d=drafts[id]||{text:'',images:[]};ta.value=d.text||'';
+function saveDraft(){if(sid)drafts[sid]={text:ta.value,images:pendingImages.slice(),
+  files:pendingFiles.slice()};persistDrafts();}
+function loadDraft(id){const d=drafts[id]||{text:'',images:[],files:[]};ta.value=d.text||'';
   ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,160)+'px';
-  pendingImages=(d.images||[]).slice();renderAttach();}
+  pendingImages=(d.images||[]).slice();pendingFiles=(d.files||[]).slice();renderAttach();}
 function dropDraft(id){if(id&&drafts[id]){delete drafts[id];persistDrafts();}}
 function sendMsg(){const t=ta.value.trim();
-  if((!t&&!pendingImages.length)||!ready||!sid||!ws||ws.readyState!==1)return;
-  wsSend({type:'user',text:t,images:pendingImages.map(im=>({media_type:im.media_type,data:im.data}))});
-  ta.value='';ta.style.height='auto';pendingImages=[];renderAttach();dropDraft(sid);}
+  if((!t&&!pendingImages.length&&!pendingFiles.length)||!ready||!sid||!ws||ws.readyState!==1)return;
+  if(filesLoading||imgsLoading){   /* sending now would silently drop the attachment */
+    addNotice('⏳ still reading attachments — press send again in a moment');return;}
+  wsSend({type:'user',text:t,images:pendingImages.map(im=>({media_type:im.media_type,data:im.data})),
+          files:pendingFiles.map(f=>({name:f.name,data:f.data}))});
+  ta.value='';ta.style.height='auto';pendingImages=[];pendingFiles=[];renderAttach();dropDraft(sid);}
   /* busy state (and the thinking word/timer) is driven by the server's
      turn_start, so it stays correct across reattach — no optimistic flip here */
 
@@ -4865,7 +5053,8 @@ function renderQueue(){const q=$('#queue');if(!q)return;const ids=Object.keys(qu
   q.classList.toggle('on',ids.length>0);
   q.innerHTML=ids.map(id=>'<div class="qmsg" data-q="'+id+'" title="sends when the current turn ends · click to edit · ✕ to discard">'+
     '<span class="qicon">⏳</span><span class="qtext">'+esc(queued[id].text||'')+
-    (queued[id].images?(' 🖼×'+queued[id].images):'')+'</span>'+
+    (queued[id].images?(' 🖼×'+queued[id].images):'')+
+    (queued[id].files?(' 📎×'+queued[id].files.length):'')+'</span>'+
     '<span class="qsteer" title="steer into the RUNNING turn now — Claude sees it immediately but may reply only after finishing current work">⚡</span>'+
     '<span class="qx" title="discard">✕</span></div>').join('');
   q.querySelectorAll('.qmsg').forEach(el=>{const id=el.dataset.q;
@@ -4873,10 +5062,13 @@ function renderQueue(){const q=$('#queue');if(!q)return;const ids=Object.keys(qu
     el.querySelector('.qsteer').onclick=ev=>{ev.stopPropagation();
       if(ws&&ws.readyState===1)wsSend({type:'steer',qid:id});};
     el.onclick=()=>editQueued(id);});}
-function addQueued(ev){queued[ev.qid]={text:ev.text||'',images:ev.images||0};renderQueue();}
+function addQueued(ev){queued[ev.qid]={text:ev.text||'',images:ev.images||0,files:ev.files||null};renderQueue();}
 function removeQueued(qid){if(queued[qid]){delete queued[qid];renderQueue();}}
 function discardQueued(id){if(ws&&ws.readyState===1)wsSend({type:'unqueue',qid:id});removeQueued(id);}
 function editQueued(id){const it=queued[id];if(!it)return;
+  if(it.files&&it.files.length)
+    addNotice('⚠ '+it.files.length+' attachment'+(it.files.length>1?'s were':' was')+
+              ' dropped with the queued message — attach again before sending');
   const draft=ta.value;
   ta.value=draft.trim()?(it.text+'\n'+draft):it.text;   /* keep any in-progress draft */
   ta.dispatchEvent(new Event('input'));ta.focus();
@@ -4919,11 +5111,20 @@ async function refreshGit(){if(!cwd){$('#gitc').innerHTML='<div class="empty">no
 
 /* bindings */
 ta.addEventListener('input',()=>{ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,160)+'px';
-  if(sid){drafts[sid]={text:ta.value,images:pendingImages.slice()};schedulePersist();}});
+  if(sid){drafts[sid]={text:ta.value,images:pendingImages.slice(),files:pendingFiles.slice()};schedulePersist();}});
 ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMsg();}
   else if(e.key==='ArrowUp'&&!ta.value&&Object.keys(queued).length){
     e.preventDefault();const ids=Object.keys(queued);editQueued(ids[ids.length-1]);}});
 window.addEventListener('paste',handlePaste);
+$('#attachBtn').onclick=()=>$('#filePick').click();
+/* clearing the value lets the same file be picked twice in a row */
+$('#filePick').onchange=e=>{takeFiles(e.target.files);e.target.value='';};
+(function(){const comp=$('#composer');let depth=0;   /* depth: dragleave also fires for children */
+  comp.addEventListener('dragenter',e=>{e.preventDefault();if(ready&&++depth===1)comp.classList.add('drop');});
+  comp.addEventListener('dragover',e=>{e.preventDefault();});
+  comp.addEventListener('dragleave',()=>{if(--depth<=0){depth=0;comp.classList.remove('drop');}});
+  comp.addEventListener('drop',e=>{e.preventDefault();depth=0;comp.classList.remove('drop');
+    if(ready&&e.dataTransfer)takeFiles(e.dataTransfer.files);});})();
 sendBtn.onclick=sendMsg;
 $('#stop').onclick=doInterrupt;
 document.addEventListener('keydown',e=>{
