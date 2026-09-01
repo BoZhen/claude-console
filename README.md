@@ -5,7 +5,7 @@ things a raw terminal tangles together:
 
 - **Discussion** — what you asked / what the agent said (prose only)
 - **Code & file changes** — every tool call (edits, writes, commands) rendered as
-  **collapsed cards** (`✏️ Edit server.py  +12 −3`) you expand on demand, plus the
+  **collapsed cards** (`✏️ Edit observables.py  +12 −3`) you expand on demand, plus the
   live `git diff` of the working directory (ground truth)
 
 <p align="center">
@@ -115,10 +115,10 @@ which is the whole point.
 
 ```bash
 # any python with tornado + claude-agent-sdk works; defaults to localhost-only (safe):
-python server.py
+python claude_console.py
 
 # to reach it from your phone/iPad on the LAN, expose it WITH auth:
-CLAUDE_CONSOLE_BIND=0.0.0.0 CLAUDE_CONSOLE_AUTH=me:secret python server.py
+CLAUDE_CONSOLE_BIND=0.0.0.0 CLAUDE_CONSOLE_AUTH=me:secret python claude_console.py
 ```
 
 Open `http://<host>:7703`, pick a project dir, and start chatting; the change
@@ -141,7 +141,7 @@ The legacy `AGENTLENS_*` names are still honored as a fallback.
 
 ## Notes
 
-- Intentionally a single `server.py` with inline HTML/CSS/JS — **no build step**.
+- Intentionally a single `claude_console.py` with inline HTML/CSS/JS — **no build step**.
 - [KaTeX](https://katex.org/) is vendored under `static/katex/` (MIT) for offline
   math rendering.
 - Non-image attachments are written to `.claude-console/uploads/` inside the
