@@ -4094,8 +4094,35 @@ function diffHtml(t){return t.split('\n').map(l=>{let c='dl-ctx';
 let replaying=false;   /* true while bulk-replaying a session log on attach — suppresses
                           per-event atBottom/scroll so we don't force 1000s of reflows;
                           a single scroll-to-bottom runs once at the end instead. */
-function atBottom(){if(replaying)return false;const c=$('#chat');return c.scrollHeight-c.scrollTop-c.clientHeight<140;}
-function scroll(){if(replaying)return;const c=$('#chat');c.scrollTop=c.scrollHeight;}
+/* ── following the tail ───────────────────────────────────────────────────────
+   Whether the view sticks to the end is a fact about the reader, not about the
+   scrollbar. It used to be read off the position, "within 140px of the end", and
+   re-read every time text landed, which during streaming is every frame. A wheel
+   notch is 100px and Chrome animates it over a few frames, so the reader never got
+   140px away before the next frame put them back at the end and cancelled the
+   animation. Scrolling up during an answer was impossible with a mouse and worse
+   on a trackpad.
+
+   So it is a state now. Any upward move the reader makes leaves the tail: the
+   wheel listener catches the intent before the first animated pixel, the scroll
+   listener catches drags, keys and touch. Coming back down into the last
+   FOLLOW_BAND px rejoins it, and so does anything that jumps to the end on purpose
+   (sending a message, an approval card, attaching). autoTop is where we last put
+   the scrollbar, so a scroll event that lands above it is the reader's doing.
+   Content that shrinks above the viewport (a trimmed window, the provisional bubble
+   being swapped out, a collapsed card) also moves scrollTop, but it clamps exactly
+   to the end, and a position at the end is never read as leaving. */
+let follow=true, autoTop=0;
+const FOLLOW_BAND=140;
+function atBottom(){return !replaying&&follow;}
+function setTop(v,f){const c=$('#chat');c.scrollTop=v;autoTop=c.scrollTop;follow=f;}
+function scroll(){if(replaying)return;setTop($('#chat').scrollHeight,true);}
+(()=>{const c=$('#chat');let prev=c.scrollTop;
+  c.addEventListener('wheel',e=>{if(e.deltaY<0&&c.scrollTop>0)follow=false;},{passive:true});
+  c.addEventListener('scroll',()=>{const top=c.scrollTop,gap=c.scrollHeight-top-c.clientHeight;
+    if(top<autoTop-1&&gap>2)follow=false;
+    else if(top>prev&&gap<FOLLOW_BAND)follow=true;
+    prev=top;},{passive:true});})();
 
 const ICON={Edit:'✏️',MultiEdit:'✏️',Write:'📝',Bash:'▶',Read:'📖',Glob:'🔍',Grep:'🔍',Task:'🤖',
   WebFetch:'🌐',WebSearch:'🌐',TodoWrite:'☑️',NotebookEdit:'📓',
@@ -5291,10 +5318,10 @@ function takeChildren(el){const f=document.createDocumentFragment();
   if(el)while(el.firstChild)f.appendChild(el.firstChild);return f;}
 function restoreChildren(el,frag){if(!el)return;el.innerHTML='';if(frag)el.appendChild(frag);}
 function rememberTabView(){const t=tabById(sid),c=$('#chat');if(!t||!c)return;
-  t.scrollTop=c.scrollTop;t.atBottom=c.scrollHeight-c.scrollTop-c.clientHeight<140;}
+  t.scrollTop=c.scrollTop;t.atBottom=follow;}
 function restoreTabView(id){const t=tabById(id),c=$('#chat');if(!t||!c)return;
   /* after the fragment is in the document but before paint, so it never flashes */
-  requestAnimationFrame(()=>{c.scrollTop=(t.atBottom!==false)?c.scrollHeight:(t.scrollTop||0);});}
+  requestAnimationFrame(()=>{const f=t.atBottom!==false;setTop(f?c.scrollHeight:(t.scrollTop||0),f);});}
 function stashView(id){
   if(!id)return false;const t=tabById(id);if(!t)return false;
   endStream();trimChatWindow();rememberTabView();
