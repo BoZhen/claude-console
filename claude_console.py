@@ -4490,7 +4490,7 @@ function addRecap(t){const s=atBottom();const d=document.createElement('div');d.
    is a statement about the present, and inline it would scroll away into history. */
 let planTasks=[],planCollapsed=false,planHideT=0;
 const PLAN_HIDE_MS=2000;
-const PLAN_MARK={completed:['done','✔'],in_progress:['active','▸'],pending:['todo','○']};
+const PLAN_MARK={completed:['done','●'],in_progress:['active','◐'],pending:['todo','○']};   /* filled, half, hollow */
 function planMark(st){return PLAN_MARK[(''+(st||'pending')).toLowerCase()]||PLAN_MARK.pending;}
 function planDone(t){return planMark(t.status)[0]==='done';}
 function planAllDone(ts){return ts.length>0&&ts.every(planDone);}
