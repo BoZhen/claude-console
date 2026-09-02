@@ -19,6 +19,7 @@ Env (legacy AGENTLENS_* names still accepted as a fallback):
 import asyncio
 import base64
 import glob
+import hashlib
 import io
 import json
 import os
@@ -2098,6 +2099,50 @@ def _sanitize_mode(m):
     return m if m in ("acceptEdits", "plan", "default", "bypassPermissions") else "acceptEdits"
 
 EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultracode")
+_ONCE_RE = re.compile(r"^@([\w.\-\[\]]+)[ \t]+(?=\S)")
+CLI_MODEL_ALIASES = ("opus", "sonnet", "haiku")
+
+def resolve_model_token(tok):
+    """A CLI alias, an exact id from the model list, or a fragment of one. The
+    list is the API's, newest first, so `fable` picks the newest fable. Whatever
+    it picks, the long-window `[1m]` variant is used when the list has one: a
+    one-off message on another model is usually made from inside a long session,
+    and the plain window would only refuse it. An exact id is used as typed, so
+    `@claude-sonnet-5` is the way to ask for the plain window. Cached list only:
+    this runs on the IO loop at dispatch and must not go to the network."""
+    t = tok.lower()
+    base = t[:-4] if t.endswith("[1m]") else t
+    ids = [m["id"] for m in (_models_cache["v"] or []) if m.get("id")]
+    for mid in ids:
+        if mid.lower() == t:
+            return mid
+    def long(mid):
+        return mid + "[1m]" if mid + "[1m]" in ids else mid
+    for mid in ids:
+        if not mid.endswith("[1m]") and base in mid.lower():
+            return long(mid)
+    if base in CLI_MODEL_ALIASES:
+        # no list yet: the CLI resolves opus[1m] / sonnet[1m] itself; haiku has no
+        # long window (the API answers 400), so it goes plain
+        return base if base == "haiku" else base + "[1m]"
+    return None
+
+def split_model_prefix(text):
+    """`@haiku fix the typos` → ("haiku", "fix the typos", "haiku"): one message
+    on another model without leaving the session or remembering to switch back.
+    A token that names no model is left in the text untouched, since "@bob is my
+    colleague" is a sentence and a typo must not vanish silently; the token is
+    still returned so the caller can say what happened."""
+    m = _ONCE_RE.match(text.lstrip())
+    if not m:
+        return None, text, None
+    tok = m.group(1)
+    model = resolve_model_token(tok)
+    if not model:
+        return None, text, tok
+    return model, text.lstrip()[m.end():], tok
+
+
 def _sanitize_effort(e):
     return e if e in EFFORTS else "max"   # default: deepest thinking
 # "ultracode" = xhigh thinking + standing multi-agent Workflow orchestration. The
@@ -2130,6 +2175,8 @@ class ChatSession:
         self.ctx = None          # latest context-window usage (get_context_usage)
         self.queue = []          # messages typed while busy; dispatched on turn_done
         self._qid = 0
+        self._control_turn = False   # a /effort turn: settings traffic, not an answer, so no done chip
+        self._once = None         # model the CLI was switched to for the running turn only (a @model prefix); put back at turn_done
         self.turn_started = None  # wall time the current turn began (for the timer)
         self.turn_word = 0        # seed for the "thinking" word, stable across reattach
         self.compacting = False   # True while a manual /compact is running
@@ -2269,7 +2316,7 @@ class ChatSession:
                 evs = self._normalize(msg)
                 for e in evs:
                     if e["kind"] == "turn_done":
-                        if not self._compact_turn:   # a /compact turn isn't a "Baked" turn
+                        if not (self._compact_turn or self._control_turn):   # /compact and /effort aren't "Baked" turns
                             e["done_word"] = secrets.choice(DONE_PAST)
                             e["done_at"] = time.time()   # UTC epoch of completion
                             if self.turn_started:
@@ -2278,10 +2325,13 @@ class ChatSession:
                             e["bg_running"] = [t.get("desc") or "background task"
                                                for t in self.bg_tasks.values()]
                         self._compact_turn = False
+                        self._control_turn = False
                         self.busy = False
                         self.turn_started = None
                         self.compacting = False
                         self.last_activity = time.time()   # idle clock starts now
+                        if self._once:                     # a @model turn: back to the session's model
+                            tornado.ioloop.IOLoop.current().spawn_callback(self._restore_model)
                     elif e["kind"] == "compacted":
                         self.compacting = False
                     elif e["kind"] == "ready":
@@ -2321,7 +2371,7 @@ class ChatSession:
         if not isinstance(u, dict):
             return
         self.ctx = {"totalTokens": u.get("totalTokens"), "maxTokens": u.get("maxTokens"),
-                    "percentage": u.get("percentage"), "model": u.get("model")}
+                    "percentage": u.get("percentage"), "model": self._shown_model(u.get("model"))}
         self._emit({"type": "context", "ctx": self.ctx})
 
     def _live_ctx(self, total):
@@ -2404,13 +2454,26 @@ class ChatSession:
             self.recap_for = self.last_activity
             self._push([{"kind": "recap", "text": _cap(text, 400)}])
 
+    def _shown_model(self, reported):
+        """The CLI reports the model it resolved. `[1m]` is the CLI's own selector
+        rather than a model, and for Fable 5.1 the CLI resolves it away and reports
+        the bare id (the window is a million tokens either way; the context report
+        for such a session says maxTokens 1000000 next to `claude-fable-5-1`). Opus
+        gets echoed back with the suffix. So one picker choice read as two different
+        strings in the ready line. When the report is the chosen model minus that
+        suffix, show the choice; anything else the CLI says is shown as it said it."""
+        chosen = self._once or self.model or ""
+        if reported and chosen.endswith("[1m]") and chosen[:-4] == reported:
+            return chosen
+        return reported
+
     def _normalize(self, msg):
         evs = []
         if isinstance(msg, SystemMessage):
             if msg.subtype == "init":
                 d = msg.data or {}
                 evs.append({"kind": "ready", "session_id": d.get("session_id"),
-                            "model": d.get("model"), "cwd": d.get("cwd"),
+                            "model": self._shown_model(d.get("model")), "cwd": d.get("cwd"),
                             "effort": self.effort})
             elif msg.subtype == "compact_boundary":
                 d = msg.data or {}
@@ -2602,6 +2665,15 @@ class ChatSession:
     def _dispatch(self, text, images, files=None, qid=None, start=True):
         """Send one message to the live client. start=True begins a new turn;
         start=False injects into the running turn without flipping busy."""
+        shown = text                  # viewers see what was typed, @prefix included
+        once, text, tok = split_model_prefix(text)
+        if tok and not once:
+            self._push([{"kind": "notice", "text": "ℹ @%s names no model here — sent as text on the session model" % tok}])
+        elif once and not start:
+            self._push([{"kind": "notice", "text": "ℹ @%s applies to a new turn; a steer stays on the running model" % tok}])
+            once = None
+        elif once and once == self.model:
+            once = None
         if start:
             self.busy = True
             self.turn_started = time.time()
@@ -2612,10 +2684,11 @@ class ChatSession:
             cmd0 = text.strip().split(None, 1)[0] if text.strip() else ""
             self.compacting = (cmd0 == "/compact")
             self._compact_turn = self.compacting
+            self._control_turn = (cmd0 == "/effort")
         # written before the echo so the chips show the names that actually landed
         # (a collision renames test.py to test-2.py, and the user should see that)
         saved, up_errs = save_uploads(self.cwd, files)
-        self._echo_user(text, images, files=[rel.rsplit("/", 1)[-1] for rel, _ in saved],
+        self._echo_user(shown, images, files=[rel.rsplit("/", 1)[-1] for rel, _ in saved],
                         qid=qid, start=start)
         for e in up_errs:
             self._push([{"kind": "notice", "text": "⚠ attachment — " + e}])
@@ -2632,6 +2705,17 @@ class ChatSession:
         payload = self._make_payload(send_text, images)
         async def _q():
             try:
+                if once:
+                    try:
+                        await client.set_model(once)
+                        self._once = once
+                        self._emit({"type": "events", "events": [{"kind": "model", "model": once, "once": True}]})
+                        self._notice("⚙ @%s → %s for this message" % (tok, once))
+                    except Exception as ex:
+                        self._push([{"kind": "notice", "text": "⚠ @%s refused by the CLI (%r) — sent on the session model" % (once, ex)}])
+                elif self._once:
+                    # the last @model turn never reported done (interrupted): back first
+                    await self._restore_model()
                 await client.query(payload)
             except Exception as ex:
                 if start:
@@ -2707,9 +2791,39 @@ class ChatSession:
                     pass
             tornado.ioloop.IOLoop.current().spawn_callback(_i)
 
+    async def _restore_model(self):
+        """A @model turn is over: put the CLI back on the session's model."""
+        self._once = None
+        back = self.model or "default"
+        try:
+            await self.client.set_model(None if back == "default" else back)
+            self._emit({"type": "events", "events": [{"kind": "model", "model": back, "once": False}]})
+            self._notice("⚙ back to %s" % back)
+        except Exception as ex:
+            self._notice("model restore failed: %r" % ex)
+
     def _notice(self, text):
         """Transient note to current viewers (not persisted in the log)."""
         self._emit({"type": "events", "events": [{"kind": "notice", "text": text}]})
+
+    def set_effort(self, eff):
+        """Switch thinking depth on the live session by sending `/effort` down the
+        stream. The CLI takes it there since 2.1.258; older builds answered
+        "/effort isn't available in this environment", which is why this used to
+        relaunch the session with a new --effort and replay its history. The
+        exchange stays in the chat like any local command. ultracode is xhigh on
+        the CLI side plus the keyword on every message."""
+        if not self.client or self.ended or eff == self.effort:
+            return
+        prev, self.effort = self.effort, eff
+        if self.cc_id:
+            save_pref(self.cc_id, effort=eff)
+        self._emit({"type": "events", "events": [{"kind": "effort", "effort": eff}]})
+        level = lambda e: "xhigh" if e == "ultracode" else e
+        if level(eff) != level(prev):
+            self._dispatch("/effort " + level(eff), [], None, start=True)
+        else:
+            self._notice("⚙ effort → %s (this session)" % eff)
 
     def set_model(self, model):
         """Switch the model on the live session (SDK set_model). 'default'→None."""
@@ -2724,6 +2838,7 @@ class ChatSession:
             try:
                 await client.set_model(m)
                 self._notice("⚙ model → %s (this session)" % self.model)
+                self._emit({"type": "events", "events": [{"kind": "model", "model": self.model, "once": False}]})
             except Exception as ex:
                 self._notice("model change failed: %r" % ex)
         tornado.ioloop.IOLoop.current().spawn_callback(_s)
@@ -2883,6 +2998,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             return
         self.session = None
         ChatSocket.clients.add(self)
+        self._say({"type": "hello", "stamp": PAGE_STAMP})
         self._say({"type": "favorites", "favorites": list_favorites()})
         self._say({"type": "projects", "projects": project_tree()})
 
@@ -3026,37 +3142,13 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                 if msg.get("mode") is not None:
                     sess.set_mode(msg.get("mode") or "")
         elif mt == "set_effort" and self.session:
-            # --effort is launch-time only (no live SDK control), so changing it
-            # relaunches the session: resume the same cc with the new --effort.
             eff = _sanitize_effort(msg.get("effort"))
             sess = self.session
             if not sess.ended and eff != sess.effort:
                 if sess.busy:
                     sess._notice("⚙ finish or interrupt the current turn before changing effort")
-                elif not _valid_cc(sess.cc_id):
-                    sess.effort = eff      # not ready yet; will apply on its own start
                 else:
-                    cc, cwd, model, mode = sess.cc_id, sess.cwd, sess.model, sess.mode
-                    save_pref(cc, effort=eff)
-                    sess.terminate(); sess.detach(self); CHAT_SESSIONS.pop(sess.id, None)
-                    self.session = None
-                    new = ChatSession(secrets.token_hex(6), cwd, model, mode, resume_cc=cc, effort=eff)
-                    new.preload()
-                    try:
-                        await new.start()
-                    except Exception as e:
-                        self._say({"type": "error", "error": "effort relaunch failed: %s" % e})
-                        return
-                    CHAT_SESSIONS[new.id] = new
-                    self.session = new
-                    new.attach(self)
-                    self._say({"type": "attached", "id": new.id, "cwd": new.cwd,
-                               "name": os.path.basename(new.cwd) or new.cwd, "cc": new.cc_id,
-                               "title": new.title(), "ctx": new.ctx,
-                               "model": new.model or "default", "mode": new.mode,
-                               "busy": new.busy, "ended": new.ended, "events": new.log,
-                               "turn_age": new.turn_age(), "word": new.turn_word,
-                               "effort": new.effort, "compacting": new.compacting, "resumed": True})
+                    sess.set_effort(eff)
         elif mt == "user" and self.session:
             self.session.send_user(msg.get("text", ""), msg.get("images"),
                                    msg.get("files"))
@@ -3152,7 +3244,8 @@ class ConsoleHandler(AuthMixin, tornado.web.RequestHandler):
         if not self._ok_auth():
             return
         self.set_header("Cache-Control", "no-store")
-        self.write(CONSOLE_HTML.replace("__CLAUDE_CONSOLE_WEBFM_URL__", json.dumps(WEBFM_URL)))
+        self.write(CONSOLE_HTML.replace("__CLAUDE_CONSOLE_WEBFM_URL__", json.dumps(WEBFM_URL))
+                   .replace("__CLAUDE_CONSOLE_STAMP__", PAGE_STAMP))
 
 
 CONSOLE_HTML = r"""<!DOCTYPE html>
@@ -3239,10 +3332,11 @@ header input#cwd{flex:1;min-width:120px;display:none}
 /* floating status pill above the composer — a "ready/idle" light, or the
    animated working indicator (glyph + word + elapsed) while a turn runs */
 .pillrow{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:flex-end;gap:6px;margin:0 0 7px}
-#effort{flex:none;max-width:100%;padding:3px 11px;background:var(--bg3);border:1px solid var(--line);
+.pills{display:flex;flex:none;gap:6px;max-width:100%}
+#effort,#modelpill{flex:none;max-width:100%;padding:3px 11px;background:var(--bg3);border:1px solid var(--line);
   border-radius:9px;box-shadow:0 2px 10px rgba(0,0,0,.28);user-select:none;cursor:pointer;
   font-size:13px;line-height:1.1;color:var(--fg);white-space:nowrap}
-#effort:hover{border-color:var(--acc);color:var(--acc)}
+#effort:hover,#modelpill:hover{border-color:var(--acc);color:var(--acc)}
 #thinking{flex:none;max-width:100%;padding:3px 12px;
   background:var(--bg3);border:1px solid var(--line);border-radius:9px;
   box-shadow:0 2px 10px rgba(0,0,0,.28);user-select:none}
@@ -3393,7 +3487,13 @@ pre code{background:none;border:none;padding:0}
 
 #composer{flex-shrink:0;border-top:1px solid var(--line);background:var(--bg2);padding:8px 10px;
   padding-bottom:calc(8px + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:0;align-items:stretch}
-#composer .wrap2{width:100%;display:flex;gap:8px;align-items:flex-end}
+#composer .wrap2{width:100%;display:flex;gap:8px;align-items:flex-end;position:relative}
+/* @model completion above the composer: same list styling as the folder picker */
+#atac{position:absolute;left:0;right:0;bottom:100%;margin-bottom:4px;z-index:50;background:var(--bg3);border:1px solid var(--acc);border-radius:6px;max-height:260px;overflow:auto;display:none;box-shadow:0 8px 18px rgba(0,0,0,.5)}
+#atac.on{display:block}
+#atac .acitem{display:flex;justify-content:space-between;gap:10px;align-items:baseline}
+#atac .acto{font-size:11px;font-family:var(--fmono);color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.acitem:hover .acto,.acitem.sel .acto{color:var(--onacc)}
 #attach{display:none;flex-wrap:wrap;gap:7px;padding:0 0 8px}
 #attach.on{display:flex}
 #attach .att{position:relative;width:54px;height:54px;border-radius:8px;overflow:hidden;border:1px solid var(--line);background:var(--bg3)}
@@ -3939,7 +4039,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
     <div id="composer">
       <div class="pillrow">
         <div id="thinking"><div class="twrap"><span class="dot" id="dot"></span><span class="glyph">✶</span><span class="word">idle</span><span class="meta"></span></div></div>
-        <span id="effort" title="thinking effort — click to change">🧠 max</span>
+        <span class="pills"><span id="modelpill" title="model — click to change">🤖 model</span><span id="effort" title="thinking effort — click to change">🧠 max</span></span>
       </div>
       <div id="queue"></div>
       <div id="attach"></div>
@@ -3948,6 +4048,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
       <input type="file" id="filePick" accept="image/png,image/jpeg,image/gif,image/webp,text/*,application/json,application/xml,application/javascript,application/x-yaml,application/pdf,.py,.ipynb,.js,.jsx,.ts,.tsx,.json,.jsonl,.yaml,.yml,.toml,.md,.rst,.tex,.bib,.c,.h,.cpp,.hpp,.cc,.rs,.go,.java,.kt,.sh,.bash,.zsh,.fish,.sql,.html,.css,.scss,.xml,.csv,.tsv,.ini,.cfg,.conf,.log,.diff,.patch,.mk,.m,.jl,.r,.f90,.cu,.pdf" multiple hidden>
       <button id="attachBtn" type="button" title="Attach images or files" aria-label="Attach files" disabled>📎</button>
       <button id="voiceBtn" type="button" title="Voice input" aria-label="Start voice input" disabled><img class="voice-mic-icon" src="/static/icons/fluent-studio-microphone.png" alt=""></button>
+      <div id="atac"></div>
       <textarea id="ta" rows="1" placeholder="Type a message…  (Enter to send · Shift+Enter newline · 📎 or paste to attach)" disabled></textarea>
       <button id="stop" title="interrupt / stop" style="display:none">⏹</button>
       <button id="send" disabled>➤</button>
@@ -3990,12 +4091,14 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
 
 <script>
 const $=s=>document.querySelector(s);
+const PAGE_STAMP='__CLAUDE_CONSOLE_STAMP__';   /* hash of the page as served; see the server's PAGE_STAMP */
 const stream=$('#stream'), ta=$('#ta'), sendBtn=$('#send'), voiceBtn=$('#voiceBtn');
 let ws=null, running=false, ready=false, compacting=false, cwd='', tools={};
 let tokUp=0,tokOut=0,tokShow=false;   /* live streaming token counts shown in the pill */
 let sid=null, curCC=null, editCount=0, pendingStart=false, reconnectT=0;
 const EFFORTS=['low','medium','high','xhigh','max','ultracode'];
 let curEffort=localStorage.getItem('al_effort')||'max';
+let curModel='default', modelOnce='';   /* the live session's model; the model a @prefix put one turn on */
 let showThink=false;
 let liveSessions=[], projData=[], HOMEDIR='';
 /* which project groups are expanded — per device, survives reloads */
@@ -4571,6 +4674,8 @@ function route(ev){
   else if(ev.kind==='dequeued'||ev.kind==='unqueued')removeQueued(ev.qid);
   else if(ev.kind==='notice')addNotice(ev.text);
   else if(ev.kind==='recap')addRecap(ev.text);
+  else if(ev.kind==='model')setModelPill(ev.model,!!ev.once);
+  else if(ev.kind==='effort')setEffortPill(ev.effort);
   else if(ev.kind==='plan')setPlan(ev.tasks);
   if(!replaying&&stream.children.length>CHAT_KEEP_ITEMS+120)trimChatWindow();
 }
@@ -4579,8 +4684,9 @@ function route(ev){
 function markEnded(msg){ready=false;ta.disabled=true;sendBtn.disabled=true;attachOff(true);$('#dot').className='dot';statset('ended');
   localStorage.removeItem(SKEY);if(msg)addNotice(msg);}
 function onMsg(e){const m=JSON.parse(e.data);
+  if(m.type==='hello'){if(m.stamp&&m.stamp!==PAGE_STAMP){try{saveDraft();}catch(_){}location.reload();}return;}   /* served under older code: pick up the new page */
   if(m.type==='started'){pendingStart=false;sid=m.id;cwd=m.cwd;bindProject(m.cwd);localStorage.setItem(SKEY,sid);loadDraft(sid);
-    ready=true;setBusy(false);ta.focus();setCurname(m.name||'session');setEffortPill(m.effort);renderCtx(null);statset('ready');
+    ready=true;setBusy(false);ta.focus();setCurname(m.name||'session');setModelPill(m.model,false);setEffortPill(m.effort);renderCtx(null);statset('ready');
     const startedTab=ensureTab(m,true);
     if(startedTab){startedTab.lastSeq=0;startedTab.serverSeq=0;persistTabs();renderTabs();}
     restoredViewId=m.id;
@@ -4590,7 +4696,7 @@ function onMsg(e){const m=JSON.parse(e.data);
     const incremental=!!m.events_delta&&restoredViewId===m.id,stick=incremental&&atBottom();
     if(!incremental){clearUI();restoredViewId='';}
     pendingStart=false;sid=m.id;curCC=m.cc||null;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
-    ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));setEffortPill(m.effort);renderCtx(m.ctx);statset(m.ended?'ended':'ready');
+    ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));setModelPill(m.model,false);setEffortPill(m.effort);renderCtx(m.ctx);statset(m.ended?'ended':'ready');
     const tab=ensureTab(m,true);if(tab&&!incremental)planCollapsed=!!tab.planCollapsed;
     replaying=true;m.events.forEach(route);replaying=false;
     setPlan(m.tasks);   /* authoritative: the log window may predate the plan */
@@ -4701,14 +4807,28 @@ function rebuildModelPicker(){
 function loadModels(fresh){return fetch('api/models'+(fresh?'?fresh=1':'')).then(r=>r.json()).then(j=>{
   if(j.models&&j.models.length&&JSON.stringify(j.models)!==JSON.stringify(MODELS)){
     MODELS=j.models;rebuildModelPicker();}}).catch(()=>{});}
-/* thinking effort: a clickable pill on the right of the status row. --effort is
-   launch-time only, so changing it on a live session relaunches it (server-side
-   resume with the new --effort); the choice is remembered for new sessions. */
+/* thinking effort: a clickable pill on the right of the status row. A live
+   session takes the change through `/effort` (no relaunch); the choice is
+   remembered for new sessions. */
 function setEffortPill(e){if(e)curEffort=e;const el=$('#effort');if(el)el.textContent='🧠 '+curEffort;}
+/* model pill: the live session's model, one click to change it (SDK set_model, no
+   relaunch, applies from the next turn). A message that starts with `@haiku ` (or
+   @sonnet / @opus / @fable / any id fragment) runs that one turn on that model,
+   long-window variant when there is one, and the pill says so until the server
+   reports the switch back. */
+function pillModel(id){if(!id||id==='default')return 'default';return (modelLabel(id)||id)+(/\[1m\]$/i.test(id)?' 1M':'');}
+function setModelPill(m,once){
+  if(m!==undefined&&m!==null){if(once)modelOnce=m;else{curModel=m||'default';modelOnce='';}}
+  const el=$('#modelpill');if(!el)return;
+  el.textContent='🤖 '+(modelOnce?pillModel(modelOnce)+' · this turn':pillModel(curModel));
+  el.title=(modelOnce?'@'+modelOnce+' for this turn, then back to '+curModel:'model: '+curModel)+
+    ' — click to change · start a message with @haiku / @sonnet / @opus / @fable to use it for one turn';}
+function pickModel(v){if(v===curModel)return;setModelPill(v,false);
+  if(sid&&ready&&ws&&ws.readyState===1)wsSend({type:'set_model',model:v});}
 function setEffort(e){if(!EFFORTS.includes(e)||e===curEffort)return;
   if(running){addNotice('⚙ finish or interrupt the current turn before changing effort');return;}
   curEffort=e;localStorage.setItem('al_effort',e);setEffortPill(e);
-  if(sid&&ready&&ws&&ws.readyState===1)wsSend({type:'set_effort',effort:e});}   /* live session → relaunch */
+  if(sid&&ready&&ws&&ws.readyState===1)wsSend({type:'set_effort',effort:e});}   /* live session: /effort down the stream */
 /* show what the live session's model actually resolves to in the picker's default
    option, e.g. "model: opus 4.8 [1M]" — family+version from the model id, the
    [ctx] window from maxTokens. Fed by the ready event and the context usage. */
@@ -4718,8 +4838,8 @@ function modelLabel(real,maxTok){
   const s=(''+real).toLowerCase();
   const fam=s.includes('opus')?'opus':s.includes('sonnet')?'sonnet':s.includes('haiku')?'haiku':s.includes('fable')?'fable':'';
   if(!fam)return ''+real;
-  const m=s.match(new RegExp(fam+'-(\\d+)-(\\d+)'))||s.match(new RegExp('(\\d+)-(\\d+)-'+fam));
-  let lbl=fam+(m?(' '+m[1]+'.'+m[2]):'');
+  const m=s.match(new RegExp(fam+'-(\\d{1,2})(?:-(\\d{1,2}))?(?!\\d)'))||s.match(new RegExp('(\\d+)-(\\d+)-'+fam));
+  let lbl=fam+(m?(' '+m[1]+(m[2]?'.'+m[2]:'')):'');
   if(maxTok)lbl+='['+fmtTok(maxTok)+']';
   return lbl;}
 /* the sidebar #model picker now holds the NEW-session default, so it no longer
@@ -5331,7 +5451,7 @@ function stashView(id){
     tools:tools,editCount:editCount,queued:queued,planTasks:planTasks,planCollapsed:planCollapsed,
     trimHidden:trimHidden,ctx:curCtx,cwd:cwd,cc:curCC,ready:ready,running:running,
     compacting:compacting,word:lastWordSeed,elapsed:running?Math.max(0,Date.now()-thinkStart):0,
-    tokUp:tokUp,tokOut:tokOut,tokShow:tokShow,effort:curEffort,
+    tokUp:tokUp,tokOut:tokOut,tokShow:tokShow,effort:curEffort,model:curModel,modelOnce:modelOnce,
     title:$('#curname').textContent||tabLabel(t)});
   persistTabs();return true;}
 function restoreView(id){
@@ -5344,7 +5464,7 @@ function restoreView(id){
   cwd=v.cwd||'';curCC=v.cc||null;compacting=!!v.compacting;
   tokUp=v.tokUp||0;tokOut=v.tokOut||0;tokShow=!!v.tokShow;
   ready=!!v.ready;                       /* before setBusy: it gates the composer on it */
-  bindProject(cwd);setCurname(v.title);renderCtx(v.ctx);setEffortPill(v.effort);
+  bindProject(cwd);setCurname(v.title);renderCtx(v.ctx);curModel=v.model||'default';modelOnce=v.modelOnce||'';setModelPill();setEffortPill(v.effort);
   updateEditBadge();renderQueue();
   running=false;setBusy(!!v.running,v.word,v.elapsed);   /* restarts the timer where it was */
   loadDraft(id);restoreTabView(id);restoredViewId=id;return true;}
@@ -5737,8 +5857,47 @@ async function refreshGit(){if(!cwd){$('#gitc').innerHTML='<div class="empty">no
 
 /* bindings */
 ta.addEventListener('input',()=>{ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,160)+'px';
-  if(sid){drafts[sid]={text:ta.value,images:pendingImages.slice(),files:pendingFiles.slice()};schedulePersist();}});
-ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMsg();}
+  if(sid){drafts[sid]={text:ta.value,images:pendingImages.slice(),files:pendingFiles.slice()};schedulePersist();}atQuery();});
+/* ── @model completion ────────────────────────────────────────────────────────
+   Type `@` at the start of the composer and a list opens showing what each
+   token resolves to, by the server's own rule (an exact id as typed, a fragment
+   to the newest match, long-window variant when there is one). ↑/↓ pick, Tab or
+   Enter insert the token, Esc closes; Enter is a send again once the list is
+   gone. The token goes in rather than the full id, so `@fable` keeps meaning
+   "the newest fable" the day a newer one appears. */
+const AT_ALIASES=['opus','sonnet','haiku','fable'];
+let atItems=[],atSel=0;
+function resolveModelToken(tok){const t=tok.toLowerCase(),base=t.endsWith('[1m]')?t.slice(0,-4):t,ids=MODELS.map(m=>m.id);
+  for(const id of ids)if(id.toLowerCase()===t)return id;
+  const long=id=>ids.includes(id+'[1m]')?id+'[1m]':id;
+  for(const id of ids)if(!id.endsWith('[1m]')&&id.toLowerCase().includes(base))return long(id);
+  if(base==='opus'||base==='sonnet'||base==='haiku')return base==='haiku'?base:base+'[1m]';
+  return null;}
+function atFrag(){const v=ta.value,m=v.match(/^\s*@([\w.\-\[\]]*)$/);return (m&&ta.selectionStart===v.length)?m[1]:null;}
+function atOpen(){return $('#atac').classList.contains('on');}
+function atClose(){const b=$('#atac');b.classList.remove('on');b.innerHTML='';atItems=[];atSel=0;}
+function atQuery(){const f=atFrag();if(f===null){atClose();return;}
+  const q=f.toLowerCase(),seen=new Set(),out=[];
+  const add=(tok,name)=>{const to=resolveModelToken(tok);if(!to||seen.has(tok))return;seen.add(tok);out.push({tok:tok,to:to,name:name||''});};
+  AT_ALIASES.forEach(a=>{if(a.includes(q)){const r=resolveModelToken(a),m=MODELS.find(x=>x.id===r);add(a,m&&m.name);}});
+  MODELS.forEach(m=>{if(m.id.toLowerCase().includes(q)||(m.name||'').toLowerCase().includes(q))add(m.id,m.name);});
+  atItems=out.slice(0,14);if(!atItems.length){atClose();return;}
+  atSel=Math.min(atSel,atItems.length-1);const b=$('#atac');
+  b.innerHTML=atItems.map((it,i)=>'<div class="acitem'+(i===atSel?' sel':'')+'" data-i="'+i+'"><span class="acname">@'+esc(it.tok)+'</span>'+
+    '<span class="acto">'+esc(it.to!==it.tok?'→ '+it.to:it.name)+'</span></div>').join('');
+  b.classList.add('on');
+  b.querySelectorAll('.acitem').forEach(el=>el.onmousedown=ev=>{ev.preventDefault();atPick(+el.dataset.i);});}
+function atMove(d){if(!atItems.length)return;atSel=(atSel+d+atItems.length)%atItems.length;
+  const els=$('#atac').querySelectorAll('.acitem');els.forEach((el,i)=>el.classList.toggle('sel',i===atSel));els[atSel].scrollIntoView({block:'nearest'});}
+function atPick(i){const it=atItems[i];if(!it)return;ta.value='@'+it.tok+' ';atClose();ta.focus();ta.dispatchEvent(new Event('input'));}
+ta.addEventListener('blur',()=>setTimeout(atClose,160));
+ta.addEventListener('keydown',e=>{
+  if(atOpen()){
+    if(e.key==='ArrowDown'){e.preventDefault();atMove(1);return;}
+    if(e.key==='ArrowUp'){e.preventDefault();atMove(-1);return;}
+    if(e.key==='Tab'||(e.key==='Enter'&&!e.shiftKey)){e.preventDefault();atPick(atSel);return;}
+    if(e.key==='Escape'){e.preventDefault();atClose();return;}}
+  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMsg();}
   else if(e.key==='ArrowUp'&&!ta.value&&Object.keys(queued).length){
     e.preventDefault();const ids=Object.keys(queued);editQueued(ids[ids.length-1]);}});
 window.addEventListener('paste',handlePaste);
@@ -5775,6 +5934,10 @@ $('#sb-backdrop').onclick=closeSidebar;
 $('#effort').onclick=ev=>{ev.stopPropagation();toggleCardMenu(ev.currentTarget,
   EFFORTS.map(e=>({label:(e===curEffort?'● ':'○ ')+e,fn:()=>setEffort(e)})));};
 setEffortPill(curEffort);
+$('#modelpill').onclick=ev=>{ev.stopPropagation();
+  const opts=[['default','default (CLI pick)'],...MODEL_ALIASES.map(([v])=>[v,v]),...MODELS.map(m=>[m.id,m.name])];
+  toggleCardMenu(ev.currentTarget,opts.map(([v,t])=>({label:(v===curModel?'● ':'○ ')+t,fn:()=>pickModel(v)})));};
+setModelPill();
 /* desktop: drag the sidebar's right edge to resize (clamped + persisted) */
 const SBW_KEY='al_sbw',SBW_MIN=200,SBW_MAX=560;
 function setSidebarW(w,save){w=Math.max(SBW_MIN,Math.min(SBW_MAX,Math.round(w)));
@@ -5926,6 +6089,12 @@ openWs();
 </script>
 </body>
 </html>"""
+# A restart with new page code used to leave every open tab running the old
+# script against the new server: the socket reconnects, the page does not
+# reload, and a feature shipped an hour ago is simply not there. The stamp is
+# the page's own hash; the socket announces it on connect and a page that
+# was served under another one reloads itself (the draft is saved first).
+PAGE_STAMP = hashlib.sha1(CONSOLE_HTML.encode("utf-8")).hexdigest()[:12]
 
 
 RECAP_KEEP_H = 24   # prune isolated recap-query transcripts older than this (hours)

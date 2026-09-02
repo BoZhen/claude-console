@@ -113,9 +113,18 @@ which is the whole point.
 - **Chinese comes out Simplified** — optionally normalized with OpenCC, which
   converts vocabulary and not just characters (`軟體` → `软件`, `記憶體` → `内存`),
   so Taiwanese dictation does not leave Taiwanese terms in the text.
+- **Model** — a `🤖` pill showing the live session's model; one click switches
+  it (from the next turn, no relaunch). For a single message, start it with
+  `@haiku …`, `@sonnet …`, `@opus …` or `@fable …` (any fragment of a model id):
+  that turn runs on that model, long-window `[1m]` variant when there is one,
+  and the session switches back when it ends. An exact id is used as typed, so
+  `@claude-sonnet-5` asks for the plain window. Typing `@` opens a list of what
+  each token resolves to (↑/↓ pick, Tab or Enter insert, Esc closes). Cheap tasks need not cost Fable prices,
+  and there is nothing to remember to undo. A token that names no model is sent
+  as ordinary text, with a note saying so.
 - **Thinking effort** — a `🧠` pill (low / medium / high / xhigh / max) to set
-  reasoning depth, switchable on the fly (the session relaunches with the new
-  `--effort`).
+  reasoning depth, switchable on the fly (`/effort` goes down to the live
+  session; nothing relaunches).
 - Pick **project dir**, **model** (`↻` refreshes the list from the API) and
   **permission mode** (⚡ Auto-accept / 🔐 Approve / 📋 Plan / ⏩ Full auto) when
   starting a session, or change them per session afterwards.
@@ -127,7 +136,7 @@ which is the whole point.
   Light, …), switchable from the sidebar; choice persists per device.
 - **At-a-glance status** — context-window and rolling 5-hour usage meters in the
   header; a floating status pill (ready / working timer / live token counts) plus
-  the effort pill above a full-width composer.
+  the model and effort pills above a full-width composer.
 
 ## Run
 
