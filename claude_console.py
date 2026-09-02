@@ -933,6 +933,10 @@ def fetch_usage():
         return _usage_cache["v"]
 
 
+# Above this input window, the CLI can be asked for the long-context beta with a
+# `[1m]` model suffix. At or below it the request is refused, so the picker must
+# not offer the variant.
+LONG_CONTEXT_FLOOR = 200000
 _models_cache = {"t": 0.0, "v": None}
 
 def fetch_models(force=False):
@@ -957,8 +961,23 @@ def fetch_models(force=False):
                      "User-Agent": "claude-console"})
         with urllib.request.urlopen(req, timeout=8) as r:
             data = json.load(r)
-        out = [{"id": m["id"], "name": m.get("display_name") or m["id"]}
-               for m in (data.get("data") or []) if isinstance(m, dict) and m.get("id")]
+        out = []
+        for m in (data.get("data") or []):
+            if not isinstance(m, dict) or not m.get("id"):
+                continue
+            mid = m["id"]
+            name = m.get("display_name") or mid
+            out.append({"id": mid, "name": name})
+            # A model supporting a million tokens is not the same as the CLI
+            # using them. The window is opt-in per launch through the `[1m]`
+            # suffix, which is what turns on the context-1m beta; without it a
+            # long --resume dies on "Prompt is too long" even though the model
+            # itself would have fit it. /v1/models only ever returns the bare
+            # id, so the variant has to be offered here or it cannot be picked.
+            # Which models get one is read off the API rather than hardcoded:
+            # asking for [1m] on a 200K model is a 400 from the server.
+            if int(m.get("max_input_tokens") or 0) > LONG_CONTEXT_FLOOR:
+                out.append({"id": mid + "[1m]", "name": name + " (1M)"})
         if out:
             _models_cache["t"], _models_cache["v"] = now, out
         return _models_cache["v"]
