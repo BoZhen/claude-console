@@ -4891,9 +4891,15 @@ function cellBar(pct){const p=Math.max(0,Math.min(100,pct)),lit=Math.min(5,Math.
   let s='<span class="cells lv-'+meterLvl(p)+'">';
   for(let i=1;i<=5;i++)s+='<span class="cell'+(i<=lit?' on':'')+'"></span>';
   return s+'</span>';}
+/* Past SNAPSHOT_AT the empty composer says "update your snapshot" instead of
+   inviting a message: compaction is on its way, and a snapshot written now is
+   what carries the session across it. The meter alone is easy to stop seeing;
+   the box you are about to type into is not. */
+const TA_HINT='Type a message…', SNAPSHOT_AT=60;
 function renderCtx(c){const el=$('#ctx');curCtx=c||null;
-  if(!c||c.percentage==null){el.style.display='none';return;}
-  const pct=Math.round(c.percentage);
+  const pct=(c&&c.percentage!=null)?Math.round(c.percentage):null;
+  ta.placeholder=(pct!=null&&pct>=SNAPSHOT_AT)?'update your snapshot':TA_HINT;
+  if(pct==null){el.style.display='none';return;}
   el.className='ctx';el.style.display='inline-flex';
   el.innerHTML='<span class="ulabel">Context</span>'+cellBar(pct)+'<span>'+pct+'%</span>';
   el.title='context '+(c.totalTokens||'?')+' / '+(c.maxTokens||'?')+' tokens ('+pct+'%)'+(c.model?' · '+c.model:'');

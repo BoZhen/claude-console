@@ -114,7 +114,9 @@
   Gruvbox、Light、Solarized Light、Rosé Pine Dawn、One Light、Ayu Light…），
   从侧栏切换；选择按设备保存。
 - **一眼可见的状态** —— 头部有上下文窗口和 5 小时滚动用量计量；全宽输入框上方有一个
-  浮动状态药丸（ready / 工作计时 / 实时 token 计数）以及模型和思考深度药丸。
+  浮动状态药丸（ready / 工作计时 / 实时 token 计数）以及模型和思考深度药丸。上下文用到
+  60% 以上时，空输入框会显示 *update your snapshot*：压缩快到了，现在写下的快照才能把
+  session 带过去。
 
 ## 运行
 

@@ -146,7 +146,9 @@ which is the whole point.
   Light, …), switchable from the sidebar; choice persists per device.
 - **At-a-glance status** — context-window and rolling 5-hour usage meters in the
   header; a floating status pill (ready / working timer / live token counts) plus
-  the model and effort pills above a full-width composer.
+  the model and effort pills above a full-width composer. Past 60% of the window
+  the empty composer reads *update your snapshot*: compaction is coming, and
+  notes written now are what carry the session across it.
 
 ## Run
 
