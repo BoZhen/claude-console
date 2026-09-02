@@ -40,12 +40,17 @@ which is the whole point.
   bursts, so the text is played out of a small jitter buffer at a steady rate
   instead of arriving a sentence and a half at a time; formatting and math are
   typeset once, when the block completes, so nothing reflows mid-sentence.
+  Scrolling up while the answer is being written keeps the view where you put
+  it — the tail is followed until you leave it, and again once you come back.
 - **Folded tool runs** — consecutive calls to the *same* tool collapse into one
   row (`▶ Bash ×5  ruff check .  1 failed`) that expands to the individual
   cards. Anything in between — an answer, an edit, an approval — ends the run.
-- **Plan dock** — when Claude keeps a task list, it is pinned above the chat
-  with the current step, a progress count, and a fold to just the active task.
-  It retires itself a couple of seconds after the last task is done.
+- **Plan dock** — a task list pinned above the chat with the current step, a
+  progress count, and a fold to just the active task; it retires itself a
+  couple of seconds after the last step is done. The console brings the tool
+  behind it into the session (the CLI's own task list came and went with
+  versions) and reminds the model to keep it current, so a plan is never left
+  half-done on screen.
 - **LaTeX rendering** — `$…$`, `$$…$$`, `\(…\)`, `\[…\]` in replies render with
   KaTeX (vendored, offline).
 - **Clickable file paths** — a path in a reply (`~/work/lattice-qmc/observables.py`)
@@ -113,18 +118,23 @@ which is the whole point.
 - **Chinese comes out Simplified** — optionally normalized with OpenCC, which
   converts vocabulary and not just characters (`軟體` → `软件`, `記憶體` → `内存`),
   so Taiwanese dictation does not leave Taiwanese terms in the text.
-- **Model** — a `🤖` pill showing the live session's model; one click switches
-  it (from the next turn, no relaunch). For a single message, start it with
-  `@haiku …`, `@sonnet …`, `@opus …` or `@fable …` (any fragment of a model id):
-  that turn runs on that model, long-window `[1m]` variant when there is one,
-  and the session switches back when it ends. An exact id is used as typed, so
-  `@claude-sonnet-5` asks for the plain window. Typing `@` opens a list of what
-  each token resolves to (↑/↓ pick, Tab or Enter insert, Esc closes). Cheap tasks need not cost Fable prices,
-  and there is nothing to remember to undo. A token that names no model is sent
-  as ordinary text, with a note saying so.
+- **Model** — a `🤖` pill showing the live session's model, one click to change
+  it (from the next turn, nothing relaunches). A single message can go to another
+  model on its own: start it with `@haiku …`, `@sonnet …`, `@opus …` or
+  `@fable …` and that turn runs there, then the session switches back by itself.
+  A cheap question need not cost what the session costs, and there is nothing to
+  remember to undo. Typing `@` opens a list of what each token resolves to
+  (↑/↓ pick, Tab or Enter insert, Esc closes). Any fragment of a model id works
+  and is matched against the live list, so `@fable` still means the newest fable
+  a year from now; the long-window `[1m]` variant is preferred, since these are
+  asked from inside long sessions where the plain window would only refuse. An
+  exact id is used as typed, which is how to ask for the plain window. A token
+  that names no model is sent as ordinary text, with a note saying so.
 - **Thinking effort** — a `🧠` pill (low / medium / high / xhigh / max) to set
-  reasoning depth, switchable on the fly (`/effort` goes down to the live
-  session; nothing relaunches).
+  reasoning depth, switchable on the fly: `/effort` goes down to the live
+  session, so nothing relaunches and no history is replayed. A sixth setting,
+  **ultracode**, runs at xhigh and opts every message into multi-agent
+  orchestration.
 - Pick **project dir**, **model** (`↻` refreshes the list from the API) and
   **permission mode** (⚡ Auto-accept / 🔐 Approve / 📋 Plan / ⏩ Full auto) when
   starting a session, or change them per session afterwards.
@@ -221,6 +231,9 @@ The legacy `AGENTLENS_*` names are still honored as a fallback.
   Claude only when you send the draft you edited.
 - Voice icon from Microsoft's [Fluent Emoji](https://github.com/microsoft/fluentui-emoji)
   (MIT), under `static/icons/`.
+- The page carries the hash of the code it was served with and reloads itself
+  when the server reports a different one, so an open tab is never left running
+  yesterday's script against today's server. Drafts are saved first.
 - Very long conversations keep a bounded window of *rendered* messages per tab;
   older ones fold into a marker that links to the history search. Nothing is
   deleted — the full transcript stays on disk under `~/.claude/projects`.

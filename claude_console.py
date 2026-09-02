@@ -47,7 +47,8 @@ try:
     from claude_agent_sdk import (
         query, ClaudeSDKClient, ClaudeAgentOptions, AssistantMessage, UserMessage,
         SystemMessage, ResultMessage, StreamEvent, TextBlock, ThinkingBlock,
-        ToolUseBlock, ToolResultBlock, PermissionResultAllow, PermissionResultDeny)
+        ToolUseBlock, ToolResultBlock, PermissionResultAllow, PermissionResultDeny,
+        tool, create_sdk_mcp_server, HookMatcher)
     HAVE_SDK = True
 except Exception:
     HAVE_SDK = False
@@ -161,9 +162,41 @@ def _strip_injected(s):
     return _INJECTED_RE.sub("", s) if isinstance(s, str) else s
 
 
-# Claude's task list, as the CLI exposes it: TaskCreate {subject, description,
-# activeForm} then TaskUpdate {taskId, status}. There is no whole-plan event, and
-# TaskCreate never reports the id it was given — that comes back only in the tool
+# The plan the console pins above the chat. The CLI used to expose a task list
+# (TaskCreate/TaskUpdate); 2.1.258 dropped it, so the console now brings its own
+# tool into the session over the SDK's in-process MCP server. One tool, one
+# shape: the FULL list of steps on every call, so a plan event is always a
+# snapshot and there is no id bookkeeping. The old CLI traffic is still folded,
+# for transcripts that carry it.
+#
+# A tool the model can see is not a tool the model uses. Measured on one
+# multi-step task: the description alone, zero calls; the protocol appended to
+# the system prompt, the model quotes it back when asked and still zero calls;
+# the same text beside the prompt as a UserPromptSubmit reminder, a plan in one
+# run of two; the same text again as a PostToolUse reminder on the FIRST tool
+# call of the turn, and the model stops and writes the plan. That is the moment
+# it is deciding how many steps there are, so that is where the reminder rides.
+# Keeping the plan CURRENT takes two more: one after a run of tool calls with a
+# step still open, and one at Stop, where an open step blocks the stop once so
+# the panel never lingers half-done.
+PLAN_TOOL = "mcp__console__plan"
+PLAN_PROMPT = (
+    "# Progress panel\n"
+    "The console pins a progress panel above the chat, fed by the `mcp__console__plan` "
+    "tool. Whenever a request takes more than one step, call it first with the full "
+    "list of steps (all pending), again as each step starts (in_progress) and finishes "
+    "(completed), and again if the steps change. Always send the complete list. Keep "
+    "exactly one step in_progress while you work. A single-step request needs no plan.")
+PLAN_NUDGE_EVERY = 4     # tool calls with a step still open before a reminder rides along
+PLAN_SCHEMA = {
+    "type": "object", "required": ["steps"],
+    "properties": {"steps": {"type": "array", "items": {
+        "type": "object", "required": ["title", "status"],
+        "properties": {"title": {"type": "string"},
+                       "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}}}}}
+# the CLI's own task list, for transcripts recorded while it still had one:
+# TaskCreate {subject, description, activeForm} then TaskUpdate {taskId, status}.
+# TaskCreate never reports the id it was given; that comes back only in the tool
 # RESULT text, "Task #3 created successfully: Fix lint".
 TASK_ID_RE = re.compile(r"[Tt]ask #(\d+)")
 TASK_FIELDS = ("subject", "description", "activeForm", "status")
@@ -2197,6 +2230,7 @@ class ChatSession:
         self.tasks = {}           # task id -> {subject, description, activeForm, status}
         self._task_open = {}      # TaskCreate tool_use id -> the task, until a result names it
         self._task_seq = 0        # creation ordinal; the fallback id if that text ever changes
+        self._since_plan = 0      # tool calls since the plan was last touched (PostToolUse nudge)
         self.event_seq = 0        # monotonic event number, so a viewer can ask for the gap
 
     def preload(self):
@@ -2233,6 +2267,12 @@ class ChatSession:
             add_dirs=[self.cwd], cli_path=CLAUDE_BIN, include_partial_messages=True,
             max_buffer_size=MAX_BUFFER,
             extra_args={"dangerously-skip-permissions": None})
+        # the console's own plan tool and the three reminders that make it used (PLAN_TOOL)
+        opts.mcp_servers = {"console": self._plan_server()}
+        opts.allowed_tools = [PLAN_TOOL]
+        opts.hooks = {"UserPromptSubmit": [HookMatcher(hooks=[self._hook_prompt])],
+                      "PostToolUse": [HookMatcher(hooks=[self._hook_post_tool])],
+                      "Stop": [HookMatcher(hooks=[self._hook_stop])]}
         if self.model and self.model != "default":
             opts.model = self.model
         if self.effort:
@@ -2244,11 +2284,81 @@ class ChatSession:
         await self.client.connect()
         tornado.ioloop.IOLoop.current().spawn_callback(self._consume)
 
+    def _plan_server(self):
+        """The console's plan tool, served in-process. Its result text carries the
+        next nudge, since that is the one place the model is certain to read."""
+        @tool("plan", "Keep the user's pinned progress panel current. Send the FULL list "
+              "of steps every time the plan changes.", PLAN_SCHEMA)
+        async def plan(args):
+            steps = [x for x in ((args or {}).get("steps") or []) if isinstance(x, dict)]
+            done = sum(1 for x in steps if x.get("status") == "completed")
+            cur = next((x.get("title") for x in steps if x.get("status") == "in_progress"), None)
+            txt = "ok (%d/%d done)" % (done, len(steps))
+            if cur:
+                txt += " · in progress: %s — call plan again when it finishes" % cur
+            return {"content": [{"type": "text", "text": txt}]}
+        return create_sdk_mcp_server(name="console", version="1.0.0", tools=[plan])
+
+    def _plan_open(self):
+        """The step in progress, else the first not completed; None when there is
+        no plan or it is done."""
+        ts = self.plan_tasks()
+        for t in ts:
+            if t.get("status") == "in_progress":
+                return t
+        for t in ts:
+            if t.get("status") != "completed":
+                return t
+        return None
+
+    async def _hook_prompt(self, input_data, tool_use_id, context):
+        """UserPromptSubmit: the plan protocol, beside the prompt (see PLAN_TOOL)."""
+        if ((input_data or {}).get("prompt") or "").lstrip().startswith("/"):
+            return {}
+        return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                       "additionalContext": PLAN_PROMPT}}
+
+    async def _hook_post_tool(self, input_data, tool_use_id, context):
+        """PostToolUse: after PLAN_NUDGE_EVERY calls with a step still open, remind."""
+        if (input_data or {}).get("tool_name") == PLAN_TOOL:
+            self._since_plan = 0
+            return {}
+        self._since_plan += 1
+        cur = self._plan_open()
+        if not cur:
+            # working with no open plan: one nudge, at the first call of the turn,
+            # which is the moment the model can still tell how many steps it has
+            # (a finished plan from an earlier turn does not count as one)
+            if self._since_plan != 1:
+                return {}
+            return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext":
+                    "Progress panel: no plan is on the board. If this request takes more than "
+                    "one step, call mcp__console__plan now with the full list of steps."}}
+        if self._since_plan < PLAN_NUDGE_EVERY:
+            return {}
+        self._since_plan = 0
+        return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext":
+                "Progress panel: '%s' is still %s. If it is finished, or the plan has changed, "
+                "call mcp__console__plan with the full list before going on."
+                % (cur.get("subject") or "", cur.get("status") or "pending")}}
+
+    async def _hook_stop(self, input_data, tool_use_id, context):
+        """Stop: an open step blocks the stop once, so the panel is settled before
+        the answer stands. stop_hook_active is the CLI's own loop guard."""
+        if (input_data or {}).get("stop_hook_active") or not self._plan_open():
+            return {}
+        return {"decision": "block", "reason":
+                "Before finishing, bring the progress panel up to date: call mcp__console__plan "
+                "with the full list, marking finished steps completed and dropping steps you will "
+                "not do. Then finish."}
+
     async def _can_use_tool(self, tool_name, tool_input, context):
         """SDK permission hook. AskUserQuestion is answered in-band: we surface the
         choices, collect the user's picks, and feed them back via
         updated_input['answers'] so the tool resolves with the real answer. Every
         other tool gets a plain Approve/Deny prompt. Both await the browser."""
+        if tool_name == PLAN_TOOL:       # ours; the panel is the whole point of it
+            return PermissionResultAllow()
         self._aid += 1
         aid = "ap%d" % self._aid
         fut = asyncio.get_running_loop().create_future()
@@ -2681,6 +2791,7 @@ class ChatSession:
             self._tok_up = self._tok_out = self._tok_chars = 0
             self._tok_exact = False
             self._step = 0
+            self._since_plan = 0
             cmd0 = text.strip().split(None, 1)[0] if text.strip() else ""
             self.compacting = (cmd0 == "/compact")
             self._compact_turn = self.compacting
@@ -2878,10 +2989,11 @@ class ChatSession:
                 self.viewers.discard(v)
 
     def _fold_tasks(self, evs):
-        """Fold TaskCreate/TaskUpdate tool traffic into the current task list.
+        """Fold plan traffic into the current task list.
 
-        Codex hands its console a whole plan per update; Claude does not, so the
-        list has to be rebuilt from the individual calls. A create is parked under
+        The console's own tool sends the whole plan per call, so that branch just
+        replaces the list. The CLI's former TaskCreate/TaskUpdate calls, still met
+        in older transcripts, have to be rebuilt piecewise. A create is parked under
         its tool_use id until its own result names it, because the id is assigned
         by the CLI and appears nowhere in the input. When that result text does not
         parse, the id falls back to the creation ordinal — which is what the CLI is
@@ -2895,7 +3007,15 @@ class ChatSession:
                 inp = e.get("input")
                 if not isinstance(inp, dict):
                     continue
-                if e.get("tool") == "TaskCreate":
+                if e.get("tool") == PLAN_TOOL:
+                    steps = inp.get("steps")
+                    if isinstance(steps, list):    # a snapshot: replaces the list wholesale
+                        self.tasks = {str(i + 1): {"subject": str(x.get("title") or ""),
+                                                   "status": str(x.get("status") or "pending")}
+                                      for i, x in enumerate(steps) if isinstance(x, dict)}
+                        self._task_open = {}
+                        changed = True
+                elif e.get("tool") == "TaskCreate":
                     self._task_open[e.get("toolId") or ""] = {
                         f: inp[f] for f in TASK_FIELDS if inp.get(f)}
                 elif e.get("tool") == "TaskUpdate":
@@ -3374,9 +3494,9 @@ header input#cwd{flex:1;min-width:120px;display:none}
   vertical-align:text-bottom;background:var(--acc);opacity:.8;animation:scaretb 1s steps(2,start) infinite}
 @keyframes scaretb{50%{opacity:0}}
 /* Plan dock — the current task list, pinned to the top of the chat viewport so it
-   stays readable while the answer scrolls under it. Claude has no whole-plan
-   event, so the server folds TaskCreate/TaskUpdate into one list (see _fold_tasks)
-   and pushes the whole thing on every change; this only ever paints a snapshot.
+   stays readable while the answer scrolls under it. The server pushes the whole
+   list on every change (the console's own plan tool, see PLAN_TOOL there), so
+   this only ever paints a snapshot.
    Opaque background, because content scrolls behind it once it sticks. */
 .plandock{position:sticky;top:0;z-index:7;max-width:820px;margin:0 auto 10px;
   padding:0 0 8px;background:var(--bg);
@@ -4049,7 +4169,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
       <button id="attachBtn" type="button" title="Attach images or files" aria-label="Attach files" disabled>📎</button>
       <button id="voiceBtn" type="button" title="Voice input" aria-label="Start voice input" disabled><img class="voice-mic-icon" src="/static/icons/fluent-studio-microphone.png" alt=""></button>
       <div id="atac"></div>
-      <textarea id="ta" rows="1" placeholder="Type a message…  (Enter to send · Shift+Enter newline · 📎 or paste to attach)" disabled></textarea>
+      <textarea id="ta" rows="1" placeholder="Type a message…" disabled></textarea>
       <button id="stop" title="interrupt / stop" style="display:none">⏹</button>
       <button id="send" disabled>➤</button>
     </div></div>
@@ -4229,8 +4349,11 @@ function scroll(){if(replaying)return;setTop($('#chat').scrollHeight,true);}
 
 const ICON={Edit:'✏️',MultiEdit:'✏️',Write:'📝',Bash:'▶',Read:'📖',Glob:'🔍',Grep:'🔍',Task:'🤖',
   WebFetch:'🌐',WebSearch:'🌐',TodoWrite:'☑️',NotebookEdit:'📓',
-  TaskCreate:'☑️',TaskUpdate:'☑️',TaskList:'☑️',TaskGet:'☑️'};
+  TaskCreate:'☑️',TaskUpdate:'☑️',TaskList:'☑️',TaskGet:'☑️',mcp__console__plan:'☑️'};
+function toolLabel(t){return t==='mcp__console__plan'?'plan':t;}   /* the console's own tool, without its MCP prefix */
 function primaryArg(i){if(!i)return '';if(typeof i==='string')return i.slice(0,80);
+  if(Array.isArray(i.steps)){const n=i.steps.length,d=i.steps.filter(x=>x&&x.status==='completed').length,c=i.steps.find(x=>x&&x.status==='in_progress');
+    return d+'/'+n+(c?' · '+(''+(c.title||'')).slice(0,60):'');}   /* plan snapshot: progress + the open step */
   if(i.file_path)return i.file_path.split('/').slice(-2).join('/');
   if(i.command)return (''+i.command).split('\n')[0].slice(0,90);
   if(i.subject)return i.subject.slice(0,80);   /* TaskCreate: the task, not its description */
@@ -4359,9 +4482,9 @@ function addRecap(t){const s=atBottom();const d=document.createElement('div');d.
   d.innerHTML='<span class="rk">※ recap:</span> <span class="rt"></span>';
   d.querySelector('.rt').textContent=t;stream.appendChild(d);if(s)scroll();}
 /* ── plan dock ────────────────────────────────────────────────────────────────
-   Claude exposes its task list only as individual TaskCreate/TaskUpdate calls, so
-   the server folds them and pushes the WHOLE list on every change. That is what
-   makes this simple: there is no incremental state to keep in sync here, every
+   The plan comes from the console's own tool (PLAN_TOOL on the server), which
+   sends the whole list per call, and the server pushes the WHOLE list on every
+   change. That is what makes this simple: there is no incremental state here, every
    `plan` event is a complete snapshot, and replaying a history just converges on
    whatever the last one said. The dock is sticky rather than inline because a plan
    is a statement about the present, and inline it would scroll away into history. */
@@ -4399,7 +4522,10 @@ function schedulePlanHide(){
   if(replaying||!planAllDone(planTasks))return;
   const owner=sid;
   planHideT=setTimeout(()=>{planHideT=0;
-    if(sid===owner&&planAllDone(planTasks)){const h=$('#planDock');if(h)h.hidden=true;}},PLAN_HIDE_MS);}
+    /* drop the list, not just the dock: keeping a retired plan in memory means the
+       next renderPlan (folding it, restoring the tab) brings the finished thing
+       back, and folded it reads "no active task" */
+    if(sid===owner&&planAllDone(planTasks))clearPlan();},PLAN_HIDE_MS);}
 function setPlan(ts){planTasks=Array.isArray(ts)?ts:[];renderPlan();schedulePlanHide();}
 function clearPlan(){if(planHideT){clearTimeout(planHideT);planHideT=0;}
   planTasks=[];planCollapsed=false;const h=$('#planDock');if(h){h.hidden=true;h.innerHTML='';}}
@@ -4444,7 +4570,7 @@ function makeToolGroup(first,second,key){
   const ev=first._ev||second._ev||{};
   const g=document.createElement('div');g.className='toolgroup';g.dataset.tkey=key;
   g.innerHTML='<div class="tgh"><span class="ico">'+(ICON[ev.tool]||'🔧')+'</span>'+
-    '<span class="tn">'+esc(ev.tool||'tool')+'</span><span class="tgcount"></span>'+
+    '<span class="tn">'+esc(toolLabel(ev.tool||'tool'))+'</span><span class="tgcount"></span>'+
     '<span class="tp"></span><span class="tgstate"></span>'+TOOL_EYE+'</div><div class="tgb"></div>';
   first.replaceWith(g);                      /* the group takes the first card's place */
   const body=g.querySelector('.tgb');
@@ -4464,7 +4590,7 @@ function placeToolCard(c,ev){
 const TOOL_EYE='<span class="eye"><svg class="e-shut" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 11c3 4 7 6 10 6s7-2 10-6"/><line x1="5.5" y1="15.5" x2="4.3" y2="18"/><line x1="12" y1="17.5" x2="12" y2="20"/><line x1="18.5" y1="15.5" x2="19.7" y2="18"/></svg><svg class="e-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></span>';
 function addTool(ev){const s=atBottom();const c=document.createElement('div');c.className='tool';
   const cn=counts(ev);const cnt=cn?('<span class="a">+'+cn.a+'</span> <span class="d">−'+cn.d+'</span>'):'';
-  c.innerHTML='<div class="th"><span class="ico">'+(ICON[ev.tool]||'🔧')+'</span><span class="tn">'+esc(ev.tool)+'</span>'+
+  c.innerHTML='<div class="th"><span class="ico">'+(ICON[ev.tool]||'🔧')+'</span><span class="tn">'+esc(toolLabel(ev.tool))+'</span>'+
     '<span class="tp">'+esc(primaryArg(ev.input))+'</span><span class="cnt">'+cnt+'</span>'+TOOL_EYE+'</div>'+
     '<div class="tb"><div class="res"></div></div>';
   c._ev=ev;   /* lazy: build the (maybe large) body only on first expand */
