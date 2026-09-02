@@ -191,6 +191,12 @@ HTTPS (a reverse proxy, or `tailscale serve`) unless you open it on `localhost`.
 | `CLAUDE_CONSOLE_BIND` | `127.0.0.1` | bind address; set `0.0.0.0` for LAN access |
 | `CLAUDE_CONSOLE_AUTH` | *(disabled)* | optional HTTP Basic Auth `user:pass` |
 | `CLAUDE_CONSOLE_WEBFM_URL` | this host on `:7701` | web file manager to open clicked file paths in |
+| `CLAUDE_CONSOLE_CLAUDE` | first on `PATH` | which `claude` binary to drive; point it at a specific version to pin one |
+| `CLAUDE_CONSOLE_RECAP` | `1` | summarize a session you return to after it has been idle |
+| `CLAUDE_CONSOLE_RECAP_IDLE_SEC` | `300` | idle seconds before a recap is due |
+| `CLAUDE_CONSOLE_RECAP_MODEL` | `haiku` | model that writes the recap |
+| `CLAUDE_CONSOLE_MAX_BUFFER_MB` | `64` | ceiling on one CLI message |
+| `CLAUDE_CONSOLE_IMPORT_MAX_MB` | `1024` | ceiling on an imported transcript |
 | `CLAUDE_CONSOLE_TRANSCRIBE` | `0` | enable local voice input |
 | `CLAUDE_CONSOLE_TRANSCRIBE_PYTHON` | current python | interpreter that has `faster-whisper` |
 | `CLAUDE_CONSOLE_TRANSCRIBE_MODEL` | *(unset)* | CTranslate2 model directory, or a model name to fetch |

@@ -157,6 +157,12 @@ python claude_console.py
 | `CLAUDE_CONSOLE_BIND` | `127.0.0.1` | 绑定地址；设为 `0.0.0.0` 可从局域网访问 |
 | `CLAUDE_CONSOLE_AUTH` | *(disabled)* | 可选的 HTTP Basic Auth `user:pass` |
 | `CLAUDE_CONSOLE_WEBFM_URL` | this host on `:7701` | 打开被点击文件路径所用的 web file manager |
+| `CLAUDE_CONSOLE_CLAUDE` | `PATH` 中第一个 | 驱动哪个 `claude` 可执行文件；指向某个版本即可钉住它 |
+| `CLAUDE_CONSOLE_RECAP` | `1` | 回到闲置已久的 session 时先给一段摘要 |
+| `CLAUDE_CONSOLE_RECAP_IDLE_SEC` | `300` | 闲置多少秒后需要摘要 |
+| `CLAUDE_CONSOLE_RECAP_MODEL` | `haiku` | 撰写摘要的模型 |
+| `CLAUDE_CONSOLE_MAX_BUFFER_MB` | `64` | 单条 CLI 消息的上限 |
+| `CLAUDE_CONSOLE_IMPORT_MAX_MB` | `1024` | 导入 transcript 的大小上限 |
 | `CLAUDE_CONSOLE_TRANSCRIBE` | `0` | 启用本地语音输入 |
 | `CLAUDE_CONSOLE_TRANSCRIBE_PYTHON` | current python | 装有 `faster-whisper` 的解释器 |
 | `CLAUDE_CONSOLE_TRANSCRIBE_MODEL` | *(unset)* | CTranslate2 模型目录，或待下载的模型名 |
