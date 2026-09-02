@@ -2231,6 +2231,9 @@ class ChatSession:
         self._task_open = {}      # TaskCreate tool_use id -> the task, until a result names it
         self._task_seq = 0        # creation ordinal; the fallback id if that text ever changes
         self._since_plan = 0      # tool calls since the plan was last touched (PostToolUse nudge)
+        self._agents = {}         # Agent tool_use id -> its subagent's {up, out, steps}, for the card
+        self._agent_reqs = {}     # Agent tool_use id -> message ids already counted
+        self._agent_tasks = {}    # CLI task id -> Agent tool_use id, for the task_* lifecycle messages
         self.event_seq = 0        # monotonic event number, so a viewer can ask for the gap
 
     def preload(self):
@@ -2320,6 +2323,8 @@ class ChatSession:
 
     async def _hook_post_tool(self, input_data, tool_use_id, context):
         """PostToolUse: after PLAN_NUDGE_EVERY calls with a step still open, remind."""
+        if (input_data or {}).get("agent_id"):      # fired inside a subagent: not its plan
+            return {}
         if (input_data or {}).get("tool_name") == PLAN_TOOL:
             self._since_plan = 0
             return {}
@@ -2603,19 +2608,47 @@ class ChatSession:
                             "post": g("postTokens", "post_tokens"),
                             "ms": g("durationMs", "duration_ms")})
             elif msg.subtype == "task_started":
-                # a run_in_background Bash launched → track it as a live background task
+                # a run_in_background Bash, or a subagent (the CLI backgrounds parallel
+                # Agent calls on its own: the Agent tool result is then only a launch
+                # notice and the turn ends while the agents still run) → track it as a
+                # live background task; a subagent's card is told to stay running
                 d = msg.data or {}
-                if d.get("task_type") == "local_bash" and d.get("task_id"):
-                    self.bg_tasks[d["task_id"]] = {"desc": d.get("description") or "",
-                                                   "tool_use_id": d.get("tool_use_id")}
+                tid, tu = d.get("task_id"), d.get("tool_use_id")
+                if tid and tu and d.get("task_type") == "local_agent":
+                    self._agent_tasks[tid] = tu
+                if tid and (d.get("task_type") == "local_bash" or d.get("is_backgrounded")):
+                    self.bg_tasks[tid] = {"desc": d.get("description") or "", "tool_use_id": tu}
+                if tid and tu and d.get("is_backgrounded"):
+                    evs.append({"kind": "agent_state", "toolId": tu, "state": "background"})
+            elif msg.subtype == "task_progress":
+                # what the subagent is doing right now; ephemeral, the card shows it
+                d = msg.data or {}
+                tu = d.get("tool_use_id") or self._agent_tasks.get(d.get("task_id"))
+                if tu and d.get("description"):
+                    self._emit({"type": "agent_progress", "toolId": tu, "desc": d["description"]})
             elif msg.subtype == "task_notification":
                 # authoritative completion notice (carries task_id + status + summary)
-                self.bg_tasks.pop((msg.data or {}).get("task_id"), None)
+                d = msg.data or {}
+                self.bg_tasks.pop(d.get("task_id"), None)
+                tu = d.get("tool_use_id") or self._agent_tasks.pop(d.get("task_id"), None)
+                if tu:
+                    self._agent_tasks.pop(d.get("task_id"), None)
+                    evs.append({"kind": "agent_done", "toolId": tu, "status": d.get("status") or "completed",
+                                "summary": _cap(d.get("summary") or "", RESULT_CAP),
+                                "agent": dict(self._agents.get(tu) or {})})
             elif msg.subtype == "task_updated":
                 # faster completion path: a status patch reaching a terminal state
                 d = msg.data or {}
-                if (d.get("patch") or {}).get("status") in ("completed", "failed", "killed", "error"):
+                st = (d.get("patch") or {}).get("status")
+                if st in ("completed", "failed", "killed", "error"):
                     self.bg_tasks.pop(d.get("task_id"), None)
+                    # the notification with the summary normally follows at once; if it
+                    # never does, the card must still stop saying it is running
+                    tu = self._agent_tasks.get(d.get("task_id"))
+                    if tu and st != "completed":
+                        self._agent_tasks.pop(d.get("task_id"), None)
+                        evs.append({"kind": "agent_done", "toolId": tu, "status": st, "summary": "",
+                                    "agent": dict(self._agents.get(tu) or {})})
         elif isinstance(msg, AssistantMessage):
             if not self.cc_id and getattr(msg, "session_id", None):
                 self.cc_id = msg.session_id
@@ -2641,6 +2674,20 @@ class ChatSession:
             evs.append({"kind": "turn_done", "subtype": msg.subtype,
                         "isError": msg.is_error, "numTurns": msg.num_turns,
                         "cost": msg.total_cost_usd})
+        # A subagent's messages carry the id of the Agent call that spawned it. The
+        # tag is what lets the console keep its run inside that one card instead of
+        # spliced into the conversation as if the main agent had done it.
+        par = getattr(msg, "parent_tool_use_id", None)
+        if par:
+            for e in evs:
+                e["parent"] = par
+            if isinstance(msg, AssistantMessage):
+                self._agent_usage(par, msg)
+        elif isinstance(msg, UserMessage):
+            for e in evs:   # the Agent call's own result: carry the totals, so replay has them
+                a = self._agents.get(e.get("toolId")) if e.get("kind") == "tool_result" else None
+                if a:
+                    e["agent"] = dict(a)
         return evs
 
     def _on_stream_event(self, msg):
@@ -2651,6 +2698,8 @@ class ChatSession:
         viewers, never appended to self.log (would flood replay on reattach)."""
         e = getattr(msg, "event", None) or {}
         et = e.get("type")
+        if getattr(msg, "parent_tool_use_id", None):
+            return                  # a subagent's request: not the pill's numbers, not the context meter's
         if et == "message_start":
             # each model request = one agentic step. Re-pick the spinner verb on
             # every step after the first (the first keeps turn_start's word), so the
@@ -2700,6 +2749,40 @@ class ChatSession:
                 self._tok_out = ot
                 self._tok_exact = True
                 self._emit_tokens(force=True)
+
+    def _agent_usage(self, par, msg):
+        """A subagent's request usage, read off its assistant messages (its stream
+        events never reach the SDK client) and shown on its Agent card. Same ↑
+        convention as the pill: fresh input plus cache writes, never cache reads.
+        One assistant message can arrive in several pieces that all repeat the
+        request's usage, so a request counts once, by message id."""
+        u = getattr(msg, "usage", None)
+        if not isinstance(u, dict):
+            return
+        a = self._agents.setdefault(par, {"up": 0, "out": 0, "steps": 0})
+        seen = self._agent_reqs.setdefault(par, set())
+        mid = getattr(msg, "message_id", None) or id(msg)
+        if mid in seen:
+            return
+        seen.add(mid)
+        a["up"] += (u.get("input_tokens") or 0) + (u.get("cache_creation_input_tokens") or 0)
+        # output_tokens on this message is the request's opening figure, not its
+        # final one (the exact count travels in a stream event we never see), so
+        # the content itself is the better measure: ~4 chars a token, as the pill
+        # estimates mid-stream. Flagged, since it stays an estimate.
+        chars = 0
+        for b in getattr(msg, "content", None) or []:
+            chars += len(getattr(b, "text", "") or "") + len(getattr(b, "thinking", "") or "")
+            if getattr(b, "input", None) is not None:
+                chars += len(json.dumps(b.input))
+        est = (chars + 3) // 4
+        rep = u.get("output_tokens") or 0
+        a["out"] += max(rep, est)
+        if est > rep:
+            a["est"] = True
+        a["steps"] += 1
+        self._emit({"type": "agent_tokens", "parent": par, "up": a["up"], "out": a["out"],
+                    "steps": a["steps"], "est": bool(a.get("est"))})
 
     def _emit_tokens(self, force=False):
         """Throttled ephemeral push of the current ↑/↓ token counts to the pill."""
@@ -3002,6 +3085,8 @@ class ChatSession:
         Returns True if anything moved, so the caller knows to push a snapshot."""
         changed = False
         for e in evs:
+            if e.get("parent"):          # a subagent's plan is its own business
+                continue
             k = e.get("kind")
             if k == "tool_use":
                 inp = e.get("input")
@@ -3551,12 +3636,18 @@ header input#cwd{flex:1;min-width:120px;display:none}
 .tool .eye{color:var(--mut);flex-shrink:0;display:inline-flex;align-items:center;transition:color .15s}
 .tool .eye svg{width:16px;height:16px;display:block}
 .tool .eye .e-open{display:none}            /* collapsed → closed eye */
-.tool.open .eye .e-shut{display:none}
-.tool.open .eye .e-open{display:block}      /* expanded → open eye */
+.tool.open>.th .eye .e-shut{display:none}
+.tool.open>.th .eye .e-open{display:block}      /* expanded → open eye; child selectors, or an open Agent card opens every card folded inside it */
 .tool .th:hover .eye{color:var(--fg)}
 .tool .tb{display:none;border-top:1px solid var(--line);padding:8px 10px}
-.tool.open .tb{display:block}
-.tool.err .tn{color:var(--del)}
+.tool.open>.tb{display:block}
+/* an Agent card folds its subagent's whole run; the header keeps the live count */
+.tool .agst{color:var(--mut);font-family:var(--fmono);font-size:11.5px;flex-shrink:0;white-space:nowrap}
+.tool.agent.running>.th .agst{color:var(--tool)}
+.tool .brief{margin-bottom:8px}
+.tool .sub{margin:0 0 8px;padding-left:10px;border-left:2px solid var(--line)}
+.tool .sub .tool,.tool .sub .toolgroup{margin:6px 0}
+.tool.err>.th .tn{color:var(--del)}
 /* Consecutive calls to the SAME tool fold into one row. A run of eight Bash calls
    otherwise pushes the answer off screen, and Claude routinely fires several tool
    calls in a single message, so these runs are common rather than exceptional.
@@ -3599,7 +3690,7 @@ pre code{background:none;border:none;padding:0}
 .bubble table{border-collapse:collapse;margin:7px 0;font-size:12px;display:block;overflow-x:auto;max-width:100%}
 .bubble th,.bubble td{border:1px solid var(--line);padding:3px 9px;text-align:left}
 .bubble thead th{background:var(--bg3);font-weight:600}
-.msg.asst ul,.msg.asst ol{margin:4px 0 4px 20px}
+.msg.asst ul,.msg.asst ol,.tool .res .b ul,.tool .res .b ol{margin:4px 0 4px 20px}   /* the report box renders markdown too */
 .msg.asst a{color:var(--acc)}
 .diffline{font-family:var(--fmono);font-size:12px;white-space:pre-wrap;line-height:1.4}
 .dl-add{color:var(--addfg)}.dl-del{color:var(--delfg)}.dl-hdr{color:var(--acc)}.dl-ctx{color:var(--mut)}
@@ -4213,6 +4304,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
 const $=s=>document.querySelector(s);
 const PAGE_STAMP='__CLAUDE_CONSOLE_STAMP__';   /* hash of the page as served; see the server's PAGE_STAMP */
 const stream=$('#stream'), ta=$('#ta'), sendBtn=$('#send'), voiceBtn=$('#voiceBtn');
+let sink=stream;   /* where conversation builders append: the stream, or an Agent card's fold while its subagent's events render */
 let ws=null, running=false, ready=false, compacting=false, cwd='', tools={};
 let tokUp=0,tokOut=0,tokShow=false;   /* live streaming token counts shown in the pill */
 let sid=null, curCC=null, editCount=0, pendingStart=false, reconnectT=0;
@@ -4347,11 +4439,12 @@ function scroll(){if(replaying)return;setTop($('#chat').scrollHeight,true);}
     else if(top>prev&&gap<FOLLOW_BAND)follow=true;
     prev=top;},{passive:true});})();
 
-const ICON={Edit:'✏️',MultiEdit:'✏️',Write:'📝',Bash:'▶',Read:'📖',Glob:'🔍',Grep:'🔍',Task:'🤖',
+const ICON={Edit:'✏️',MultiEdit:'✏️',Write:'📝',Bash:'▶',Read:'📖',Glob:'🔍',Grep:'🔍',Task:'🤖',Agent:'🤖',
   WebFetch:'🌐',WebSearch:'🌐',TodoWrite:'☑️',NotebookEdit:'📓',
   TaskCreate:'☑️',TaskUpdate:'☑️',TaskList:'☑️',TaskGet:'☑️',mcp__console__plan:'☑️'};
 function toolLabel(t){return t==='mcp__console__plan'?'plan':t;}   /* the console's own tool, without its MCP prefix */
 function primaryArg(i){if(!i)return '';if(typeof i==='string')return i.slice(0,80);
+  if(i.prompt!==undefined&&(i.description||i.subagent_type))return [i.description,i.subagent_type,i.model].filter(Boolean).join(' · ').slice(0,90);   /* Agent: what, who, on which model */
   if(Array.isArray(i.steps)){const n=i.steps.length,d=i.steps.filter(x=>x&&x.status==='completed').length,c=i.steps.find(x=>x&&x.status==='in_progress');
     return d+'/'+n+(c?' · '+(''+(c.title||'')).slice(0,60):'');}   /* plan snapshot: progress + the open step */
   if(i.file_path)return i.file_path.split('/').slice(-2).join('/');
@@ -4377,7 +4470,7 @@ function addUser(text,nImg,files){const s=atBottom();const d=document.createElem
     ((files&&files.length)?'<div class="files">📎 '+files.map(esc).join(' · ')+'</div>':'');
   stream.appendChild(d);scroll();}
 function addAsst(text){const s=atBottom();const d=document.createElement('div');d.className='msg asst';
-  d.innerHTML='<div class="b bubble">'+md(text)+'</div>';typesetMath(d);stream.appendChild(d);if(s)scroll();}
+  d.innerHTML='<div class="b bubble">'+md(text)+'</div>';typesetMath(d);sink.appendChild(d);if(s)scroll();}
 /* ── live streaming bubble ────────────────────────────────────────────────────
    Deltas render as PLAIN TEXT, appended to a text node and never re-parsed. That
    is deliberate: running md()+KaTeX on every delta would re-parse the whole answer
@@ -4476,7 +4569,7 @@ function endStream(){
   if(streamRAF){cancelAnimationFrame(streamRAF);streamRAF=0;}
   if(streamEl){const w=streamEl.closest('.msg');if(w)w.remove();streamEl=null;}}
 function addThink(text){const s=atBottom();const d=document.createElement('div');d.className='think'+(showThink?'':' hide');d.dataset.t=1;
-  d.textContent=text;stream.appendChild(d);if(s)scroll();}
+  d.textContent=text;sink.appendChild(d);if(s)scroll();}
 function addNotice(t){const d=document.createElement('div');d.className='notice';d.textContent=t;stream.appendChild(d);}
 function addRecap(t){const s=atBottom();const d=document.createElement('div');d.className='recap';
   d.innerHTML='<span class="rk">※ recap:</span> <span class="rt"></span>';
@@ -4553,7 +4646,8 @@ function addErr(t){const d=document.createElement('div');d.className='errline';d
    the whole semantic — a group means "these happened back to back with nothing
    in between", which is exactly the noise worth folding and exactly the context
    worth keeping. */
-function toolGroupKey(ev){return (''+((ev&&ev.tool)||'')).trim().toLowerCase();}
+function toolGroupKey(ev){if(ev&&(ev.tool==='Agent'||ev.tool==='Task'))return null;   /* each Agent card is its own fold */
+  return (''+((ev&&ev.tool)||'')).trim().toLowerCase();}
 function groupCards(g){return [...g.querySelectorAll(':scope>.tgb>.tool')];}
 function refreshToolGroup(g){
   if(!g)return;
@@ -4580,27 +4674,55 @@ function makeToolGroup(first,second,key){
   if(first.classList.contains('open'))g.classList.add('open');
   refreshToolGroup(g);return g;}
 function placeToolCard(c,ev){
-  const key=toolGroupKey(ev),prev=stream.lastElementChild;
+  const key=toolGroupKey(ev),prev=sink.lastElementChild;
   if(prev&&key){
     if(prev.classList.contains('toolgroup')&&prev.dataset.tkey===key){
       prev.querySelector(':scope>.tgb').appendChild(c);refreshToolGroup(prev);return;}
     if(prev.classList.contains('tool')&&toolGroupKey(prev._ev)===key){
       makeToolGroup(prev,c,key);return;}}
-  stream.appendChild(c);}
+  sink.appendChild(c);}
 const TOOL_EYE='<span class="eye"><svg class="e-shut" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 11c3 4 7 6 10 6s7-2 10-6"/><line x1="5.5" y1="15.5" x2="4.3" y2="18"/><line x1="12" y1="17.5" x2="12" y2="20"/><line x1="18.5" y1="15.5" x2="19.7" y2="18"/></svg><svg class="e-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></span>';
+/* An Agent card is the whole delegated run: the brief it was given, then every
+   message and tool call its subagent makes (routed here by the `parent` tag),
+   then the report it came back with as the result. Folded by default; the
+   header carries a live count and the subagent's own token usage. */
+function agentStat(c,d){const a=c._ag;if(!a)return;
+  if(d.tools)a.tools+=d.tools;if(d.up!=null)a.up=d.up;if(d.out!=null)a.out=d.out;if(d.est!=null)a.est=!!d.est;
+  if(d.doing!==undefined)a.doing=(''+(d.doing||'')).slice(0,48);   /* the brief needs its room too */
+  const el=c.querySelector(':scope>.th .agst');if(!el)return;
+  const run=c.classList.contains('running');
+  el.textContent=(run?(c._bg?'background':'running'):(a.status||'done'))+(run&&a.doing?(' · '+a.doing):'')+
+    ' · '+a.tools+' tool'+(a.tools===1?'':'s')+((a.up||a.out)?(' · ↑'+fmtTok(a.up)+' ↓'+(a.est?'~':'')+fmtTok(a.out)):'');}
+/* a backgrounded subagent: the Agent tool result is only the launch notice, the
+   real report arrives later as a task notification (agent_done) */
+function agentLaunched(c){c._bg=true;c.classList.add('running');
+  (c.querySelector(':scope>.tb>.res')||{}).innerHTML='<div class="reslabel">running in the background — the report lands here when it finishes</div>';
+  agentStat(c,{});}
+function agentDone(ev){const c=tools[ev.toolId];if(!c||!c._ag)return;
+  c._bg=false;c.classList.remove('running');c.classList.add('done');if(ev.status&&ev.status!=='completed')c.classList.add('err');
+  c._ag.status=ev.status&&ev.status!=='completed'?ev.status:'done';c._ag.doing='';
+  const r=c.querySelector(':scope>.tb>.res');
+  if(r&&ev.summary){r.innerHTML='<div class="reslabel">report ⤵</div><div class="b">'+md(ev.summary)+'</div>';typesetMath(r);}
+  agentStat(c,ev.agent||{});}
 function addTool(ev){const s=atBottom();const c=document.createElement('div');c.className='tool';
+  const agent=ev.tool==='Agent'||ev.tool==='Task';if(agent)c.classList.add('agent','running');
   const cn=counts(ev);const cnt=cn?('<span class="a">+'+cn.a+'</span> <span class="d">−'+cn.d+'</span>'):'';
   c.innerHTML='<div class="th"><span class="ico">'+(ICON[ev.tool]||'🔧')+'</span><span class="tn">'+esc(toolLabel(ev.tool))+'</span>'+
-    '<span class="tp">'+esc(primaryArg(ev.input))+'</span><span class="cnt">'+cnt+'</span>'+TOOL_EYE+'</div>'+
-    '<div class="tb"><div class="res"></div></div>';
+    '<span class="tp">'+esc(primaryArg(ev.input))+'</span>'+(agent?'<span class="agst"></span>':'')+'<span class="cnt">'+cnt+'</span>'+TOOL_EYE+'</div>'+
+    '<div class="tb">'+(agent?'<div class="brief"></div><div class="sub"></div>':'')+'<div class="res"></div></div>';
   c._ev=ev;   /* lazy: build the (maybe large) body only on first expand */
+  if(agent){c._sub=c.querySelector('.sub');c._ag={tools:0,up:0,out:0};agentStat(c,{});}
   c.querySelector('.th').onclick=()=>{const open=c.classList.toggle('open');
-    if(open&&!c._bodyDone){c._bodyDone=1;c.querySelector('.res').insertAdjacentHTML('beforebegin',toolBody(c._ev));}};
+    if(open&&!c._bodyDone){c._bodyDone=1;const b=c.querySelector(':scope>.tb>.brief');
+      if(b)b.innerHTML=toolBody(c._ev);else c.querySelector('.res').insertAdjacentHTML('beforebegin',toolBody(c._ev));}};
   placeToolCard(c,ev);if(ev.toolId)tools[ev.toolId]=c;if(s)scroll();}
 function addResult(ev){const c=tools[ev.toolId];if(!c)return;if(ev.isError)c.classList.add('err');
-  const b=(ev.content||'').trim();c.querySelector('.res').innerHTML='<div class="reslabel">'+(ev.isError?'error ⤵':'output ⤵')+
+  /* the card's OWN result box: an Agent card has more .res inside its fold; an edit card has no .tb at all */
+  const b=(ev.content||'').trim();(c.querySelector(':scope>.tb>.res')||c.querySelector('.res')).innerHTML='<div class="reslabel">'+(ev.isError?'error ⤵':'output ⤵')+
     '</div><pre><code>'+esc(b.length>2200?b.slice(0,2200)+'\n…':b)+'</code></pre>';
+  if(c._ag&&(c._bg||/^Async agent launched/.test(b))){agentLaunched(c);return;}   /* not a result, a launch notice */
   c.classList.add('done');   /* a card with its result in is no longer in flight */
+  if(c._ag){c.classList.remove('running');agentStat(c,ev.agent||{});}
   if(c.closest)refreshToolGroup(c.closest('.toolgroup'));}
 
 function statset(t){const el=$('#thinking');if(!el)return;
@@ -4719,7 +4841,7 @@ function addMarker(ev){const s=atBottom();const cn=counts(ev);const m=document.c
   m.innerHTML=(ICON[ev.tool]||'✏️')+'<span>'+esc(primaryArg(ev.input)||ev.tool)+'</span>'+
     (cn?'<span><span class="a">+'+cn.a+'</span> <span class="d">−'+cn.d+'</span></span>':'')+'<span class="mut">— see Changes</span>';
   m.onclick=()=>{openDrawer('edits');focusEdit(ev.toolId);};
-  stream.appendChild(m);if(s)scroll();}
+  sink.appendChild(m);if(s)scroll();}
 
 function addApproval(ev){const c=document.createElement('div');c.className='approval';c.dataset.aid=ev.aid;
   c.innerHTML='<div class="ah">🔐 Approve <b>'+esc(ev.tool)+'</b> <span class="tp">'+esc(primaryArg(ev.input)||'')+'</span></div>'+
@@ -4775,6 +4897,16 @@ function route(ev){
   if(_s){const _t=tabById(sid);
     if(_t){_t.lastSeq=Math.max(Number(_t.lastSeq||0),_s);
            _t.serverSeq=Math.max(Number(_t.serverSeq||0),_t.lastSeq);}}
+  /* a subagent's events render inside the Agent card that spawned it, never in
+     the conversation; the streaming bubble is the main agent's and stays */
+  if(ev.parent){const c=tools[ev.parent];if(!c||!c._sub)return;
+    sink=c._sub;try{
+      if(ev.kind==='assistant_text')addAsst(ev.text);
+      else if(ev.kind==='thinking')addThink(ev.text);
+      else if(ev.kind==='tool_use'){if(EDIT_TOOLS.has(ev.tool)){addEditCard(ev);addMarker(ev);}else addTool(ev);agentStat(c,{tools:1});}
+      else if(ev.kind==='tool_result')addResult(ev);
+    }finally{sink=stream;}
+    return;}
   /* if activity resumes while we think we're idle (e.g. the CLI ran an injected
      queued message as its own turn), step back into the busy state */
   if(!running&&(ev.kind==='assistant_text'||ev.kind==='thinking'||ev.kind==='tool_use'))setBusy(true);
@@ -4801,6 +4933,8 @@ function route(ev){
   else if(ev.kind==='notice')addNotice(ev.text);
   else if(ev.kind==='recap')addRecap(ev.text);
   else if(ev.kind==='model')setModelPill(ev.model,!!ev.once);
+  else if(ev.kind==='agent_state'){const c=tools[ev.toolId];if(c&&c._ag&&ev.state==='background')agentLaunched(c);}
+  else if(ev.kind==='agent_done')agentDone(ev);
   else if(ev.kind==='effort')setEffortPill(ev.effort);
   else if(ev.kind==='plan')setPlan(ev.tasks);
   if(!replaying&&stream.children.length>CHAT_KEEP_ITEMS+120)trimChatWindow();
@@ -4858,6 +4992,8 @@ function onMsg(e){const m=JSON.parse(e.data);
   else if(m.type==='renamed'){if(m.ok){if(m.cc&&m.cc===curCC&&m.name)setCurname(m.name);addNotice('✎ renamed');reqList();loadTree();}else addNotice('rename failed');}
   else if(m.type==='sessions'){renderLive(m.sessions);syncTabs(m.sessions);}
   else if(m.type==='context')renderCtx(m.ctx);
+  else if(m.type==='agent_progress'){const c=tools[m.toolId];if(c)agentStat(c,{doing:m.desc});}
+  else if(m.type==='agent_tokens'){const c=tools[m.parent];if(c)agentStat(c,{up:m.up,out:m.out,est:m.est});}
   else if(m.type==='tokens'){tokUp=m.up||0;tokOut=m.out||0;tokShow=true;
     if(m.word!=null&&m.word!==lastWordSeed){lastWordSeed=m.word;if(running&&!compacting)setWord(m.word);}}
   else if(m.type==='projects'){projData=m.projects||[];renderSidebar();}

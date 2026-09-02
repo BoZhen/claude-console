@@ -45,12 +45,14 @@ which is the whole point.
 - **Folded tool runs** — consecutive calls to the *same* tool collapse into one
   row (`▶ Bash ×5  ruff check .  1 failed`) that expands to the individual
   cards. Anything in between — an answer, an edit, an approval — ends the run.
+- **Delegated work** — when the agent hands a task to a subagent (the `Agent`
+  tool), everything the subagent says and does stays inside that one card,
+  collapsed, with its tool-call count and token usage in the header; the report
+  it returns is the card's result.
 - **Plan dock** — a task list pinned above the chat with the current step, a
   progress count, and a fold to just the active task; it retires itself a
-  couple of seconds after the last step is done. The console brings the tool
-  behind it into the session (the CLI's own task list came and went with
-  versions) and reminds the model to keep it current, so a plan is never left
-  half-done on screen.
+  couple of seconds after the last step is done. The console supplies the tool
+  behind it to the session and reminds the model to keep it current.
 - **LaTeX rendering** — `$…$`, `$$…$$`, `\(…\)`, `\[…\]` in replies render with
   KaTeX (vendored, offline).
 - **Clickable file paths** — a path in a reply (`~/work/lattice-qmc/observables.py`)
@@ -120,19 +122,16 @@ which is the whole point.
   so Taiwanese dictation does not leave Taiwanese terms in the text.
 - **Model** — a `🤖` pill showing the live session's model, one click to change
   it (from the next turn, nothing relaunches). A single message can go to another
-  model on its own: start it with `@haiku …`, `@sonnet …`, `@opus …` or
-  `@fable …` and that turn runs there, then the session switches back by itself.
-  A cheap question need not cost what the session costs, and there is nothing to
-  remember to undo. Typing `@` opens a list of what each token resolves to
-  (↑/↓ pick, Tab or Enter insert, Esc closes). Any fragment of a model id works
-  and is matched against the live list, so `@fable` still means the newest fable
-  a year from now; the long-window `[1m]` variant is preferred, since these are
-  asked from inside long sessions where the plain window would only refuse. An
-  exact id is used as typed, which is how to ask for the plain window. A token
-  that names no model is sent as ordinary text, with a note saying so.
+  model: start it with `@haiku …`, `@sonnet …`, `@opus …` or `@fable …` and that
+  turn runs there, then the session switches back. Typing `@` opens a list of
+  what each token resolves to (↑/↓ pick, Tab or Enter insert, Esc closes). Any
+  fragment of a model id works and is matched against the live list, newest
+  first; the long-window `[1m]` variant is used when one exists, and an exact id
+  is used as typed. A token that names no model is sent as ordinary text, with a
+  note saying so.
 - **Thinking effort** — a `🧠` pill (low / medium / high / xhigh / max) to set
-  reasoning depth, switchable on the fly: `/effort` goes down to the live
-  session, so nothing relaunches and no history is replayed. A sixth setting,
+  reasoning depth, switchable on the fly without relaunching the session. A
+  sixth setting,
   **ultracode**, runs at xhigh and opts every message into multi-agent
   orchestration.
 - Pick **project dir**, **model** (`↻` refreshes the list from the API) and
@@ -147,8 +146,7 @@ which is the whole point.
 - **At-a-glance status** — context-window and rolling 5-hour usage meters in the
   header; a floating status pill (ready / working timer / live token counts) plus
   the model and effort pills above a full-width composer. Past 60% of the window
-  the empty composer reads *update your snapshot*: compaction is coming, and
-  notes written now are what carry the session across it.
+  the empty composer reads *update your snapshot*.
 
 ## Run
 
@@ -240,8 +238,7 @@ The legacy `AGENTLENS_*` names are still honored as a fallback.
 - Voice icon from Microsoft's [Fluent Emoji](https://github.com/microsoft/fluentui-emoji)
   (MIT), under `static/icons/`.
 - The page carries the hash of the code it was served with and reloads itself
-  when the server reports a different one, so an open tab is never left running
-  yesterday's script against today's server. Drafts are saved first.
+  when the server reports a different one; drafts are saved first.
 - Very long conversations keep a bounded window of *rendered* messages per tab;
   older ones fold into a marker that links to the history search. Nothing is
   deleted — the full transcript stays on disk under `~/.claude/projects`.
