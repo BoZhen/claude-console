@@ -936,8 +936,10 @@ def fetch_usage():
     """The rolling 5h / 7d usage limits, from Claude's OAuth usage endpoint — the
     same numbers the CLI shows. Reads the local OAuth token; cached ~5 min (the
     endpoint is itself rate-limited). Blocking (run it off the IO loop). Returns a
-    dict {window: {utilization, resets_at}}, the last good value on a transient
-    error, or None when never available (no token)."""
+    dict {window: {utilization, resets_at}} plus, when the account has per-model
+    weekly quotas, "model_scoped": [{label, utilization, resets_at, severity}].
+    Returns the last good value on a transient error, or None when never
+    available (no token)."""
     now = time.monotonic()
     if _usage_cache["v"] is not None and now - _usage_cache["t"] < 300:
         return _usage_cache["v"]
@@ -958,6 +960,22 @@ def fetch_usage():
             v = data.get(k)
             if isinstance(v, dict) and v.get("utilization") is not None:
                 out[k] = {"utilization": v.get("utilization"), "resets_at": v.get("resets_at")}
+        # Per-model weekly windows (currently Fable on Max) exist only inside
+        # limits[], never as a top-level key, and the top-level names rotate as
+        # unreleased buckets ship. limits[] is self-describing, so take the label
+        # off the entry rather than matching on a model name. Note the field
+        # names differ from the top-level buckets: percent (int), not utilization.
+        scoped = []
+        for it in (data.get("limits") or []):
+            if not isinstance(it, dict) or it.get("kind") != "weekly_scoped":
+                continue
+            name = ((it.get("scope") or {}).get("model") or {}).get("display_name")
+            if not name or it.get("percent") is None:
+                continue
+            scoped.append({"label": name, "utilization": it["percent"],
+                           "resets_at": it.get("resets_at"), "severity": it.get("severity")})
+        if scoped:
+            out["model_scoped"] = scoped
         _usage_cache["t"], _usage_cache["v"] = now, out
         return out
     except Exception:
@@ -5044,17 +5062,21 @@ function renderCtx(c){const el=$('#ctx');curCtx=c||null;
 function fmtDur(ms){if(ms==null||ms<=0)return '0m';const m=Math.floor(ms/60000),h=Math.floor(m/60);
   return h>0?(h+'h '+(m%60)+'m'):(m+'m');}
 function renderUsage(u){const el=$('#usage');const f=u&&u.five_hour,w=u&&u.seven_day;
-  if((!f||f.utilization==null)&&(!w||w.utilization==null)){el.style.display='none';return;}
+  /* per-model weekly windows (e.g. Fable); label comes from the server */
+  const sc=(u&&u.model_scoped)||[];
+  if((!f||f.utilization==null)&&(!w||w.utilization==null)&&!sc.length){el.style.display='none';return;}
   function seg(o,lbl){if(!o||o.utilization==null)return '';
     const pct=Math.round(o.utilization);
     return '<span class="useg"><span class="ulabel">'+lbl+'</span>'+cellBar(pct)+'<span>'+pct+'%</span></span>';}
   el.className='usage';el.style.display='inline-flex';
-  el.innerHTML='<span class="ulabel">Usage</span>'+seg(f,'5h')+seg(w,'7d');
+  el.innerHTML='<span class="ulabel">Usage</span>'+seg(f,'5h')+seg(w,'7d')+sc.map(o=>seg(o,o.label)).join('');
   let t='';
-  const all=[['five_hour','5-hour'],['seven_day','7-day'],['seven_day_sonnet','7-day Sonnet'],['seven_day_opus','7-day Opus']];
-  all.forEach(([k,lbl])=>{const o=u&&u[k];if(o&&o.utilization!=null){
+  function row(lbl,o){if(!o||o.utilization==null)return;
     const rem=o.resets_at?fmtDur(new Date(o.resets_at)-Date.now()):'';
-    t+=(t?'\n':'')+lbl+': '+Math.round(o.utilization)+'% used'+(rem?(' · resets in '+rem):'');}});
+    t+=(t?'\n':'')+lbl+': '+Math.round(o.utilization)+'% used'+(rem?(' · resets in '+rem):'');}
+  const all=[['five_hour','5-hour'],['seven_day','7-day'],['seven_day_sonnet','7-day Sonnet'],['seven_day_opus','7-day Opus']];
+  all.forEach(([k,lbl])=>row(lbl,u&&u[k]));
+  sc.forEach(o=>row('7-day '+o.label,o));
   el.title=t;}
 function loadUsage(){fetch('api/usage').then(r=>r.json()).then(j=>renderUsage(j.usage)).catch(()=>{});}
 /* dynamic model list from the live /v1/models API: aliases (track the latest of

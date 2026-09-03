@@ -114,7 +114,8 @@
 - **13 种配色主题** —— 明暗皆有（Dark、Dracula、Nord、Tokyo Night、Catppuccin、
   Gruvbox、Light、Solarized Light、Rosé Pine Dawn、One Light、Ayu Light…），
   从侧栏切换；选择按设备保存。
-- **一眼可见的状态** —— 头部有上下文窗口和 5 小时滚动用量计量；全宽输入框上方有一个
+- **一眼可见的状态** —— 头部有上下文窗口、5 小时滚动用量和每周用量计量，账号若有按
+  模型细分的周额度（Max 上的 Fable）也一并显示，悬停可看各自的复位时间；全宽输入框上方有一个
   浮动状态药丸（ready / 工作计时 / 实时 token 计数）以及模型和思考深度药丸。上下文用到
   60% 以上时，空输入框会显示 *update your snapshot*。
 

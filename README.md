@@ -143,8 +143,9 @@ which is the whole point.
 - **13 color themes** — light & dark (Dark, Dracula, Nord, Tokyo Night,
   Catppuccin, Gruvbox, Light, Solarized Light, Rosé Pine Dawn, One Light, Ayu
   Light, …), switchable from the sidebar; choice persists per device.
-- **At-a-glance status** — context-window and rolling 5-hour usage meters in the
-  header; a floating status pill (ready / working timer / live token counts) plus
+- **At-a-glance status** — context-window, rolling 5-hour and weekly usage meters
+  in the header, including any per-model weekly quota the account carries (Fable
+  on Max), each with its reset time on hover; a floating status pill (ready / working timer / live token counts) plus
   the model and effort pills above a full-width composer. Past 60% of the window
   the empty composer reads *update your snapshot*.
 

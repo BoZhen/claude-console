@@ -12,5 +12,6 @@ __pycache__/
 # rather than the product, and some of it is simply personal.
 DESIGN.md
 docs/snapshot.md
+MODEL_SCOPED_USAGE.md
 session_snapshot/
 tests/
