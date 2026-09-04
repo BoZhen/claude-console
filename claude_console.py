@@ -5673,8 +5673,13 @@ function renderTabs(){
     el.onauxclick=ev=>{if(ev.button===1){ev.preventDefault();closeTab(t.id);}};
     el.onkeydown=tabKeydown;
     host.appendChild(el);});
+  /* keep the active tab inside the strip by moving the strip's own scroller only.
+     scrollIntoView would also scroll every ancestor, and this runs on each 8 s session
+     poll: on a phone with the keyboard up it pulled the page back to the strip. */
   const act=host.querySelector('.stab.active');
-  if(act&&act.scrollIntoView)act.scrollIntoView({block:'nearest',inline:'nearest'});}
+  if(act){const a=act.getBoundingClientRect(),r=host.getBoundingClientRect();
+    if(a.left<r.left)host.scrollLeft+=a.left-r.left;
+    else if(a.right>r.right)host.scrollLeft+=a.right-r.right;}}
 function tabKeydown(ev){
   if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();ev.currentTarget.click();return;}
   if(!['ArrowLeft','ArrowRight','Home','End'].includes(ev.key))return;
