@@ -3693,8 +3693,24 @@ header input#cwd{flex:1;min-width:120px;display:none}
 .toolgroup>.tgb{display:none;border-top:1px solid var(--line)}
 .toolgroup.open>.tgb{display:block}
 /* inside a group the cards give up their own frame: the group owns the box */
-.toolgroup>.tgb>.tool{border:0;border-radius:0;margin:0;background:transparent}
+.toolgroup>.tgb>.tool{border:0;border-radius:0;margin:0 0 0 12px;background:transparent}
 .toolgroup>.tgb>.tool+.tool{border-top:1px solid var(--line)}
+/* three levels inside a fold, each with its own cue: the group header becomes a band
+   once it is open; its members hang on a rail, numbered, without the tool icon (the
+   band already names the tool) and with the argument in full colour; a member that
+   is open marks its own header */
+.toolgroup.open>.tgh{background:var(--bg3)}
+.toolgroup>.tgb{background:var(--bg);padding:3px 0;counter-reset:tix}
+.toolgroup>.tgb>.tool{border-left:2px solid color-mix(in srgb,var(--tool) 45%,transparent)}
+.toolgroup>.tgb>.tool>.th{padding:6px 10px 6px 8px}
+.toolgroup>.tgb>.tool>.th::before{counter-increment:tix;content:counter(tix);color:var(--mut);
+  font-family:var(--fmono);font-size:11px;min-width:14px;text-align:right;flex-shrink:0}
+.toolgroup>.tgb>.tool>.th .ico{display:none}
+.toolgroup>.tgb>.tool>.th .tn{color:var(--mut);font-weight:500;font-size:12px}
+.toolgroup>.tgb>.tool.err>.th .tn{color:var(--del)}
+.toolgroup>.tgb>.tool>.th .tp{color:var(--fg)}
+.toolgroup>.tgb>.tool.open>.th{background:var(--bg2)}
+.toolgroup>.tgb>.tool.open{border-left-color:var(--tool)}   /* the open member's stretch of the rail is solid */
 pre{background:var(--codebg);border:1px solid var(--line);border-radius:6px;padding:8px;overflow-x:auto;margin:5px 0;
   font-family:var(--fmono);font-size:12.5px;line-height:1.45}
 code{font-family:var(--fmono);font-size:12.5px;background:var(--codebg);border:1px solid var(--line);border-radius:3px;padding:0 4px}
