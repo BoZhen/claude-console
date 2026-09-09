@@ -3845,8 +3845,9 @@ pre code{background:none;border:none;padding:0}
 .question .qopt:hover{border-color:var(--usr)}
 .question .qopt.sel{background:var(--sel);border-color:var(--usr);color:var(--fg)}
 .question .qopt .od{display:block;color:var(--mut);font-size:11.5px;margin-top:2px}
-.question .qother{margin-top:7px;width:100%;background:var(--bg3);color:var(--fg);
-  border:1px solid var(--line);border-radius:6px;padding:7px;font-size:13px}
+.question .qother{display:block;margin-top:7px;width:100%;background:var(--bg3);color:var(--fg);
+  border:1px solid var(--line);border-radius:6px;padding:7px;font-size:13px;font-family:inherit;
+  line-height:1.35;resize:none;overflow-y:auto;max-height:124px}
 .question .qbtns{display:flex;gap:8px;padding:8px 10px;border-top:1px solid var(--infoln)}
 .question .qbtns button{flex:1;padding:9px;border-radius:6px;cursor:pointer;font-size:14px;font-weight:700;
   background:var(--okbg);color:var(--addfg);border:1px solid var(--add)}
@@ -4875,6 +4876,8 @@ function decide(aid,allow,always){wsSend({type:'approve',aid:aid,allow:allow,alw
 function resolveApprovalCard(aid,allow,always){const c=stream.querySelector('.approval[data-aid="'+aid+'"]');
   if(c&&!c.classList.contains('done')){c.classList.add('done');
     const bt=c.querySelector('.abtns');if(bt)bt.innerHTML='<span class="'+(allow?'ok':'no')+'">'+(allow?('✓ Approved'+(always?" · won't ask again this session":'')):'✕ Denied')+'</span>';}}
+/* the custom-answer box grows with its text (rows=1 at first, capped by max-height) */
+function growOther(o){o.style.height='auto';o.style.height=Math.min(o.scrollHeight+2,124)+'px';}
 function qval(bl){const other=bl.querySelector('.qother').value.trim();
   if(other)return other;
   return [...bl.querySelectorAll('.qopt.sel')].map(x=>x.dataset.label).join(', ');}
@@ -4885,7 +4888,7 @@ function addQuestion(ev){const c=document.createElement('div');c.className='ques
     '<div class="qopts">';
     (q.options||[]).forEach(o=>{h+='<button class="qopt" data-label="'+esc(o.label)+'">'+esc(o.label)+
       (o.description?'<span class="od">'+esc(o.description)+'</span>':'')+'</button>';});
-    h+='</div><input class="qother" placeholder="Other… custom answer'+(q.multiSelect?' (comma-separated)':'')+'"></div>';});
+    h+='</div><textarea class="qother" rows="1" placeholder="Other… custom answer'+(q.multiSelect?' (comma-separated)':'')+'"></textarea></div>';});
   h+='<div class="qbtns"><button class="qsub" disabled>Submit</button></div>';
   c.innerHTML=h;const sub=c.querySelector('.qsub');
   function refresh(){let ok=qs.length>0;c.querySelectorAll('.qblk').forEach(bl=>{if(!qval(bl))ok=false;});sub.disabled=!ok;}
@@ -4894,7 +4897,10 @@ function addQuestion(ev){const c=document.createElement('div');c.className='ques
       if(multi)b.classList.toggle('sel');
       else bl.querySelectorAll('.qopt').forEach(x=>x.classList.toggle('sel',x===b));
       refresh();};});
-    bl.querySelector('.qother').oninput=refresh;});
+    const o=bl.querySelector('.qother');
+    o.oninput=()=>{growOther(o);refresh();};
+    /* Enter submits like the composer; Shift+Enter keeps a newline */
+    o.onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();if(!sub.disabled)sub.click();}};});
   sub.onclick=()=>{const picks=qs.map((q,qi)=>qval(c.querySelector('.qblk[data-qi="'+qi+'"]')));
     wsSend({type:'answer',aid:ev.aid,answers:picks});resolveQuestionCard(ev.aid,picks);};
   stream.appendChild(c);scroll();}
