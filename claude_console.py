@@ -4027,7 +4027,7 @@ pre code{background:none;border:none;padding:0}
 .dl-add{color:var(--addfg)}.dl-del{color:var(--delfg)}.dl-hdr{color:var(--acc)}.dl-ctx{color:var(--mut)}
 .reslabel{font-size:11px;color:var(--mut);margin:6px 0 2px}
 
-#composer{flex-shrink:0;border-top:1px solid var(--line);background:var(--bg2);padding:8px 10px;
+#composer{position:relative;flex-shrink:0;border-top:1px solid var(--line);background:var(--bg2);padding:8px 10px;
   padding-bottom:calc(8px + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:0;align-items:stretch}
 #composer .wrap2{width:100%;display:flex;gap:8px;align-items:flex-end;position:relative}
 /* @model completion above the composer: same list styling as the folder picker */
@@ -4195,6 +4195,14 @@ pre code{background:none;border:none;padding:0}
 .cells.lv-o{color:var(--mo)}.cells.lv-r{color:var(--mr)}
 .cells .cell.on{background:currentColor;border-color:currentColor;box-shadow:0 0 4px currentColor}
 @media(max-width:680px){.usage{display:none!important}}
+/* the way back down after reading up: over the chat's bottom-right corner, shown while
+   the view is off the tail, hidden once it follows again or there is nothing to scroll */
+.jump{position:absolute;right:22px;top:-46px;width:34px;height:34px;border-radius:50%;z-index:6;
+  border:1px solid var(--line);background:var(--bg2);color:var(--fg);box-shadow:0 4px 14px rgba(0,0,0,.28);
+  cursor:pointer;font-size:17px;line-height:1;display:inline-flex;align-items:center;justify-content:center}
+.jump:hover{border-color:var(--acc);color:var(--acc)}
+.jump[hidden]{display:none}
+@media(max-width:680px){.jump{right:12px}}
 /* header pill: the plan history, reachable when the dock is not showing */
 .hpill{display:inline-flex;align-items:center;gap:5px;height:24px;padding:0 9px;border:1px solid var(--line);
   border-radius:12px;background:var(--bg3);color:var(--fg);font-family:var(--fmono);font-size:12px;
@@ -4617,6 +4625,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
     <div id="sessionTabs" role="tablist" aria-label="Open sessions" hidden></div>
     <div id="chat"><div class="plandock" id="planDock" hidden></div><div class="wrap" id="stream"></div></div>
     <div id="composer">
+      <button id="jump" class="jump" hidden title="Jump to the latest message" aria-label="Jump to the latest message">↓</button>
       <div class="pillrow">
         <div id="thinking"><div class="twrap"><span class="dot" id="dot"></span><span class="glyph">✶</span><span class="word">idle</span><span class="meta"></span></div></div>
         <span class="pills"><span id="modelpill" title="model — click to change">🤖 model</span><span id="effort" title="thinking effort — click to change">🧠 max</span></span>
@@ -4807,14 +4816,17 @@ let replaying=false;   /* true while bulk-replaying a session log on attach — 
 let follow=true, autoTop=0;
 const FOLLOW_BAND=140;
 function atBottom(){return !replaying&&follow;}
-function setTop(v,f){const c=$('#chat');c.scrollTop=v;autoTop=c.scrollTop;follow=f;}
+function setTop(v,f){const c=$('#chat');c.scrollTop=v;autoTop=c.scrollTop;follow=f;syncJump();}
 function scroll(){if(replaying)return;setTop($('#chat').scrollHeight,true);}
+function syncJump(){const b=$('#jump'),c=$('#chat');if(!b)return;
+  b.hidden=follow||c.scrollHeight<=c.clientHeight+60;}
 (()=>{const c=$('#chat');let prev=c.scrollTop;
-  c.addEventListener('wheel',e=>{if(e.deltaY<0&&c.scrollTop>0)follow=false;},{passive:true});
+  c.addEventListener('wheel',e=>{if(e.deltaY<0&&c.scrollTop>0){follow=false;syncJump();}},{passive:true});
   c.addEventListener('scroll',()=>{const top=c.scrollTop,gap=c.scrollHeight-top-c.clientHeight;
     if(top<autoTop-1&&gap>2)follow=false;
     else if(top>prev&&gap<FOLLOW_BAND)follow=true;
-    prev=top;},{passive:true});})();
+    prev=top;syncJump();},{passive:true});
+  $('#jump').onclick=()=>{scroll();syncJump();};})();
 
 const ICON={Edit:'✏️',MultiEdit:'✏️',Write:'📝',Bash:'▶',Read:'📖',Glob:'🔍',Grep:'🔍',Task:'🤖',Agent:'🤖',
   WebFetch:'🌐',WebSearch:'🌐',TodoWrite:'☑️',NotebookEdit:'📓',
@@ -5256,7 +5268,7 @@ function fmtSecs(ms){const s=Math.max(0,Math.round(ms/1000));if(s<60)return s+'s
 function doInterrupt(){if(!running)return;wsSend({type:'interrupt'});addNotice('⏹ interrupt sent');}
 function clearUI(){stream.innerHTML='';$('#edits').innerHTML='<div class="empty">no file changes yet</div>';
   $('#gitc').innerHTML='<div class="empty">—</div>';tools={};editCount=0;updateEditBadge();renderCtx(null);ready=false;
-  queued={};renderQueue();stopThinking();clearPlan();planHist=[];renderPlanHistPill();trimHidden=0;
+  queued={};renderQueue();stopThinking();clearPlan();planHist=[];renderPlanHistPill();trimHidden=0;syncJump();
   endStream();}   /* also cancels a pending frame, which would else refill the cleared stream */
 
 /* file edits → out of chat, into the Changes drawer */

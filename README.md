@@ -41,7 +41,9 @@ which is the whole point.
   instead of arriving a sentence and a half at a time; formatting and math are
   typeset once, when the block completes, so nothing reflows mid-sentence.
   Scrolling up while the answer is being written keeps the view where you put
-  it — the tail is followed until you leave it, and again once you come back.
+  it — the tail is followed until you leave it, and again once you come back. A
+  `↓` button at the bottom right of the chat, shown whenever the view is off the
+  tail, jumps to the latest message and resumes following.
 - **Folded tool runs** — consecutive calls to the *same* tool collapse into one
   row (`▶ Bash ×5  ruff check .  1 failed`) that expands to the individual
   cards. Anything in between — an answer, an edit, an approval — ends the run.
