@@ -50,9 +50,13 @@ which is the whole point.
   collapsed, with its tool-call count and token usage in the header; the report
   it returns is the card's result.
 - **Plan dock** — a task list pinned above the chat with the current step, a
-  progress count, and a fold to just the active task; it retires itself a
-  couple of seconds after the last step is done. The console supplies the tool
-  behind it to the session and reminds the model to keep it current.
+  progress count, and a fold to just the active task. A finished plan stays
+  until its `read` button is pressed. The console supplies the tool behind it
+  to the session and reminds the model to keep it current.
+- **Plan history** — the dock's `history` button, or the `☑ plans` pill at the
+  top right, lists every plan of the session, newest first, with its steps, start time, duration and a one- or
+  two-sentence summary written by a cheap model when the plan finished. The
+  list is kept per session and survives a resume.
 - **LaTeX rendering** — `$…$`, `$$…$$`, `\(…\)`, `\[…\]` in replies render with
   KaTeX (vendored, offline).
 - **Clickable file paths** — a path in a reply (`~/work/lattice-qmc/observables.py`)
@@ -194,6 +198,7 @@ HTTPS (a reverse proxy, or `tailscale serve`) unless you open it on `localhost`.
 | `CLAUDE_CONSOLE_RECAP` | `1` | summarize a session you return to after it has been idle |
 | `CLAUDE_CONSOLE_RECAP_IDLE_SEC` | `300` | idle seconds before a recap is due |
 | `CLAUDE_CONSOLE_RECAP_MODEL` | `haiku` | model that writes the recap |
+| `CLAUDE_CONSOLE_PLAN_SUMMARY_MODEL` | `haiku` | model that writes the plan-history summaries |
 | `CLAUDE_CONSOLE_MAX_BUFFER_MB` | `64` | ceiling on one CLI message |
 | `CLAUDE_CONSOLE_IMPORT_MAX_MB` | `1024` | ceiling on an imported transcript |
 | `CLAUDE_CONSOLE_TRANSCRIBE` | `0` | enable local voice input |

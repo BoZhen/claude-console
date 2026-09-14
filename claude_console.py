@@ -94,6 +94,14 @@ RECAP_SYS = ("You write a one-line \"recap\" for a developer who stepped away fr
              "SINGLE plain-text line (no markdown, no quotes, under 160 characters) stating what "
              "is being worked on and the immediate next step. "
              "Example: Working on the auth refactor — just split the login handler; next: wire up the session cookie.")
+# the plan history: one entry per plan, its summary written by a cheap model once the
+# plan is finished (see ChatSession._track_plan)
+PLAN_SUMMARY_MODEL = _env("PLAN_SUMMARY_MODEL", "haiku") or "haiku"
+PLAN_SUMMARY_SYS = ("You write the entry for a finished plan in a developer's plan history. You "
+                    "get the plan's steps and the transcript of the work. Reply with one or two "
+                    "plain-text sentences saying what was done and how it ended: no preamble, no "
+                    "markdown, no quotes. Write in the language the user writes in.")
+PLAN_HIST_MAX = 200          # entries kept per session
 # turn-complete verbs — the CLI's curated past-tense set (independent of the live
 # spinner's present-participle word); one is stamped onto each finished turn.
 DONE_PAST = ["Baked", "Brewed", "Churned", "Cogitated", "Cooked", "Crunched", "Sautéed", "Worked"]
@@ -618,6 +626,7 @@ def trash_transcript(cc):
 
 
 NAMES_FILE = os.path.join(HOME, ".claude", "console-names.json")
+PLANS_FILE = os.path.join(HOME, ".claude", "console-plans.json")   # {claude_session_id: [plan entries]}
 _names_cache = {"mtime": -1.0, "v": {}}
 
 def load_names():
@@ -716,6 +725,37 @@ def save_pref(cc, mode=None, model=None, effort=None, fav=None):
             json.dump(prefs, f, ensure_ascii=False)
         os.replace(tmp, PREFS_FILE)
         _prefs_cache["mtime"] = -1.0
+    except Exception:
+        pass
+
+
+def load_plans(cc):
+    """The plan history saved for one Claude session (see ChatSession._track_plan)."""
+    try:
+        with open(PLANS_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        v = d.get(cc) if isinstance(d, dict) else None
+        return [x for x in v if isinstance(x, dict)] if isinstance(v, list) else []
+    except Exception:
+        return []
+
+
+def save_plans(cc, items):
+    if not _valid_cc(cc):
+        return
+    try:
+        try:
+            with open(PLANS_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+            if not isinstance(d, dict):
+                d = {}
+        except Exception:
+            d = {}
+        d[cc] = list(items)[-PLAN_HIST_MAX:]
+        tmp = PLANS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, PLANS_FILE)
     except Exception:
         pass
 
@@ -2246,6 +2286,8 @@ class ChatSession:
         self.bg_tasks = {}        # live run_in_background tasks: task_id -> {desc, tool_use_id}
         # the plan, folded out of TaskCreate/TaskUpdate tool traffic (see _fold_tasks)
         self.tasks = {}           # task id -> {subject, description, activeForm, status}
+        self.plan_hist = []       # this session's plans, oldest first (see _track_plan)
+        self._plan_hist_loaded = False
         self._task_open = {}      # TaskCreate tool_use id -> the task, until a result names it
         self._task_seq = 0        # creation ordinal; the fallback id if that text ever changes
         self._since_plan = 0      # tool calls since the plan was last touched (PostToolUse nudge)
@@ -3145,6 +3187,118 @@ class ChatSession:
                 changed = True
         return changed
 
+    # ───────── plan history ─────────
+    def _load_plan_hist(self):
+        """Merge what the file holds for this Claude session under what this run has
+        recorded so far. Waits for the session id, which a fresh session reports
+        only once its first turn starts."""
+        if self._plan_hist_loaded or not self.cc_id:
+            return
+        self._plan_hist_loaded = True
+        saved = load_plans(self.cc_id)
+        seen = {r.get("id") for r in saved}
+        self.plan_hist = saved + [r for r in self.plan_hist if r.get("id") not in seen]
+
+    def _save_plan_hist(self):
+        if self.cc_id:
+            self._load_plan_hist()
+            save_plans(self.cc_id, [self._plan_item(r) for r in self.plan_hist])
+
+    @staticmethod
+    def _plan_item(rec):
+        return {k: v for k, v in rec.items() if not k.startswith("_")}
+
+    def plan_hist_items(self):
+        self._load_plan_hist()
+        return [self._plan_item(r) for r in self.plan_hist]
+
+    def _track_plan(self, evs):
+        """Keep the plan history in step with the plan the dock shows. Every plan call
+        replaces the whole list, so a snapshot is matched against the newest entry:
+        an unfinished entry absorbs it (renamed or added steps included); a finished
+        entry with the same steps is either left alone (a repeated call) or reopened;
+        anything else starts a new entry. An entry closes when every step is
+        completed, and its summary is written then."""
+        ts = self.plan_tasks()
+        if not ts:
+            return
+        self._load_plan_hist()
+        steps = [{"subject": t.get("subject") or t.get("activeForm") or ("task #%s" % t.get("id")),
+                  "status": t.get("status") or "pending"} for t in ts]
+        all_done = all(s["status"] == "completed" for s in steps)
+        cur = self.plan_hist[-1] if self.plan_hist else None
+        same = bool(cur) and ([s.get("subject") for s in cur.get("steps") or []]
+                              == [s["subject"] for s in steps])
+        if cur and not cur.get("finished"):
+            rec = cur
+        elif same and all_done:
+            return
+        elif same:
+            rec = cur
+            rec["finished"] = None
+            rec["summary"] = None
+        else:
+            now = time.time()
+            rec = {"id": "p%d" % int(now * 1000), "steps": steps, "started": now,
+                   "finished": None, "summary": None, "seq": self.event_seq}
+            self.plan_hist.append(rec)
+            del self.plan_hist[:-PLAN_HIST_MAX]
+        rec["steps"] = steps
+        if all_done and not rec.get("finished"):
+            rec["finished"] = time.time()
+            tornado.ioloop.IOLoop.current().spawn_callback(self._summarize_plan, rec)
+        self._save_plan_hist()
+        evs.append({"kind": "plan_hist_item", "item": self._plan_item(rec)})
+
+    async def _summarize_plan(self, rec):
+        """The history entry for a finished plan: an isolated single-turn call to a
+        cheap model, as for the recap. A failure leaves the summary empty rather
+        than pending, so the panel can say so."""
+        if rec.get("summary") or rec.get("_busy") or not HAVE_SDK:
+            return
+        rec["_busy"] = True
+        text = ""
+        try:
+            lines, start = [], int(rec.get("seq") or 0)
+            for e in self.log:
+                if int(e.get("_seq") or 0) <= start:
+                    continue
+                k, t = e.get("kind"), (e.get("text") or "").strip()
+                if k == "user_text" and t:
+                    lines.append("User: " + t)
+                elif k == "assistant_text" and t:
+                    lines.append("Assistant: " + t)
+                elif k == "tool_use":
+                    lines.append("[tool: %s]" % (e.get("tool") or "?"))
+            steps = "\n".join("- [%s] %s" % (x.get("status"), x.get("subject"))
+                              for x in rec.get("steps") or [])
+            cwd = os.path.join(HOME, ".cache", "claude-console-recap")   # pruned with the recaps
+            os.makedirs(cwd, exist_ok=True)
+            opts = ClaudeAgentOptions(
+                model=PLAN_SUMMARY_MODEL, cwd=cwd, cli_path=CLAUDE_BIN,
+                system_prompt=PLAN_SUMMARY_SYS, allowed_tools=[], max_turns=1,
+                max_buffer_size=MAX_BUFFER, setting_sources=[])
+            prompt = ("Plan steps:\n" + steps + "\n\nTranscript of the work:\n"
+                      + "\n".join(lines)[-6000:] + "\n\nEntry:")
+            chunks = []
+            async def _run():
+                async for m in query(prompt=prompt, options=opts):
+                    if isinstance(m, AssistantMessage):
+                        for b in m.content:
+                            if isinstance(b, TextBlock):
+                                chunks.append(b.text)
+            await asyncio.wait_for(_run(), 45)
+            text = " ".join(" ".join(chunks).split())
+        except Exception:
+            text = ""
+        finally:
+            rec.pop("_busy", None)
+        if self.ended:
+            return
+        rec["summary"] = _cap(text, 600) if text else ""
+        self._save_plan_hist()
+        self._push([{"kind": "plan_hist_item", "item": self._plan_item(rec)}])
+
     def plan_tasks(self):
         """The task list on the wire, in the CLI's own order (its ids count up)."""
         def key(kv):
@@ -3159,6 +3313,7 @@ class ChatSession:
         # replayed history converges on the same plan the live viewers are showing
         if self._fold_tasks(evs):
             evs = list(evs) + [{"kind": "plan", "tasks": self.plan_tasks()}]
+            self._track_plan(evs)
         for ev in evs:
             self.event_seq += 1
             ev["_seq"] = self.event_seq
@@ -3290,7 +3445,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "busy": sess.busy, "ended": sess.ended, "events": events,
                        "events_delta": events_delta, "event_seq": sess.event_seq,
                        "turn_age": sess.turn_age(), "word": sess.turn_word, "effort": sess.effort,
-                       "compacting": sess.compacting, "tasks": sess.plan_tasks()})
+                       "compacting": sess.compacting, "tasks": sess.plan_tasks(), "plan_hist": sess.plan_hist_items()})
             # returning to an idle session that's been quiet a while → recap it now
             # (the periodic sweep may not have ticked yet); guarded against busy/dup
             if (RECAP_ENABLED and not sess.busy and not sess.ended and not sess.compacting
@@ -3334,7 +3489,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "model": sess.model or "default", "mode": sess.mode,
                        "busy": sess.busy, "ended": sess.ended, "events": sess.log,
                        "turn_age": sess.turn_age(), "word": sess.turn_word, "effort": sess.effort,
-                       "compacting": sess.compacting, "resumed": True, "tasks": sess.plan_tasks(),
+                       "compacting": sess.compacting, "resumed": True, "tasks": sess.plan_tasks(), "plan_hist": sess.plan_hist_items(),
                        "events_delta": False, "event_seq": sess.event_seq})
         elif mt == "detach":
             # closing the last tab stops the VIEW, never the session: drop this
@@ -3619,10 +3774,12 @@ header input#cwd{flex:1;min-width:120px;display:none}
   justify-content:center;border:0;background:none;color:var(--mut);cursor:pointer;
   border-radius:5px;font-size:11px;line-height:1}
 .plan .ptoggle:hover{color:var(--acc);background:var(--bg3)}
-.plan .pdismiss{flex:none;height:22px;padding:0 8px;border:1px solid var(--line);
+.plan .pdismiss,.plan .phbtn{flex:none;height:22px;padding:0 8px;border:1px solid var(--line);
   background:none;color:var(--mut);cursor:pointer;border-radius:5px;
   font-family:var(--fmono);font-size:11px;line-height:1}
-.plan .pdismiss:hover{color:var(--add);border-color:var(--add)}
+.plan .pdismiss{color:var(--add);border-color:color-mix(in srgb,var(--add) 60%,transparent)}
+.plan .pdismiss:hover{background:var(--okbg);border-color:var(--add)}
+.plan .phbtn:hover{color:var(--acc);border-color:var(--acc)}
 .plan .psteps{display:flex;flex-direction:column;border-top:1px solid var(--line)}
 .plan .pst{display:grid;grid-template-columns:18px 1fr;gap:6px;align-items:start;
   padding:5px 10px;font-size:13px;line-height:1.35}
@@ -3902,6 +4059,14 @@ pre code{background:none;border:none;padding:0}
 .cells.lv-o{color:var(--mo)}.cells.lv-r{color:var(--mr)}
 .cells .cell.on{background:currentColor;border-color:currentColor;box-shadow:0 0 4px currentColor}
 @media(max-width:680px){.usage{display:none!important}}
+/* header pill: the plan history, reachable when the dock is not showing */
+.hpill{display:inline-flex;align-items:center;gap:5px;height:24px;padding:0 9px;border:1px solid var(--line);
+  border-radius:12px;background:var(--bg3);color:var(--fg);font-family:var(--fmono);font-size:12px;
+  cursor:pointer;white-space:nowrap;flex:none;margin-left:auto}
+.hpill:hover{border-color:var(--acc);color:var(--acc)}
+.hpill[hidden]{display:none}
+.hpill span:not(:empty)::before{content:'· '}
+.hpill span{color:var(--mut)}
 #shell{flex:1;display:flex;min-height:0;position:relative}
 #mainCol{flex:1;display:flex;flex-direction:column;min-width:0}
 /* Session tabs — the working set of THIS browser, not the list of what is running.
@@ -4127,11 +4292,37 @@ pre code{background:none;border:none;padding:0}
 #fimppanel{width:min(620px,100%);max-height:70vh;display:flex;flex-direction:column;
   background:var(--bg2);border:1px solid var(--line);border-radius:10px;
   box-shadow:0 18px 60px rgba(0,0,0,.5);overflow:hidden}
-#fimp .fh,#pman .fh{display:flex;gap:10px;align-items:baseline;padding:10px 12px;
+/* plan history: the session's plans, newest first, each with its summary */
+#phist{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.55);
+  display:flex;justify-content:center;align-items:flex-start;padding:9vh 16px 16px}
+#phist[hidden]{display:none}
+#phistpanel{width:min(680px,100%);max-height:78vh;display:flex;flex-direction:column;
+  background:var(--bg2);border:1px solid var(--line);border-radius:10px;
+  box-shadow:0 18px 60px rgba(0,0,0,.5);overflow:hidden}
+#phistlist{overflow:auto;padding:4px 10px 8px;min-height:0}
+#phistlist .empty{padding:18px 10px;color:var(--mut);text-align:center}
+.phi{border:1px solid var(--line);border-radius:8px;background:var(--bg);margin:6px 0;overflow:hidden}
+.phi .phh{display:flex;gap:8px;align-items:center;padding:7px 10px;cursor:pointer;user-select:none}
+.phi .phh:hover{background:var(--bg3)}
+.phi .phmark{font-family:var(--fmono);color:var(--tool);flex:none}
+.phi.done .phmark{color:var(--add)}
+.phi .pht{flex:1;min-width:0;font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.phi .phm{flex:none;color:var(--mut);font-family:var(--fmono);font-size:11px;white-space:nowrap}
+.phi .phs{padding:0 10px 8px;font-size:13px;line-height:1.45;color:var(--fg);overflow-wrap:anywhere}
+.phi .phs.mut{color:var(--mut);font-style:italic}
+.phi .phsteps{border-top:1px solid var(--line);padding:3px 0}
+.phi .phsteps[hidden]{display:none}
+.phi .pst{display:grid;grid-template-columns:18px 1fr;gap:6px;align-items:start;padding:4px 10px;font-size:12.5px;line-height:1.35}
+.phi .pi{font-family:var(--fmono);color:var(--mut);text-align:center}
+.phi .psub{color:var(--fg);min-width:0;overflow-wrap:anywhere}
+.phi .pst.done .pi{color:var(--add)}
+.phi .pst.done .psub{color:var(--mut);text-decoration:line-through}
+.phi .pst.active .pi{color:var(--tool)}
+#fimp .fh,#pman .fh,#phist .fh{display:flex;gap:10px;align-items:baseline;padding:10px 12px;
   border-bottom:1px solid var(--line)}
 #fimp .fh .ft{flex:1;font-size:13px;font-weight:600;color:var(--fg)}
-#pman .fh .ft{flex:none;font-size:13px;font-weight:600;color:var(--fg);white-space:nowrap}
-#pman .fh .btn{align-self:center}
+#pman .fh .ft,#phist .fh .ft{flex:none;font-size:13px;font-weight:600;color:var(--fg);white-space:nowrap}
+#pman .fh .btn,#phist .fh .btn{align-self:center}
 #fimpq{width:100%;background:var(--bg3);color:var(--fg);border:1px solid var(--line);
   border-radius:6px;padding:9px 11px;font-size:13px;font-family:var(--fmono);outline:none}
 #fimpq:focus{border-color:var(--acc)}
@@ -4139,11 +4330,11 @@ pre code{background:none;border:none;padding:0}
 #fimpac{flex:1;min-height:0;overflow:auto;border:1px solid var(--line);border-radius:6px;background:var(--bg)}
 #fimpmsg{font-size:11.5px;color:var(--mut);min-height:1em}
 #fimpmsg.bad{color:var(--delfg)}
-#fimp .fbtns,#pman .fbtns{display:flex;gap:8px;justify-content:flex-end;padding:10px}
-#pman .fbtns{border-top:1px solid var(--line)}
-#fimp .fbtns button,#pman .fbtns button{padding:7px 14px;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer}
+#fimp .fbtns,#pman .fbtns,#phist .fbtns{display:flex;gap:8px;justify-content:flex-end;padding:10px}
+#pman .fbtns,#phist .fbtns{border-top:1px solid var(--line)}
+#fimp .fbtns button,#pman .fbtns button,#phist .fbtns button{padding:7px 14px;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer}
 #fimp .fadd{background:var(--acc);color:var(--onacc);border:none}
-#fimp .fcancel,#pman .fcancel{background:var(--bg3);color:var(--fg);border:1px solid var(--line)}
+#fimp .fcancel,#pman .fcancel,#phist .fcancel{background:var(--bg3);color:var(--fg);border:1px solid var(--line)}
 .improw{display:flex;gap:5px}
 .improw button{flex:1;min-width:0}
 #fimpbtn{background:var(--bg3);color:var(--fg);border:1px solid var(--line);
@@ -4209,6 +4400,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
   <span class="curname" id="curname">— no session —</span>
   <span class="ctx" id="ctx" title="context-window usage"></span>
   <span class="usage" id="usage" title="usage limits (5h / 7d)"></span>
+  <button class="hpill" id="planhistpill" hidden title="The plans of this session, each with a summary">☑ plans<span id="planhistN"></span></button>
 </header>
 
 <div id="shell">
@@ -4323,6 +4515,14 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
     <div id="pmanlist"></div>
     <div class="fbtns"><button class="fcancel" id="pmanclose">Close</button>
       <button id="pmandel" disabled>🗑 Delete selected</button></div>
+  </div>
+</div>
+<div id="phist" hidden>
+  <div id="phistpanel">
+    <div class="fh"><span class="ft">☑ Plan history</span><span id="phistsub" class="pmsub"></span>
+      <button class="btn" id="phistx" title="close">✕</button></div>
+    <div id="phistlist"></div>
+    <div class="fbtns"><button class="fcancel" id="phistclose">Close</button></div>
   </div>
 </div>
 <div id="fimp" hidden>
@@ -4643,6 +4843,7 @@ function renderPlan(){
     (planAllDone(planTasks)
       ?'<button type="button" class="pdismiss" title="Mark this finished plan read and hide it">read</button>'
       :'')+
+    '<button type="button" class="phbtn" title="The plans of this session, each with a summary">history</button>'+
     '<button type="button" class="ptoggle" aria-expanded="'+(!planCollapsed)+'" title="'+
     (planCollapsed?'Expand plan':'Collapse plan')+'">'+(planCollapsed?'▼':'▲')+'</button></div>';
   if(shown.length){h+='<div class="psteps">';
@@ -4654,7 +4855,8 @@ function renderPlan(){
   else h+='<div class="pempty">no active task</div>';
   host.innerHTML=h+'</div>';host.hidden=false;
   const tg=host.querySelector('.ptoggle');if(tg)tg.onclick=togglePlan;
-  const dz=host.querySelector('.pdismiss');if(dz)dz.onclick=dismissPlan;}
+  const dz=host.querySelector('.pdismiss');if(dz)dz.onclick=dismissPlan;
+  const hb=host.querySelector('.phbtn');if(hb)hb.onclick=openPlanHist;}
 function togglePlan(){planCollapsed=!planCollapsed;
   const t=tabById(sid);if(t){t.planCollapsed=planCollapsed;persistTabs();}renderPlan();}
 /* A finished plan retires when you say so, not on a timer. The timer version hid
@@ -4674,6 +4876,34 @@ function setPlan(ts){planTasks=Array.isArray(ts)?ts:[];
   renderPlan();}
 function clearPlan(){
   planTasks=[];planCollapsed=false;const h=$('#planDock');if(h){h.hidden=true;h.innerHTML='';}}
+/* Plan history: every plan this session has run, newest first, with the summary the
+   server writes once a plan is finished. The attach reply carries the whole list;
+   plan_hist_item events keep it current (and replay harmlessly, keyed by id). */
+let planHist=[];
+function planHistUpsert(it){if(!it||!it.id)return;const i=planHist.findIndex(x=>x.id===it.id);
+  if(i>=0)planHist[i]=it;else planHist.push(it);renderPlanHistPill();if(phistOpened())renderPlanHist();}
+function phistOpened(){return !$('#phist').hasAttribute('hidden');}
+function renderPlanHistPill(){const p=$('#planhistpill');if(!p)return;
+  p.hidden=!sid;$('#planhistN').textContent=planHist.length?String(planHist.length):'';}
+function openPlanHist(){renderPlanHist();$('#phist').removeAttribute('hidden');}
+function closePlanHist(){$('#phist').setAttribute('hidden','');}
+function phWhen(sec){if(!sec)return '';const d=new Date(sec*1000),p=n=>String(n).padStart(2,'0');
+  return p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());}
+function phDur(s){s=Math.max(0,Math.round(s||0));return s<60?s+'s':s<3600?Math.round(s/60)+'m':(s/3600).toFixed(1)+'h';}
+function renderPlanHist(){const host=$('#phistlist');if(!host)return;
+  const items=planHist.slice().sort((a,b)=>(b.started||0)-(a.started||0));
+  $('#phistsub').textContent=items.length?(items.length+' plan'+(items.length===1?'':'s')+' · '+($('#curname').textContent||'')):'';
+  if(!items.length){host.innerHTML='<div class="empty">no plans in this session yet</div>';return;}
+  host.innerHTML=items.map(it=>{const st=it.steps||[],done=st.filter(s=>s.status==='completed').length,fin=!!it.finished;
+    const title=(st[0]&&st[0].subject)||'plan';
+    const sum=it.summary?esc(it.summary):(it.summary===''?'no summary':(fin?'summarizing…':'in progress'));
+    return '<div class="phi'+(fin?' done':'')+'" data-id="'+escAttr(it.id)+'"><div class="phh">'+
+      '<span class="phmark">'+(fin?'●':'◐')+'</span><span class="pht">'+esc(title)+'</span>'+
+      '<span class="phm">'+done+'/'+st.length+' · '+phWhen(it.started)+(fin?' · '+phDur(it.finished-it.started):' · open')+'</span></div>'+
+      '<div class="phs'+(it.summary?'':' mut')+'">'+sum+'</div>'+
+      '<div class="phsteps" hidden>'+st.map(s=>{const mk=planMark(s.status);
+        return '<div class="pst '+mk[0]+'"><span class="pi">'+mk[1]+'</span><span class="psub">'+esc(s.subject||'')+'</span></div>';}).join('')+'</div></div>';}).join('');
+  host.querySelectorAll('.phi .phh').forEach(h=>{h.onclick=()=>{const st=h.parentElement.querySelector('.phsteps');st.hidden=!st.hidden;};});}
 /* turn-complete footer line — ✻ {past verb} for {N}s · {YYYY-MM-DD HH:MM:SS} UTC (server-stamped) */
 function utcStamp(sec){const d=new Date(sec*1000),p=n=>String(n).padStart(2,'0');
   return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+
@@ -4873,7 +5103,7 @@ function fmtSecs(ms){const s=Math.max(0,Math.round(ms/1000));if(s<60)return s+'s
 function doInterrupt(){if(!running)return;wsSend({type:'interrupt'});addNotice('⏹ interrupt sent');}
 function clearUI(){stream.innerHTML='';$('#edits').innerHTML='<div class="empty">no file changes yet</div>';
   $('#gitc').innerHTML='<div class="empty">—</div>';tools={};editCount=0;updateEditBadge();renderCtx(null);ready=false;
-  queued={};renderQueue();stopThinking();clearPlan();trimHidden=0;
+  queued={};renderQueue();stopThinking();clearPlan();planHist=[];renderPlanHistPill();trimHidden=0;
   endStream();}   /* also cancels a pending frame, which would else refill the cleared stream */
 
 /* file edits → out of chat, into the Changes drawer */
@@ -4994,6 +5224,7 @@ function route(ev){
   else if(ev.kind==='agent_done')agentDone(ev);
   else if(ev.kind==='effort')setEffortPill(ev.effort);
   else if(ev.kind==='plan')setPlan(ev.tasks);
+  else if(ev.kind==='plan_hist_item')planHistUpsert(ev.item);
   if(!replaying&&stream.children.length>CHAT_KEEP_ITEMS+120)trimChatWindow();
 }
 
@@ -5017,6 +5248,7 @@ function onMsg(e){const m=JSON.parse(e.data);
     const tab=ensureTab(m,true);if(tab&&!incremental)planCollapsed=!!tab.planCollapsed;
     replaying=true;m.events.forEach(route);replaying=false;
     setPlan(m.tasks);   /* authoritative: the log window may predate the plan */
+    planHist=Array.isArray(m.plan_hist)?m.plan_hist:[];renderPlanHistPill();if(phistOpened())renderPlanHist();
     trimChatWindow();
     compacting=!!m.compacting;setBusy(!!m.busy,m.word,(m.turn_age||0)*1000);loadDraft(sid);
     if(m.ended){markEnded('— this session has ended (history shown · you can resume it from disk) —');}
@@ -5030,7 +5262,7 @@ function onMsg(e){const m=JSON.parse(e.data);
     else{scroll();requestAnimationFrame(scroll);}
     reqList();loadTree();}
   else if(m.type==='detached'){if(!sid){ready=false;ta.disabled=true;sendBtn.disabled=true;attachOff(true);statset('idle');}}
-  else if(m.type==='no_session'){localStorage.removeItem(SKEY);sid=null;restoredViewId='';ready=false;setBusy(false);setCurname('');renderCtx(null);statset('idle');
+  else if(m.type==='no_session'){localStorage.removeItem(SKEY);sid=null;renderPlanHistPill();restoredViewId='';ready=false;setBusy(false);setCurname('');renderCtx(null);statset('idle');
     if(m.id)dropTab(m.id);
     addNotice('that session is no longer running — pick it under “Resume from disk”, or ＋ New.');reqList();loadTree();}
   else if(m.type==='events')m.events.forEach(route);
@@ -5438,6 +5670,8 @@ function pmanDelete(){
   pmanClose();}
 
 $('#pmanx').onclick=pmanClose;
+$('#phistx').onclick=closePlanHist;$('#phistclose').onclick=closePlanHist;$('#planhistpill').onclick=openPlanHist;
+$('#phist').onclick=e=>{if(e.target.id==='phist')closePlanHist();};   /* backdrop */
 $('#pmanclose').onclick=pmanClose;
 $('#pmandel').onclick=pmanDelete;
 $('#pmanall').onclick=pmanToggleAll;
@@ -5576,6 +5810,7 @@ function wireSearch(){
     if((e.ctrlKey||e.metaKey)&&(e.key==='k'||e.key==='K')){e.preventDefault();
       srchOpen()?closeSearch():openSearch();return;}
     if(e.key==='Escape'&&srchOpen()){e.preventDefault();e.stopPropagation();closeSearch();}
+    if(e.key==='Escape'&&phistOpened()){e.preventDefault();e.stopPropagation();closePlanHist();}
   },true);   /* capture: close the palette before Esc reaches the interrupt handler */
 }
 function impMsg(t,bad){const el=$('#impmsg');if(!el)return;
@@ -5783,7 +6018,7 @@ function stashView(id){
   endStream();trimChatWindow();rememberTabView();
   viewCache.set(id,{stream:takeChildren(stream),plan:takeChildren($('#planDock')),
     planHidden:$('#planDock').hidden,edits:takeChildren($('#edits')),git:takeChildren($('#gitc')),
-    tools:tools,editCount:editCount,queued:queued,planTasks:planTasks,planCollapsed:planCollapsed,
+    tools:tools,editCount:editCount,queued:queued,planTasks:planTasks,planCollapsed:planCollapsed,planHist:planHist,
     trimHidden:trimHidden,ctx:curCtx,cwd:cwd,cc:curCC,ready:ready,running:running,
     compacting:compacting,word:lastWordSeed,elapsed:running?Math.max(0,Date.now()-thinkStart):0,
     tokUp:tokUp,tokOut:tokOut,tokShow:tokShow,effort:curEffort,model:curModel,modelOnce:modelOnce,
@@ -5795,7 +6030,7 @@ function restoreView(id){
   restoreChildren($('#planDock'),v.plan);$('#planDock').hidden=!!v.planHidden;
   restoreChildren($('#edits'),v.edits);restoreChildren($('#gitc'),v.git);
   tools=v.tools||{};editCount=v.editCount||0;queued=v.queued||{};
-  planTasks=v.planTasks||[];planCollapsed=!!v.planCollapsed;trimHidden=Number(v.trimHidden||0);
+  planTasks=v.planTasks||[];planCollapsed=!!v.planCollapsed;planHist=v.planHist||[];renderPlanHistPill();trimHidden=Number(v.trimHidden||0);
   cwd=v.cwd||'';curCC=v.cc||null;compacting=!!v.compacting;
   tokUp=v.tokUp||0;tokOut=v.tokOut||0;tokShow=!!v.tokShow;
   ready=!!v.ready;                       /* before setBusy: it gates the composer on it */
@@ -6255,7 +6490,7 @@ $('#filePick').onchange=e=>{takeFiles(e.target.files);e.target.value='';};
 sendBtn.onclick=sendMsg;
 $('#stop').onclick=doInterrupt;
 document.addEventListener('keydown',e=>{
-  if(e.key==='Escape'&&running&&!srchOpen()&&!$('#cwdac').classList.contains('on')){e.preventDefault();doInterrupt();}});
+  if(e.key==='Escape'&&running&&!srchOpen()&&!phistOpened()&&!$('#cwdac').classList.contains('on')){e.preventDefault();doInterrupt();}});
 $('#newbtn').onclick=newSession;
 /* color theme: apply + persist (the <head> script already set it pre-paint) */
 function applyTheme(t){if(t&&t!=='dark')document.documentElement.setAttribute('data-theme',t);

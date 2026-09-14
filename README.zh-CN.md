@@ -44,8 +44,12 @@
   收在那一张卡片里，默认折叠，卡片头显示它的工具调用次数和 token 用量；它交回的报告就是
   这张卡片的结果。
 - **Plan 悬停区** —— 钉在对话上方的任务列表，显示当前步骤、进度计数，并可折叠到只剩
-  当前任务；最后一步完成几秒后自行退场。背后的工具由控制台提供给 session，并提醒模型
-  随时更新。
+  当前任务；完成的计划一直停留，按 `read` 才收起。背后的工具由控制台提供给 session，
+  并提醒模型随时更新。
+- **Plan 历史** —— 悬停区的 `history` 按钮或右上角的 `☑ plans` 药丸列出本 session 的全部
+  计划，最新在前，每条带
+  步骤、开始时间、用时，以及计划完成时由一个廉价模型写的一两句摘要。列表按 session
+  保存，恢复 session 后仍在。
 - **LaTeX 渲染** —— 回复中的 `$…$`、`$$…$$`、`\(…\)`、`\[…\]` 由 KaTeX 渲染
   （已内置，离线可用）。
 - **可点击的文件路径** —— 回复里的路径（`~/work/lattice-qmc/observables.py`）
@@ -162,6 +166,7 @@ python claude_console.py
 | `CLAUDE_CONSOLE_RECAP` | `1` | 回到闲置已久的 session 时先给一段摘要 |
 | `CLAUDE_CONSOLE_RECAP_IDLE_SEC` | `300` | 闲置多少秒后需要摘要 |
 | `CLAUDE_CONSOLE_RECAP_MODEL` | `haiku` | 撰写摘要的模型 |
+| `CLAUDE_CONSOLE_PLAN_SUMMARY_MODEL` | `haiku` | 撰写 Plan 历史摘要的模型 |
 | `CLAUDE_CONSOLE_MAX_BUFFER_MB` | `64` | 单条 CLI 消息的上限 |
 | `CLAUDE_CONSOLE_IMPORT_MAX_MB` | `1024` | 导入 transcript 的大小上限 |
 | `CLAUDE_CONSOLE_TRANSCRIBE` | `0` | 启用本地语音输入 |
