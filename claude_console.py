@@ -5011,8 +5011,22 @@ function setPlan(ts){planTasks=Array.isArray(ts)?ts:[];
      the list too, not just the dock: keeping it would let the next renderPlan
      (folding it, restoring the tab) bring the finished thing back. */
   if(planAllDone(planTasks)&&planDismissed(planTasks)){clearPlan();return;}
-  renderPlan();}
-function clearPlan(){
+  /* work in progress cancels the read mark: a plan that finishes again is seen again */
+  if(planTasks.length&&!planAllDone(planTasks)){const t=tabById(sid);if(t&&t.planSeen){t.planSeen='';persistTabs();}}
+  renderPlan();schedulePlanRead();}
+/* A finished plan marks itself read after a moment; the button is for sooner. The
+   mark is what keeps it from coming back on a switch or a reload, so a plan is
+   seen to finish once and then stays out of the way. Re-checked when the timer
+   fires: the session may have been switched, or new work may have reopened it. */
+let planReadT=0;
+const PLAN_READ_MS=2000;
+function schedulePlanRead(){
+  if(planReadT){clearTimeout(planReadT);planReadT=0;}
+  if(!planAllDone(planTasks))return;
+  const owner=sid,sig=planSig(planTasks);
+  planReadT=setTimeout(()=>{planReadT=0;
+    if(sid===owner&&planAllDone(planTasks)&&planSig(planTasks)===sig)dismissPlan();},PLAN_READ_MS);}
+function clearPlan(){if(planReadT){clearTimeout(planReadT);planReadT=0;}
   planTasks=[];planCollapsed=false;const h=$('#planDock');if(h){h.hidden=true;h.innerHTML='';}}
 /* Plan history: every plan this session has run, newest first, with the summary the
    server writes once a plan is finished. The attach reply carries the whole list;

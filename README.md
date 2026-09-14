@@ -50,9 +50,11 @@ which is the whole point.
   collapsed, with its tool-call count and token usage in the header; the report
   it returns is the card's result.
 - **Plan dock** — a task list pinned above the chat with the current step, a
-  progress count, and a fold to just the active task. A finished plan stays
-  until its `read` button is pressed. The console supplies the tool behind it
-  to the session and reminds the model to keep it current.
+  progress count, and a fold to just the active task. A finished plan retires
+  two seconds after its last step, or at once with its `read` button, and a
+  plan once retired does not come back on a switch or a reload. The console
+  supplies the tool behind it to the session and reminds the model to keep it
+  current.
 - **Plan history** — the dock's `history` button, or the `☑ plans` pill at the
   top right, lists every plan of the session, newest first, with its steps, start time, duration and a one- or
   two-sentence summary written by a cheap model once the turn that finished the
