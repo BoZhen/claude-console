@@ -4079,8 +4079,10 @@ pre code{background:none;border:none;padding:0}
 #sessionTabs[hidden]{display:none}
 .stab{position:relative;display:flex;align-items:center;gap:6px;padding:0 5px 0 10px;
   max-width:210px;min-width:0;border-right:1px solid var(--line);color:var(--mut);
-  font-size:12.5px;cursor:pointer;white-space:nowrap;user-select:none}
+  font-size:12.5px;cursor:pointer;white-space:nowrap;user-select:none;touch-action:none}
 .stab:hover{background:var(--bg3);color:var(--fg)}
+.stab.dragging{opacity:.6;background:var(--bg3);color:var(--fg);box-shadow:inset 0 0 0 1px var(--acc)}
+body.tabdrag,body.tabdrag .stab{cursor:grabbing}
 .stab.active{background:var(--bg);color:var(--fg)}
 .stab.active::after{content:"";position:absolute;left:0;right:0;bottom:0;height:2px;background:var(--acc)}
 .stab:focus-visible{outline:2px solid var(--acc);outline-offset:-2px}
@@ -5928,6 +5930,11 @@ function persistTabs(){try{localStorage.setItem(TABKEY,JSON.stringify(tabState.m
     planSeen:t.planSeen||''}))));}catch(e){}}
 function renderTabs(){
   const host=$('#sessionTabs');if(!host)return;
+  if(tabDrag){tabsRerender=true;return;}   /* rebuilt once the pointer lets go */
+  /* a rebuild replaces the tab that has keyboard focus (a click gives it focus, then
+     switching or the 8 s poll rebuilds the strip), so the focus is put back on the
+     same tab and the arrow keys keep working from where you clicked */
+  const fe=document.activeElement,keep=host.contains(fe)?(fe.closest('.stab')||{}).dataset.tid||sid:null;
   /* before the first session list lands we cannot tell which stored tabs are still
      real, so an unvalidated strip with nothing open stays out of the way */
   host.hidden=!tabState.length||(!tabsValidated&&!sid);
@@ -5937,16 +5944,16 @@ function renderTabs(){
     el.className='stab'+(t.id===sid?' active':'')+(t.busy?' busy':'')+
       (t.unread&&t.id!==sid?' unread':'')+(t.ended?' ended':'');
     el.setAttribute('role','tab');el.setAttribute('aria-selected',t.id===sid?'true':'false');
-    el.tabIndex=t.id===sid?0:-1;
+    el.tabIndex=t.id===sid?0:-1;el.dataset.tid=t.id;
     el.title=tabLabel(t)+(t.cwd?'\n'+shortPath(t.cwd):'')+(t.ended?'\nended':'');
     el.innerHTML='<span class="sdot"></span><span class="stt"></span>'+
       '<span class="sx" role="button" tabindex="-1" aria-label="Close tab" '+
       'title="Close tab — the session keeps running">✕</span>';
     el.querySelector('.stt').textContent=tabLabel(t);
-    el.onclick=ev=>{if(!ev.target.classList.contains('sx'))switchSession(t.id);};
+    el.onclick=ev=>{if(!ev.target.classList.contains('sx')&&Date.now()>=tabClickBlock)switchSession(t.id);};
     el.querySelector('.sx').onclick=ev=>{ev.stopPropagation();closeTab(t.id);};
     el.onauxclick=ev=>{if(ev.button===1){ev.preventDefault();closeTab(t.id);}};
-    el.onkeydown=tabKeydown;
+    el.onkeydown=tabKeydown;el.onpointerdown=tabPointerDown;
     host.appendChild(el);});
   /* keep the active tab inside the strip by moving the strip's own scroller only.
      scrollIntoView would also scroll every ancestor, and this runs on each 8 s session
@@ -5954,7 +5961,57 @@ function renderTabs(){
   const act=host.querySelector('.stab.active');
   if(act){const a=act.getBoundingClientRect(),r=host.getBoundingClientRect();
     if(a.left<r.left)host.scrollLeft+=a.left-r.left;
-    else if(a.right>r.right)host.scrollLeft+=a.right-r.right;}}
+    else if(a.right>r.right)host.scrollLeft+=a.right-r.right;}
+  if(keep){const f=[...host.querySelectorAll('.stab')].find(x=>x.dataset.tid===keep)||act;
+    if(f)f.focus({preventScroll:true});}}
+/* Drag a tab to reorder the strip. Pointer events cover mouse and touch: a mouse
+   drag starts after 6px of travel; a touch has to hold still for 300ms first, and
+   a touch that moves before that scrolls the strip (touch-action is none on a tab,
+   so the strip's own panning is done here). The drop order is the new tabState
+   order, saved with the tabs. renderTabs waits while a drag is in flight. */
+let tabDrag=null,tabsRerender=false,tabClickBlock=0;
+const TAB_HOLD_MS=300,TAB_DRAG_PX=6;
+function tabPointerDown(ev){
+  if((ev.pointerType==='mouse'&&ev.button!==0)||ev.target.classList.contains('sx')||tabDrag)return;
+  const el=ev.currentTarget,host=$('#sessionTabs');
+  const d=tabDrag={el,pid:ev.pointerId,x0:ev.clientX,x:ev.clientX,sl0:host.scrollLeft,
+    mode:'idle',touch:ev.pointerType==='touch',hold:0,raf:0};
+  if(d.touch)d.hold=setTimeout(()=>{if(tabDrag===d&&d.mode==='idle')tabDragStart(d);},TAB_HOLD_MS);
+  /* listeners on the document: the pointer leaves the tab as soon as the tab moves
+     under it, and capture is not something every input path grants */
+  try{el.setPointerCapture(ev.pointerId);}catch(_){}
+  document.addEventListener('pointermove',tabPointerMove);
+  document.addEventListener('pointerup',tabPointerEnd);document.addEventListener('pointercancel',tabPointerEnd);}
+function tabDragStart(d){d.mode='drag';d.el.classList.add('dragging');document.body.classList.add('tabdrag');}
+function tabPointerMove(ev){const d=tabDrag;if(!d||ev.pointerId!==d.pid)return;
+  d.x=ev.clientX;const dx=d.x-d.x0,host=$('#sessionTabs');
+  if(d.mode==='idle'){
+    if(Math.abs(dx)<TAB_DRAG_PX)return;
+    if(d.touch){clearTimeout(d.hold);d.mode='scroll';}else tabDragStart(d);}
+  if(d.mode==='scroll'){host.scrollLeft=d.sl0-dx;return;}
+  /* the tab moves to the slot whose midpoint the pointer has crossed */
+  const sibs=[...host.querySelectorAll('.stab')].filter(x=>x!==d.el);
+  let before=null;for(const s of sibs){const r=s.getBoundingClientRect();if(d.x<r.left+r.width/2){before=s;break;}}
+  if(before?d.el.nextElementSibling!==before:host.lastElementChild!==d.el)host.insertBefore(d.el,before);
+  tabEdgeScroll(d,host);}
+function tabEdgeScroll(d,host){const z=28,vel=()=>{const r=host.getBoundingClientRect();
+    return d.x<r.left+z?-8:d.x>r.right-z?8:0;};
+  if(!vel()||d.raf)return;
+  const step=()=>{d.raf=0;if(tabDrag!==d||d.mode!=='drag')return;
+    const v=vel();if(!v)return;host.scrollLeft+=v;d.raf=requestAnimationFrame(step);};
+  d.raf=requestAnimationFrame(step);}
+function tabPointerEnd(ev){const d=tabDrag;if(!d||ev.pointerId!==d.pid)return;
+  clearTimeout(d.hold);if(d.raf)cancelAnimationFrame(d.raf);
+  document.removeEventListener('pointermove',tabPointerMove);
+  document.removeEventListener('pointerup',tabPointerEnd);document.removeEventListener('pointercancel',tabPointerEnd);
+  try{d.el.releasePointerCapture(d.pid);}catch(_){}
+  tabDrag=null;document.body.classList.remove('tabdrag');d.el.classList.remove('dragging');
+  if(d.mode!=='idle')tabClickBlock=Date.now()+400;   /* the click after a drag or a scroll is not a pick */
+  if(d.mode==='drag'){
+    const order=[...$('#sessionTabs').querySelectorAll('.stab')].map(x=>x.dataset.tid);
+    tabState.sort((a,b)=>order.indexOf(a.id)-order.indexOf(b.id));persistTabs();renderTabs();}
+  else if(tabsRerender)renderTabs();
+  tabsRerender=false;}
 function tabKeydown(ev){
   if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();ev.currentTarget.click();return;}
   if(!['ArrowLeft','ArrowRight','Home','End'].includes(ev.key))return;

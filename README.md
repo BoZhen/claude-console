@@ -70,7 +70,9 @@ which is the whole point.
 - **Session tabs** — the sessions you have open, above the chat. Switching is a
   swap, not a reload: the rendered view is kept and the server sends only what
   happened while you were away. **Closing a tab never ends the session** — the
-  sidebar's LIVE list is what is running, the tabs are what you have open.
+  sidebar's LIVE list is what is running, the tabs are what you have open. Drag
+  a tab to reorder the strip (on a phone, hold it first; a quick swipe scrolls
+  the strip). The order is saved with the tabs.
 - **Multi-session sidebar** — projects grouped by folder, with Live / Favorites
   / Recent / In-folder sections (each collapsible). A project's own button opens
   a new session there, browses the folder, favorites or renames it, or opens
