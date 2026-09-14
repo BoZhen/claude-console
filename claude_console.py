@@ -3619,6 +3619,10 @@ header input#cwd{flex:1;min-width:120px;display:none}
   justify-content:center;border:0;background:none;color:var(--mut);cursor:pointer;
   border-radius:5px;font-size:11px;line-height:1}
 .plan .ptoggle:hover{color:var(--acc);background:var(--bg3)}
+.plan .pdismiss{flex:none;height:22px;padding:0 8px;border:1px solid var(--line);
+  background:none;color:var(--mut);cursor:pointer;border-radius:5px;
+  font-family:var(--fmono);font-size:11px;line-height:1}
+.plan .pdismiss:hover{color:var(--add);border-color:var(--add)}
 .plan .psteps{display:flex;flex-direction:column;border-top:1px solid var(--line)}
 .plan .pst{display:grid;grid-template-columns:18px 1fr;gap:6px;align-items:start;
   padding:5px 10px;font-size:13px;line-height:1.35}
@@ -4616,12 +4620,18 @@ function addRecap(t){const s=atBottom();const d=document.createElement('div');d.
    `plan` event is a complete snapshot, and replaying a history just converges on
    whatever the last one said. The dock is sticky rather than inline because a plan
    is a statement about the present, and inline it would scroll away into history. */
-let planTasks=[],planCollapsed=false,planHideT=0;
-const PLAN_HIDE_MS=2000;
+let planTasks=[],planCollapsed=false;
 const PLAN_MARK={completed:['done','●'],in_progress:['active','◐'],pending:['todo','○']};   /* filled, half, hollow */
 function planMark(st){return PLAN_MARK[(''+(st||'pending')).toLowerCase()]||PLAN_MARK.pending;}
 function planDone(t){return planMark(t.status)[0]==='done';}
 function planAllDone(ts){return ts.length>0&&ts.every(planDone);}
+/* Identity of a finished plan, so dismissing one does not also dismiss the next.
+   Status is part of the signature: if later work reopens a step the plan is no
+   longer the one that was dismissed, and it comes back on its own. */
+function planSig(ts){return (ts||[]).map(t=>
+  (t.subject||t.activeForm||('#'+t.id))+'\u0001'+(t.status||'')).join('\u0002');}
+function planDismissed(ts){const t=tabById(sid);
+  return !!t&&!!t.planSeen&&t.planSeen===planSig(ts);}
 function renderPlan(){
   const host=$('#planDock');if(!host)return;
   if(!planTasks.length){host.hidden=true;host.innerHTML='';return;}
@@ -4630,6 +4640,9 @@ function renderPlan(){
   const shown=planCollapsed?planTasks.filter(t=>planMark(t.status)[0]==='active'):planTasks;
   let h='<div class="plan"><div class="ph"><span class="ptitle">☑ Plan</span>'+
     '<span class="pcount">'+planTasks.filter(planDone).length+'/'+planTasks.length+'</span>'+
+    (planAllDone(planTasks)
+      ?'<button type="button" class="pdismiss" title="Mark this finished plan read and hide it">read</button>'
+      :'')+
     '<button type="button" class="ptoggle" aria-expanded="'+(!planCollapsed)+'" title="'+
     (planCollapsed?'Expand plan':'Collapse plan')+'">'+(planCollapsed?'▼':'▲')+'</button></div>';
   if(shown.length){h+='<div class="psteps">';
@@ -4640,22 +4653,26 @@ function renderPlan(){
     h+='</div>';}
   else h+='<div class="pempty">no active task</div>';
   host.innerHTML=h+'</div>';host.hidden=false;
-  const tg=host.querySelector('.ptoggle');if(tg)tg.onclick=togglePlan;}
+  const tg=host.querySelector('.ptoggle');if(tg)tg.onclick=togglePlan;
+  const dz=host.querySelector('.pdismiss');if(dz)dz.onclick=dismissPlan;}
 function togglePlan(){planCollapsed=!planCollapsed;
   const t=tabById(sid);if(t){t.planCollapsed=planCollapsed;persistTabs();}renderPlan();}
-/* A finished plan is just clutter, so it retires itself. Re-checked when the timer
-   fires: the session may have been switched, or new work may have reopened it. */
-function schedulePlanHide(){
-  if(planHideT){clearTimeout(planHideT);planHideT=0;}
-  if(replaying||!planAllDone(planTasks))return;
-  const owner=sid;
-  planHideT=setTimeout(()=>{planHideT=0;
-    /* drop the list, not just the dock: keeping a retired plan in memory means the
-       next renderPlan (folding it, restoring the tab) brings the finished thing
-       back, and folded it reads "no active task" */
-    if(sid===owner&&planAllDone(planTasks))clearPlan();},PLAN_HIDE_MS);}
-function setPlan(ts){planTasks=Array.isArray(ts)?ts:[];renderPlan();schedulePlanHide();}
-function clearPlan(){if(planHideT){clearTimeout(planHideT);planHideT=0;}
+/* A finished plan retires when you say so, not on a timer. The timer version hid
+   it two seconds after the last step completed, which reads fine while you watch a
+   plan finish but is wrong everywhere else: attaching to a session replays its log
+   and hands the dock a plan that finished hours ago, so every switch back replayed
+   a two-second appearance of something already over. Dismissal is recorded against
+   the session, so it also survives a reload. */
+function dismissPlan(){const t=tabById(sid);
+  if(t){t.planSeen=planSig(planTasks);persistTabs();}
+  clearPlan();}
+function setPlan(ts){planTasks=Array.isArray(ts)?ts:[];
+  /* finished, and already marked read while unchanged — stay out of the way. Drop
+     the list too, not just the dock: keeping it would let the next renderPlan
+     (folding it, restoring the tab) bring the finished thing back. */
+  if(planAllDone(planTasks)&&planDismissed(planTasks)){clearPlan();return;}
+  renderPlan();}
+function clearPlan(){
   planTasks=[];planCollapsed=false;const h=$('#planDock');if(h){h.hidden=true;h.innerHTML='';}}
 /* turn-complete footer line — ✻ {past verb} for {N}s · {YYYY-MM-DD HH:MM:SS} UTC (server-stamped) */
 function utcStamp(sec){const d=new Date(sec*1000),p=n=>String(n).padStart(2,'0');
@@ -5672,7 +5689,8 @@ function persistTabs(){try{localStorage.setItem(TABKEY,JSON.stringify(tabState.m
     id:t.id,cc:t.cc||null,title:t.title||'',name:t.name||'',cwd:t.cwd||'',
     busy:!!t.busy,ended:!!t.ended,unread:!!t.unread,lastSeq:Number(t.lastSeq||0),
     serverSeq:Number(t.serverSeq||0),scrollTop:Number(t.scrollTop||0),
-    atBottom:t.atBottom!==false,planCollapsed:!!t.planCollapsed}))));}catch(e){}}
+    atBottom:t.atBottom!==false,planCollapsed:!!t.planCollapsed,
+    planSeen:t.planSeen||''}))));}catch(e){}}
 function renderTabs(){
   const host=$('#sessionTabs');if(!host)return;
   /* before the first session list lands we cannot tell which stored tabs are still
@@ -5715,7 +5733,8 @@ function ensureTab(s,active){
   if(!s||!s.id)return null;
   let t=tabById(s.id);
   if(!t){t={id:s.id,cc:s.cc||null,title:'',name:'',cwd:'',busy:false,ended:false,unread:false,
-    lastSeq:0,serverSeq:0,scrollTop:0,atBottom:true,planCollapsed:false};tabState.push(t);}
+    lastSeq:0,serverSeq:0,scrollTop:0,atBottom:true,planCollapsed:false,
+    planSeen:''};tabState.push(t);}
   if(s.cc)t.cc=s.cc;if(s.title)t.title=s.title;if(s.name)t.name=s.name;if(s.cwd)t.cwd=s.cwd;
   if(s.busy!==undefined)t.busy=!!s.busy;
   if(s.ended!==undefined)t.ended=!!s.ended;
@@ -5762,7 +5781,6 @@ function restoreTabView(id){const t=tabById(id),c=$('#chat');if(!t||!c)return;
 function stashView(id){
   if(!id)return false;const t=tabById(id);if(!t)return false;
   endStream();trimChatWindow();rememberTabView();
-  if(planHideT){clearTimeout(planHideT);planHideT=0;}
   viewCache.set(id,{stream:takeChildren(stream),plan:takeChildren($('#planDock')),
     planHidden:$('#planDock').hidden,edits:takeChildren($('#edits')),git:takeChildren($('#gitc')),
     tools:tools,editCount:editCount,queued:queued,planTasks:planTasks,planCollapsed:planCollapsed,
