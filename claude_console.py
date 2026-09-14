@@ -19,6 +19,7 @@ Env (legacy AGENTLENS_* names still accepted as a fallback):
 import asyncio
 import base64
 import glob
+import datetime
 import hashlib
 import io
 import json
@@ -97,10 +98,14 @@ RECAP_SYS = ("You write a one-line \"recap\" for a developer who stepped away fr
 # the plan history: one entry per plan, its summary written by a cheap model once the
 # plan is finished (see ChatSession._track_plan)
 PLAN_SUMMARY_MODEL = _env("PLAN_SUMMARY_MODEL", "haiku") or "haiku"
+# the language of the plan's step titles and of the history summaries, as a language
+# name for the prompts ("Chinese"); unset, both follow the language the user writes in
+PLAN_LANG = (_env("PLAN_LANG", "") or "").strip()
 PLAN_SUMMARY_SYS = ("You write the entry for a finished plan in a developer's plan history. You "
                     "get the plan's steps and the transcript of the work. Reply with one or two "
                     "plain-text sentences saying what was done and how it ended: no preamble, no "
-                    "markdown, no quotes. Write in the language the user writes in.")
+                    "markdown, no quotes. "
+                    + ("Write in %s." % PLAN_LANG if PLAN_LANG else "Write in the language the user writes in."))
 PLAN_HIST_MAX = 200          # entries kept per session
 # turn-complete verbs — the CLI's curated past-tense set (independent of the live
 # spinner's present-participle word); one is stamped onto each finished turn.
@@ -194,7 +199,8 @@ PLAN_PROMPT = (
     "tool. Whenever a request takes more than one step, call it first with the full "
     "list of steps (all pending), again as each step starts (in_progress) and finishes "
     "(completed), and again if the steps change. Always send the complete list. Keep "
-    "exactly one step in_progress while you work. A single-step request needs no plan.")
+    "exactly one step in_progress while you work. A single-step request needs no plan."
+    + (" Write the step titles in %s." % PLAN_LANG if PLAN_LANG else ""))
 PLAN_NUDGE_EVERY = 4     # tool calls with a step still open before a reminder rides along
 PLAN_SCHEMA = {
     "type": "object", "required": ["steps"],
@@ -758,6 +764,74 @@ def save_plans(cc, items):
         os.replace(tmp, PLANS_FILE)
     except Exception:
         pass
+
+
+def _iso_ts(v):
+    try:
+        return datetime.datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+def transcript_plans(path):
+    """The plans a saved transcript went through, rebuilt from its plan-tool calls
+    with the same rules ChatSession._track_plan applies live, and the transcript's
+    text as (time, line) pairs for the summaries. Both are what the live session
+    would have recorded had the console been watching at the time."""
+    entries, lines, cur = [], [], None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if d.get("isSidechain") or d.get("parentToolUseId"):
+                    continue
+                typ, m = d.get("type"), d.get("message") or {}
+                if typ not in ("user", "assistant") or not isinstance(m, dict):
+                    continue
+                ts, c = _iso_ts(d.get("timestamp")), m.get("content")
+                if isinstance(c, str):
+                    c = [{"type": "text", "text": c}]
+                if not isinstance(c, list):
+                    continue
+                for b in c:
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get("type") == "text" and (b.get("text") or "").strip():
+                        lines.append((ts, ("User: " if typ == "user" else "Assistant: ") + b["text"].strip()))
+                    elif b.get("type") == "tool_use" and typ == "assistant":
+                        if b.get("name") != PLAN_TOOL:
+                            lines.append((ts, "[tool: %s]" % (b.get("name") or "?")))
+                            continue
+                        raw = (b.get("input") or {}).get("steps")
+                        if not isinstance(raw, list):
+                            continue
+                        steps = [{"subject": str(x.get("title") or ""), "status": str(x.get("status") or "pending")}
+                                 for x in raw if isinstance(x, dict)]
+                        if not steps:
+                            continue
+                        titles = [x["subject"] for x in steps]
+                        all_done = all(x["status"] == "completed" for x in steps)
+                        same = bool(cur) and [x["subject"] for x in cur["steps"]] == titles
+                        if cur and not cur.get("finished"):
+                            rec = cur
+                        elif same and all_done:
+                            continue
+                        elif same:
+                            rec = cur
+                            rec["finished"] = None
+                        else:
+                            rec = cur = {"id": "t%d" % int(ts * 1000), "steps": steps, "started": ts,
+                                         "finished": None, "summary": None}
+                            entries.append(rec)
+                        rec["steps"] = steps
+                        if all_done and not rec.get("finished"):
+                            rec["finished"] = ts
+    except Exception:
+        pass
+    return entries, lines
 
 
 def list_favorites():
@@ -2288,6 +2362,8 @@ class ChatSession:
         self.tasks = {}           # task id -> {subject, description, activeForm, status}
         self.plan_hist = []       # this session's plans, oldest first (see _track_plan)
         self._plan_hist_loaded = False
+        self._plan_sum_task = None  # the summaries-on-demand worker, while it runs
+        self._plan_lines = None     # transcript text for backfilled summaries, per run
         self._task_open = {}      # TaskCreate tool_use id -> the task, until a result names it
         self._task_seq = 0        # creation ordinal; the fallback id if that text ever changes
         self._since_plan = 0      # tool calls since the plan was last touched (PostToolUse nudge)
@@ -2351,7 +2427,8 @@ class ChatSession:
         """The console's plan tool, served in-process. Its result text carries the
         next nudge, since that is the one place the model is certain to read."""
         @tool("plan", "Keep the user's pinned progress panel current. Send the FULL list "
-              "of steps every time the plan changes.", PLAN_SCHEMA)
+              "of steps every time the plan changes."
+              + (" Step titles in %s." % PLAN_LANG if PLAN_LANG else ""), PLAN_SCHEMA)
         async def plan(args):
             steps = [x for x in ((args or {}).get("steps") or []) if isinstance(x, dict)]
             done = sum(1 for x in steps if x.get("status") == "completed")
@@ -3197,7 +3274,23 @@ class ChatSession:
         self._plan_hist_loaded = True
         saved = load_plans(self.cc_id)
         seen = {r.get("id") for r in saved}
-        self.plan_hist = saved + [r for r in self.plan_hist if r.get("id") not in seen]
+        hist = saved + [r for r in self.plan_hist if r.get("id") not in seen]
+        # plans that ran before the console kept a history (or while it was not
+        # watching) are rebuilt from the transcript; one the live tracking already
+        # holds is recognised by its steps and its start time
+        path = find_transcript(self.cc_id)
+        if path:
+            def key(r):
+                return tuple(x.get("subject") for x in r.get("steps") or [])
+            have = [(key(r), float(r.get("started") or 0)) for r in hist]
+            for r in transcript_plans(path)[0]:
+                k, t0 = key(r), r["started"]
+                if not any(k == hk and abs(t0 - ht) < 300 for hk, ht in have):
+                    hist.append(r)
+            hist.sort(key=lambda r: float(r.get("started") or 0))
+        self.plan_hist = hist[-PLAN_HIST_MAX:]
+        if path:
+            self._save_plan_hist()
 
     def _save_plan_hist(self):
         if self.cc_id:
@@ -3211,6 +3304,37 @@ class ChatSession:
     def plan_hist_items(self):
         self._load_plan_hist()
         return [self._plan_item(r) for r in self.plan_hist]
+
+    def summarize_missing(self):
+        """Write the summaries the history still lacks, newest first, one at a
+        time. Asked for when the panel opens, so the cost follows the reader."""
+        if self._plan_sum_task or not HAVE_SDK:
+            return
+        async def _run():
+            try:
+                self._load_plan_hist()
+                for rec in sorted(self.plan_hist, key=lambda r: -float(r.get("started") or 0)):
+                    if self.ended:
+                        break
+                    if rec.get("finished") and rec.get("summary") is None:
+                        await self._summarize_plan(rec)
+            finally:
+                self._plan_sum_task = None
+                self._plan_lines = None
+        self._plan_sum_task = True
+        tornado.ioloop.IOLoop.current().spawn_callback(_run)
+
+    def _plan_transcript(self, rec):
+        """The text of the work a backfilled plan covered: the transcript between
+        its first and last plan call, read once per summary run."""
+        if self._plan_lines is None:
+            path = find_transcript(self.cc_id) if self.cc_id else None
+            self._plan_lines = transcript_plans(path)[1] if path else []
+        t0, t1 = float(rec.get("started") or 0) - 5, float(rec.get("finished") or 0) + 900
+        nxt = [float(r.get("started") or 0) for r in self.plan_hist if float(r.get("started") or 0) > t0 + 5]
+        if nxt:
+            t1 = min(t1, min(nxt))
+        return "\n".join(t for ts, t in self._plan_lines if t0 <= ts <= t1)[-6000:]
 
     def _track_plan(self, evs):
         """Keep the plan history in step with the plan the dock shows. Every plan call
@@ -3246,9 +3370,15 @@ class ChatSession:
         rec["steps"] = steps
         if all_done and not rec.get("finished"):
             rec["finished"] = time.time()
-            tornado.ioloop.IOLoop.current().spawn_callback(self._summarize_plan, rec)
+            rec["_pending"] = True   # summarised once the turn ends, so its wrap-up is in
         self._save_plan_hist()
         evs.append({"kind": "plan_hist_item", "item": self._plan_item(rec)})
+
+    def _plans_after_turn(self, evs):
+        if any(e.get("kind") == "turn_done" and not e.get("parent") for e in evs):
+            for rec in self.plan_hist:
+                if rec.pop("_pending", None):
+                    tornado.ioloop.IOLoop.current().spawn_callback(self._summarize_plan, rec)
 
     async def _summarize_plan(self, rec):
         """The history entry for a finished plan: an isolated single-turn call to a
@@ -3259,17 +3389,20 @@ class ChatSession:
         rec["_busy"] = True
         text = ""
         try:
-            lines, start = [], int(rec.get("seq") or 0)
-            for e in self.log:
-                if int(e.get("_seq") or 0) <= start:
-                    continue
-                k, t = e.get("kind"), (e.get("text") or "").strip()
-                if k == "user_text" and t:
-                    lines.append("User: " + t)
-                elif k == "assistant_text" and t:
-                    lines.append("Assistant: " + t)
-                elif k == "tool_use":
-                    lines.append("[tool: %s]" % (e.get("tool") or "?"))
+            lines = []
+            if rec.get("seq") is not None:          # tracked live: the log since the plan began
+                start = int(rec.get("seq") or 0)
+                for e in self.log:
+                    if int(e.get("_seq") or 0) <= start:
+                        continue
+                    k, t = e.get("kind"), (e.get("text") or "").strip()
+                    if k == "user_text" and t:
+                        lines.append("User: " + t)
+                    elif k == "assistant_text" and t:
+                        lines.append("Assistant: " + t)
+                    elif k == "tool_use":
+                        lines.append("[tool: %s]" % (e.get("tool") or "?"))
+            transcript = "\n".join(lines)[-6000:] if lines else self._plan_transcript(rec)
             steps = "\n".join("- [%s] %s" % (x.get("status"), x.get("subject"))
                               for x in rec.get("steps") or [])
             cwd = os.path.join(HOME, ".cache", "claude-console-recap")   # pruned with the recaps
@@ -3279,7 +3412,7 @@ class ChatSession:
                 system_prompt=PLAN_SUMMARY_SYS, allowed_tools=[], max_turns=1,
                 max_buffer_size=MAX_BUFFER, setting_sources=[])
             prompt = ("Plan steps:\n" + steps + "\n\nTranscript of the work:\n"
-                      + "\n".join(lines)[-6000:] + "\n\nEntry:")
+                      + transcript + "\n\nEntry:")
             chunks = []
             async def _run():
                 async for m in query(prompt=prompt, options=opts):
@@ -3314,6 +3447,7 @@ class ChatSession:
         if self._fold_tasks(evs):
             evs = list(evs) + [{"kind": "plan", "tasks": self.plan_tasks()}]
             self._track_plan(evs)
+        self._plans_after_turn(evs)
         for ev in evs:
             self.event_seq += 1
             ev["_seq"] = self.event_seq
@@ -3503,6 +3637,8 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             self.session.resolve_approval(msg.get("aid"), bool(msg.get("allow")), bool(msg.get("always")))
         elif mt == "answer" and self.session:
             self.session.resolve_answer(msg.get("aid"), msg.get("answers"))
+        elif mt == "plan_summaries" and self.session:
+            self.session.summarize_missing()
         elif mt == "interrupt" and self.session:
             self.session.interrupt()
         elif mt == "set_model" and self.session:
@@ -4887,7 +5023,8 @@ function planHistUpsert(it){if(!it||!it.id)return;const i=planHist.findIndex(x=>
 function phistOpened(){return !$('#phist').hasAttribute('hidden');}
 function renderPlanHistPill(){const p=$('#planhistpill');if(!p)return;
   p.hidden=!sid;$('#planhistN').textContent=planHist.length?String(planHist.length):'';}
-function openPlanHist(){renderPlanHist();$('#phist').removeAttribute('hidden');}
+function openPlanHist(){renderPlanHist();$('#phist').removeAttribute('hidden');
+  if(planHist.some(it=>it.finished&&it.summary==null))wsSend({type:'plan_summaries'});}
 function closePlanHist(){$('#phist').setAttribute('hidden','');}
 function phWhen(sec){if(!sec)return '';const d=new Date(sec*1000),p=n=>String(n).padStart(2,'0');
   return p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());}

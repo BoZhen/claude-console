@@ -48,8 +48,9 @@
   并提醒模型随时更新。
 - **Plan 历史** —— 悬停区的 `history` 按钮或右上角的 `☑ plans` 药丸列出本 session 的全部
   计划，最新在前，每条带
-  步骤、开始时间、用时，以及计划完成时由一个廉价模型写的一两句摘要。列表按 session
-  保存，恢复 session 后仍在。
+  步骤、开始时间、用时，以及完成该计划的那一轮结束后由一个廉价模型写的一两句摘要。
+  列表按 session 保存，恢复 session 后仍在；恢复时也会从 transcript 里补上控制台
+  开始记录之前的计划，它们的摘要在打开面板时补写。
 - **LaTeX 渲染** —— 回复中的 `$…$`、`$$…$$`、`\(…\)`、`\[…\]` 由 KaTeX 渲染
   （已内置，离线可用）。
 - **可点击的文件路径** —— 回复里的路径（`~/work/lattice-qmc/observables.py`）
@@ -168,6 +169,7 @@ python claude_console.py
 | `CLAUDE_CONSOLE_RECAP_IDLE_SEC` | `300` | 闲置多少秒后需要摘要 |
 | `CLAUDE_CONSOLE_RECAP_MODEL` | `haiku` | 撰写摘要的模型 |
 | `CLAUDE_CONSOLE_PLAN_SUMMARY_MODEL` | `haiku` | 撰写 Plan 历史摘要的模型 |
+| `CLAUDE_CONSOLE_PLAN_LANG` | *(未设)* | 计划步骤标题和历史摘要使用的语言，写给提示词的语言名（如 `Chinese`）；未设时两者跟随你写的语言 |
 | `CLAUDE_CONSOLE_MAX_BUFFER_MB` | `64` | 单条 CLI 消息的上限 |
 | `CLAUDE_CONSOLE_IMPORT_MAX_MB` | `1024` | 导入 transcript 的大小上限 |
 | `CLAUDE_CONSOLE_TRANSCRIBE` | `0` | 启用本地语音输入 |

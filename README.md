@@ -55,8 +55,10 @@ which is the whole point.
   to the session and reminds the model to keep it current.
 - **Plan history** — the dock's `history` button, or the `☑ plans` pill at the
   top right, lists every plan of the session, newest first, with its steps, start time, duration and a one- or
-  two-sentence summary written by a cheap model when the plan finished. The
-  list is kept per session and survives a resume.
+  two-sentence summary written by a cheap model once the turn that finished the
+  plan ends. The list is kept per session and survives a resume; a resumed
+  session also gets the plans in its transcript from before the console kept a
+  history, and their summaries are written when the panel is opened.
 - **LaTeX rendering** — `$…$`, `$$…$$`, `\(…\)`, `\[…\]` in replies render with
   KaTeX (vendored, offline).
 - **Clickable file paths** — a path in a reply (`~/work/lattice-qmc/observables.py`)
@@ -201,6 +203,7 @@ HTTPS (a reverse proxy, or `tailscale serve`) unless you open it on `localhost`.
 | `CLAUDE_CONSOLE_RECAP_IDLE_SEC` | `300` | idle seconds before a recap is due |
 | `CLAUDE_CONSOLE_RECAP_MODEL` | `haiku` | model that writes the recap |
 | `CLAUDE_CONSOLE_PLAN_SUMMARY_MODEL` | `haiku` | model that writes the plan-history summaries |
+| `CLAUDE_CONSOLE_PLAN_LANG` | *(unset)* | language of plan step titles and history summaries, as a name for the prompts (`Chinese`); unset, both follow the language you write in |
 | `CLAUDE_CONSOLE_MAX_BUFFER_MB` | `64` | ceiling on one CLI message |
 | `CLAUDE_CONSOLE_IMPORT_MAX_MB` | `1024` | ceiling on an imported transcript |
 | `CLAUDE_CONSOLE_TRANSCRIBE` | `0` | enable local voice input |
