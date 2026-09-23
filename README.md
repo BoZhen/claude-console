@@ -82,8 +82,9 @@ which is the whole point.
   sidebar's LIVE list is what is running, the tabs are what you have open. Drag
   a tab to reorder the strip (on a phone, hold it first; a quick swipe scrolls
   the strip). The order is saved with the tabs.
-- **Multi-session sidebar** — projects grouped by folder, with Live / Favorites
-  / Recent / In-folder sections (each collapsible). A project's own button opens
+- **Multi-session sidebar** — projects grouped by folder, in Live / Favorites /
+  Recent sections (each collapsible); a folder row expands to the sessions
+  whose working directory is that folder. A project's own button opens
   a new session there, browses the folder, favorites or renames it, or opens
   **Manage sessions** to clean up several at once; a session's `⋮` covers
   configure, rename, export and end (or delete to trash, for one on disk). Drag
