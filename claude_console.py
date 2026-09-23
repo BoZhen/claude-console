@@ -735,6 +735,15 @@ def save_pref(cc, mode=None, model=None, effort=None, fav=None):
         pass
 
 
+def _trim_plans(items):
+    """The newest PLAN_HIST_MAX entries, plus as many markers of deleted ones
+    (see ChatSession.delete_plans), in their original order."""
+    live = [x for x in items if not x.get("deleted")][-PLAN_HIST_MAX:]
+    gone = [x for x in items if x.get("deleted")][-PLAN_HIST_MAX:]
+    keep = {id(x) for x in live} | {id(x) for x in gone}
+    return [x for x in items if id(x) in keep]
+
+
 def load_plans(cc):
     """The plan history saved for one Claude session (see ChatSession._track_plan)."""
     try:
@@ -757,7 +766,7 @@ def save_plans(cc, items):
                 d = {}
         except Exception:
             d = {}
-        d[cc] = list(items)[-PLAN_HIST_MAX:]
+        d[cc] = _trim_plans(list(items))
         tmp = PLANS_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(d, f, ensure_ascii=False)
@@ -3288,7 +3297,7 @@ class ChatSession:
                 if not any(k == hk and abs(t0 - ht) < 300 for hk, ht in have):
                     hist.append(r)
             hist.sort(key=lambda r: float(r.get("started") or 0))
-        self.plan_hist = hist[-PLAN_HIST_MAX:]
+        self.plan_hist = _trim_plans(hist)
         if path:
             self._save_plan_hist()
 
@@ -3303,7 +3312,28 @@ class ChatSession:
 
     def plan_hist_items(self):
         self._load_plan_hist()
-        return [self._plan_item(r) for r in self.plan_hist]
+        return [self._plan_item(r) for r in self.plan_hist if not r.get("deleted")]
+
+    def delete_plans(self, ids):
+        """Take entries out of the history. Each leaves a marker holding its steps
+        and start time, which is what keeps the transcript backfill from restoring
+        it on the next resume; markers are trimmed like entries. A summary still
+        being written for a deleted entry is dropped when it arrives."""
+        self._load_plan_hist()
+        want = {str(i) for i in (ids or []) if i}
+        gone = []
+        for rec in self.plan_hist:
+            if rec.get("id") in want and not rec.get("deleted"):
+                mark = {"id": rec["id"], "started": rec.get("started"), "finished": rec.get("finished"),
+                        "steps": [{"subject": x.get("subject")} for x in rec.get("steps") or []],
+                        "deleted": True}
+                rec.clear()            # in place: a running _summarize_plan holds this dict
+                rec.update(mark)
+                gone.append(rec["id"])
+        if gone:
+            self.plan_hist = _trim_plans(self.plan_hist)
+            self._save_plan_hist()
+            self._push([{"kind": "plan_hist_del", "ids": gone}])
 
     def summarize_missing(self):
         """Write the summaries the history still lacks, newest first, one at a
@@ -3316,7 +3346,7 @@ class ChatSession:
                 for rec in sorted(self.plan_hist, key=lambda r: -float(r.get("started") or 0)):
                     if self.ended:
                         break
-                    if rec.get("finished") and rec.get("summary") is None:
+                    if rec.get("finished") and rec.get("summary") is None and not rec.get("deleted"):
                         await self._summarize_plan(rec)
             finally:
                 self._plan_sum_task = None
@@ -3350,7 +3380,7 @@ class ChatSession:
         steps = [{"subject": t.get("subject") or t.get("activeForm") or ("task #%s" % t.get("id")),
                   "status": t.get("status") or "pending"} for t in ts]
         all_done = all(s["status"] == "completed" for s in steps)
-        cur = self.plan_hist[-1] if self.plan_hist else None
+        cur = next((r for r in reversed(self.plan_hist) if not r.get("deleted")), None)
         same = bool(cur) and ([s.get("subject") for s in cur.get("steps") or []]
                               == [s["subject"] for s in steps])
         if cur and not cur.get("finished"):
@@ -3366,7 +3396,7 @@ class ChatSession:
             rec = {"id": "p%d" % int(now * 1000), "steps": steps, "started": now,
                    "finished": None, "summary": None, "seq": self.event_seq}
             self.plan_hist.append(rec)
-            del self.plan_hist[:-PLAN_HIST_MAX]
+            self.plan_hist = _trim_plans(self.plan_hist)
         rec["steps"] = steps
         if all_done and not rec.get("finished"):
             rec["finished"] = time.time()
@@ -3377,14 +3407,14 @@ class ChatSession:
     def _plans_after_turn(self, evs):
         if any(e.get("kind") == "turn_done" and not e.get("parent") for e in evs):
             for rec in self.plan_hist:
-                if rec.pop("_pending", None):
+                if rec.pop("_pending", None) and not rec.get("deleted"):
                     tornado.ioloop.IOLoop.current().spawn_callback(self._summarize_plan, rec)
 
     async def _summarize_plan(self, rec):
         """The history entry for a finished plan: an isolated single-turn call to a
         cheap model, as for the recap. A failure leaves the summary empty rather
         than pending, so the panel can say so."""
-        if rec.get("summary") or rec.get("_busy") or not HAVE_SDK:
+        if rec.get("summary") or rec.get("_busy") or rec.get("deleted") or not HAVE_SDK:
             return
         rec["_busy"] = True
         text = ""
@@ -3426,7 +3456,7 @@ class ChatSession:
             text = ""
         finally:
             rec.pop("_busy", None)
-        if self.ended:
+        if self.ended or rec.get("deleted"):
             return
         rec["summary"] = _cap(text, 600) if text else ""
         self._save_plan_hist()
@@ -3639,6 +3669,8 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             self.session.resolve_answer(msg.get("aid"), msg.get("answers"))
         elif mt == "plan_summaries" and self.session:
             self.session.summarize_missing()
+        elif mt == "plan_delete" and self.session:
+            self.session.delete_plans(msg.get("ids") or [])
         elif mt == "interrupt" and self.session:
             self.session.interrupt()
         elif mt == "set_model" and self.session:
@@ -4427,8 +4459,8 @@ body.tabdrag,body.tabdrag .stab{cursor:grabbing}
 .pmrow .pmd{font-size:11px;color:var(--mut);font-family:var(--fmono)}
 .pmrow .pmlive{flex:none;font-size:10px;color:var(--addfg);border:1px solid var(--add);
   border-radius:8px;padding:0 6px;line-height:15px}
-#pmandel{background:var(--nobg);color:var(--delfg);border:1px solid var(--del)}
-#pmandel:disabled{opacity:.45;cursor:not-allowed}
+#pmandel,#phistdel{background:var(--nobg);color:var(--delfg);border:1px solid var(--del)}
+#pmandel:disabled,#phistdel:disabled{opacity:.45;cursor:not-allowed}
 
 /* Import folder — pick a directory and it becomes a sidebar project even before
    it owns a session. Same dircomplete backend as the custom-path box. */
@@ -4464,6 +4496,11 @@ body.tabdrag,body.tabdrag .stab{cursor:grabbing}
 .phi .pst.done .pi{color:var(--add)}
 .phi .pst.done .psub{color:var(--mut);text-decoration:line-through}
 .phi .pst.active .pi{color:var(--tool)}
+.phi .phck{flex:none;width:15px;height:15px;margin:0;cursor:pointer;accent-color:var(--acc)}
+.phi.sel{border-color:var(--acc);background:color-mix(in srgb,var(--acc) 7%,var(--bg))}
+.phi .phdel{flex:none;background:none;border:0;padding:0 5px;margin:0 -4px 0 0;line-height:20px;border-radius:4px;
+  color:var(--mut);font-size:13px;cursor:pointer}
+.phi .phdel:hover{color:var(--delfg);background:var(--nobg)}
 #fimp .fh,#pman .fh,#phist .fh{display:flex;gap:10px;align-items:baseline;padding:10px 12px;
   border-bottom:1px solid var(--line)}
 #fimp .fh .ft{flex:1;font-size:13px;font-weight:600;color:var(--fg)}
@@ -4668,8 +4705,13 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
   <div id="phistpanel">
     <div class="fh"><span class="ft">☑ Plan history</span><span id="phistsub" class="pmsub"></span>
       <button class="btn" id="phistx" title="close">✕</button></div>
+    <div class="pmbar">
+      <label><input type="checkbox" id="phistall"> Select all</label>
+      <span class="grow"></span><span id="phistcount">0 selected</span>
+    </div>
     <div id="phistlist"></div>
-    <div class="fbtns"><button class="fcancel" id="phistclose">Close</button></div>
+    <div class="fbtns"><button class="fcancel" id="phistclose">Close</button>
+      <button id="phistdel" disabled>🗑 Delete selected</button></div>
   </div>
 </div>
 <div id="fimp" hidden>
@@ -5043,13 +5085,24 @@ function clearPlan(){if(planReadT){clearTimeout(planReadT);planReadT=0;}
 /* Plan history: every plan this session has run, newest first, with the summary the
    server writes once a plan is finished. The attach reply carries the whole list;
    plan_hist_item events keep it current (and replay harmlessly, keyed by id). */
-let planHist=[];
+let planHist=[],phistSel=new Set();
+function planHistDel(ids){const s=new Set(ids||[]);if(!s.size)return;
+  planHist=planHist.filter(x=>!s.has(x.id));s.forEach(id=>phistSel.delete(id));
+  renderPlanHistPill();if(phistOpened())renderPlanHist();}
+function phistDelete(ids){ids=(ids||[]).filter(id=>planHist.some(x=>x.id===id));
+  if(!ids.length||!(ws&&ws.readyState===1))return;
+  wsSend({type:'plan_delete',ids});planHistDel(ids);}
+function phistBar(){const n=phistSel.size,tot=planHist.length;
+  $('#phistcount').textContent=n+' selected';$('#phistdel').disabled=!n;
+  const all=$('#phistall');all.disabled=!tot;all.checked=n>0&&n===tot;all.indeterminate=n>0&&n<tot;}
+function phistToggleAll(){if(phistSel.size===planHist.length)phistSel=new Set();
+  else phistSel=new Set(planHist.map(x=>x.id));renderPlanHist();}
 function planHistUpsert(it){if(!it||!it.id)return;const i=planHist.findIndex(x=>x.id===it.id);
   if(i>=0)planHist[i]=it;else planHist.push(it);renderPlanHistPill();if(phistOpened())renderPlanHist();}
 function phistOpened(){return !$('#phist').hasAttribute('hidden');}
 function renderPlanHistPill(){const p=$('#planhistpill');if(!p)return;
   p.hidden=!sid;$('#planhistN').textContent=planHist.length?String(planHist.length):'';}
-function openPlanHist(){renderPlanHist();$('#phist').removeAttribute('hidden');
+function openPlanHist(){phistSel=new Set();renderPlanHist();$('#phist').removeAttribute('hidden');
   if(planHist.some(it=>it.finished&&it.summary==null))wsSend({type:'plan_summaries'});}
 function closePlanHist(){$('#phist').setAttribute('hidden','');}
 function phWhen(sec){if(!sec)return '';const d=new Date(sec*1000),p=n=>String(n).padStart(2,'0');
@@ -5057,18 +5110,27 @@ function phWhen(sec){if(!sec)return '';const d=new Date(sec*1000),p=n=>String(n)
 function phDur(s){s=Math.max(0,Math.round(s||0));return s<60?s+'s':s<3600?Math.round(s/60)+'m':(s/3600).toFixed(1)+'h';}
 function renderPlanHist(){const host=$('#phistlist');if(!host)return;
   const items=planHist.slice().sort((a,b)=>(b.started||0)-(a.started||0));
+  [...phistSel].forEach(id=>{if(!planHist.some(x=>x.id===id))phistSel.delete(id);});
   $('#phistsub').textContent=items.length?(items.length+' plan'+(items.length===1?'':'s')+' · '+($('#curname').textContent||'')):'';
-  if(!items.length){host.innerHTML='<div class="empty">no plans in this session yet</div>';return;}
+  if(!items.length){host.innerHTML='<div class="empty">no plans in this session yet</div>';phistBar();return;}
   host.innerHTML=items.map(it=>{const st=it.steps||[],done=st.filter(s=>s.status==='completed').length,fin=!!it.finished;
     const title=(st[0]&&st[0].subject)||'plan';
     const sum=it.summary?esc(it.summary):(it.summary===''?'no summary':(fin?'summarizing…':'in progress'));
-    return '<div class="phi'+(fin?' done':'')+'" data-id="'+escAttr(it.id)+'"><div class="phh">'+
+    const sel=phistSel.has(it.id);
+    return '<div class="phi'+(fin?' done':'')+(sel?' sel':'')+'" data-id="'+escAttr(it.id)+'"><div class="phh">'+
+      '<input type="checkbox" class="phck"'+(sel?' checked':'')+' title="select">'+
       '<span class="phmark">'+(fin?'●':'◐')+'</span><span class="pht">'+esc(title)+'</span>'+
-      '<span class="phm">'+done+'/'+st.length+' · '+phWhen(it.started)+(fin?' · '+phDur(it.finished-it.started):' · open')+'</span></div>'+
+      '<span class="phm">'+done+'/'+st.length+' · '+phWhen(it.started)+(fin?' · '+phDur(it.finished-it.started):' · open')+'</span>'+
+      '<button class="phdel" title="delete this plan">✕</button></div>'+
       '<div class="phs'+(it.summary?'':' mut')+'">'+sum+'</div>'+
       '<div class="phsteps" hidden>'+st.map(s=>{const mk=planMark(s.status);
         return '<div class="pst '+mk[0]+'"><span class="pi">'+mk[1]+'</span><span class="psub">'+esc(s.subject||'')+'</span></div>';}).join('')+'</div></div>';}).join('');
-  host.querySelectorAll('.phi .phh').forEach(h=>{h.onclick=()=>{const st=h.parentElement.querySelector('.phsteps');st.hidden=!st.hidden;};});}
+  host.querySelectorAll('.phi').forEach(el=>{const id=el.dataset.id,h=el.querySelector('.phh'),cb=el.querySelector('.phck');
+    h.onclick=ev=>{if(ev.target===cb||ev.target.classList.contains('phdel'))return;
+      const st=el.querySelector('.phsteps');st.hidden=!st.hidden;};
+    cb.onchange=()=>{if(cb.checked)phistSel.add(id);else phistSel.delete(id);el.classList.toggle('sel',cb.checked);phistBar();};
+    el.querySelector('.phdel').onclick=ev=>{ev.stopPropagation();phistDelete([id]);};});
+  phistBar();}
 /* turn-complete footer line — ✻ {past verb} for {N}s · {YYYY-MM-DD HH:MM:SS} UTC (server-stamped) */
 function utcStamp(sec){const d=new Date(sec*1000),p=n=>String(n).padStart(2,'0');
   return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+
@@ -5268,7 +5330,7 @@ function fmtSecs(ms){const s=Math.max(0,Math.round(ms/1000));if(s<60)return s+'s
 function doInterrupt(){if(!running)return;wsSend({type:'interrupt'});addNotice('⏹ interrupt sent');}
 function clearUI(){stream.innerHTML='';$('#edits').innerHTML='<div class="empty">no file changes yet</div>';
   $('#gitc').innerHTML='<div class="empty">—</div>';tools={};editCount=0;updateEditBadge();renderCtx(null);ready=false;
-  queued={};renderQueue();stopThinking();clearPlan();planHist=[];renderPlanHistPill();trimHidden=0;syncJump();
+  queued={};renderQueue();stopThinking();clearPlan();planHist=[];phistSel=new Set();renderPlanHistPill();trimHidden=0;syncJump();
   endStream();}   /* also cancels a pending frame, which would else refill the cleared stream */
 
 /* file edits → out of chat, into the Changes drawer */
@@ -5390,6 +5452,7 @@ function route(ev){
   else if(ev.kind==='effort')setEffortPill(ev.effort);
   else if(ev.kind==='plan')setPlan(ev.tasks);
   else if(ev.kind==='plan_hist_item')planHistUpsert(ev.item);
+  else if(ev.kind==='plan_hist_del')planHistDel(ev.ids);
   if(!replaying&&stream.children.length>CHAT_KEEP_ITEMS+120)trimChatWindow();
 }
 
@@ -5836,6 +5899,9 @@ function pmanDelete(){
 
 $('#pmanx').onclick=pmanClose;
 $('#phistx').onclick=closePlanHist;$('#phistclose').onclick=closePlanHist;$('#planhistpill').onclick=openPlanHist;
+$('#phistall').onclick=phistToggleAll;
+$('#phistdel').onclick=()=>{const ids=[...phistSel];if(!ids.length)return;
+  if(ids.length>1&&!confirm('Delete '+ids.length+' plans from this session\'s history?'))return;phistDelete(ids);};
 $('#phist').onclick=e=>{if(e.target.id==='phist')closePlanHist();};   /* backdrop */
 $('#pmanclose').onclick=pmanClose;
 $('#pmandel').onclick=pmanDelete;

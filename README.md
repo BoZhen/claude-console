@@ -62,7 +62,9 @@ which is the whole point.
   two-sentence summary written by a cheap model once the turn that finished the
   plan ends. The list is kept per session and survives a resume; a resumed
   session also gets the plans in its transcript from before the console kept a
-  history, and their summaries are written when the panel is opened.
+  history, and their summaries are written when the panel is opened. Each entry
+  has a `✕` and a checkbox; `Select all` and `Delete selected` remove several at
+  once. A deleted plan stays deleted across a resume.
 - **LaTeX rendering** — `$…$`, `$$…$$`, `\(…\)`, `\[…\]` in replies render with
   KaTeX (vendored, offline).
 - **Clickable file paths** — a path in a reply (`~/work/lattice-qmc/observables.py`)
