@@ -81,6 +81,50 @@ CODEX_ROOT = os.path.join(HOME, ".codex", "sessions")
 CLAUDE_BIN = (_env("CLAUDE") or shutil.which("claude")
               or os.path.expanduser("~/.local/bin/claude"))
 
+
+def cli_version():
+    """The version the CLI on disk is now. The native installer keeps each version
+    as its own file and points the launcher at one, so the file name says it;
+    any other layout is asked with --version."""
+    try:
+        base = os.path.basename(os.path.realpath(CLAUDE_BIN))
+        if re.fullmatch(r"\d+\.\d+\.\d+", base):
+            return base
+        out = subprocess.run([CLAUDE_BIN, "--version"], capture_output=True, text=True, timeout=8).stdout
+        m = re.search(r"\d+\.\d+\.\d+", out or "")
+        return m.group(0) if m else ""
+    except Exception:
+        return ""
+
+
+def _vtuple(v):
+    return tuple(int(x) for x in v.split("."))
+
+
+_CLI_TOO_OLD_RE = re.compile(r"Claude Code ([\d.]+) does not support this model; "
+                             r"version ([\d.]+) or newer is required")
+
+
+def model_change_error(ex):
+    """The notice for a failed model switch. A session keeps the CLI process it
+    started with, so after a CLI update an older session still answers with the
+    old version: for that case name both versions and the way out (a resume or a
+    new session), not the raw API error."""
+    m = _CLI_TOO_OLD_RE.search(str(ex))
+    if not m:
+        return "model change failed: %r" % ex
+    have, need = m.group(1), m.group(2)
+    now = cli_version()
+    head = "model change failed: this session runs Claude Code %s and the model needs %s. " % (have, need)
+    try:
+        current = bool(now) and _vtuple(now) >= _vtuple(need)
+    except ValueError:
+        current = False
+    if current:
+        return head + ("The installed CLI is already %s: end this session and resume it, "
+                       "or open a new one, and the model is available there." % now)
+    return head + "Run `claude update`, then end this session and resume it, or open a new one."
+
 CAP = 12000          # cap per long string field sent to the browser
 RESULT_CAP = 6000    # cap per tool_result body
 POLL_MS = 800        # transcript tail interval
@@ -3174,6 +3218,7 @@ class ChatSession:
         if not self.client or self.ended:
             return
         m = None if (not model or model == "default") else model
+        prev = self.model
         self.model = model or "default"   # optimistic; reflected in list/attach
         if self.cc_id:
             save_pref(self.cc_id, model=self.model)
@@ -3184,7 +3229,11 @@ class ChatSession:
                 self._notice("⚙ model → %s (this session)" % self.model)
                 self._emit({"type": "events", "events": [{"kind": "model", "model": self.model, "once": False}]})
             except Exception as ex:
-                self._notice("model change failed: %r" % ex)
+                self.model = prev             # the session still runs what it ran
+                if self.cc_id:
+                    save_pref(self.cc_id, model=prev)
+                self._notice(model_change_error(ex))
+                self._emit({"type": "events", "events": [{"kind": "model", "model": prev, "once": False}]})
         tornado.ioloop.IOLoop.current().spawn_callback(_s)
 
     def set_mode(self, mode):
