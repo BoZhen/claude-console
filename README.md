@@ -55,8 +55,9 @@ which is the whole point.
   progress count, and a fold to just the active task. A finished plan retires
   two seconds after its last step, or at once with its `read` button, and a
   plan once retired does not come back on a switch or a reload. The console
-  supplies the tool behind it to the session and reminds the model to keep it
-  current.
+  supplies the tool behind it to the session and asks for a plan only for work
+  with several distinct steps; a turn that ends normally closes whatever the
+  plan still has open.
 - **Plan history** — the dock's `history` button, or the `☑ plans` pill at the
   top right, lists every plan of the session, newest first, with its steps, start time, duration and a one- or
   two-sentence summary written by a cheap model once the turn that finished the

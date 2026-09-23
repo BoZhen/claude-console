@@ -189,19 +189,26 @@ def _strip_injected(s):
 # run of two; the same text again as a PostToolUse reminder on the FIRST tool
 # call of the turn, and the model stops and writes the plan. That is the moment
 # it is deciding how many steps there are, so that is where the reminder rides.
-# Keeping the plan CURRENT takes two more: one after a run of tool calls with a
-# step still open, and one at Stop, where an open step blocks the stop once so
-# the panel never lingers half-done.
+# Keeping the plan CURRENT is left to the model, with one fallback: a turn that
+# ends normally closes whatever is still open (_close_plan). Two enforcers were
+# tried and removed. A reminder every few tool calls while a step was open, and
+# a Stop hook that blocked the stop once while a step was open: the forced second
+# turn has to end in a fresh assistant message, and the model restates its whole
+# report there, so the user read every wrap-up twice. The protocol also names
+# what is NOT a plan, since the bar "more than one step" had a two-file
+# explanation making a three-step plan.
 PLAN_TOOL = "mcp__console__plan"
 PLAN_PROMPT = (
     "# Progress panel\n"
     "The console pins a progress panel above the chat, fed by the `mcp__console__plan` "
-    "tool. Whenever a request takes more than one step, call it first with the full "
-    "list of steps (all pending), again as each step starts (in_progress) and finishes "
-    "(completed), and again if the steps change. Always send the complete list. Keep "
-    "exactly one step in_progress while you work. A single-step request needs no plan."
+    "tool. It is for work with several distinct steps: a change plus its verification, "
+    "edits across several files, a task with phases. Call it first with the full list of "
+    "steps (all pending), again as a step starts (in_progress) or finishes (completed), "
+    "and again if the steps change; always send the complete list, one step in_progress "
+    "at a time. A question, an explanation, a review, reading a file or two, or a single "
+    "edit needs no plan; most requests need none. Update the panel before your final "
+    "message, not after it: the console closes whatever is still open when the turn ends."
     + (" Write the step titles in %s." % PLAN_LANG if PLAN_LANG else ""))
-PLAN_NUDGE_EVERY = 4     # tool calls with a step still open before a reminder rides along
 PLAN_SCHEMA = {
     "type": "object", "required": ["steps"],
     "properties": {"steps": {"type": "array", "items": {
@@ -2389,6 +2396,7 @@ class ChatSession:
         self._task_open = {}      # TaskCreate tool_use id -> the task, until a result names it
         self._task_seq = 0        # creation ordinal; the fallback id if that text ever changes
         self._since_plan = 0      # tool calls since the plan was last touched (PostToolUse nudge)
+        self._interrupted = False # the user stopped this turn: its plan is left as it stands
         self._agents = {}         # Agent tool_use id -> its subagent's {up, out, steps}, for the card
         self._agent_reqs = {}     # Agent tool_use id -> message ids already counted
         self._agent_tasks = {}    # CLI task id -> Agent tool_use id, for the task_* lifecycle messages
@@ -2428,12 +2436,11 @@ class ChatSession:
             add_dirs=[self.cwd], cli_path=CLAUDE_BIN, include_partial_messages=True,
             max_buffer_size=MAX_BUFFER,
             extra_args={"dangerously-skip-permissions": None})
-        # the console's own plan tool and the three reminders that make it used (PLAN_TOOL)
+        # the console's own plan tool and the two reminders that make it used (PLAN_TOOL)
         opts.mcp_servers = {"console": self._plan_server()}
         opts.allowed_tools = [PLAN_TOOL]
         opts.hooks = {"UserPromptSubmit": [HookMatcher(hooks=[self._hook_prompt])],
-                      "PostToolUse": [HookMatcher(hooks=[self._hook_post_tool])],
-                      "Stop": [HookMatcher(hooks=[self._hook_stop])]}
+                      "PostToolUse": [HookMatcher(hooks=[self._hook_post_tool])]}
         if self.model and self.model != "default":
             opts.model = self.model
         if self.effort:
@@ -2448,8 +2455,8 @@ class ChatSession:
     def _plan_server(self):
         """The console's plan tool, served in-process. Its result text carries the
         next nudge, since that is the one place the model is certain to read."""
-        @tool("plan", "Keep the user's pinned progress panel current. Send the FULL list "
-              "of steps every time the plan changes."
+        @tool("plan", "Keep the user's pinned progress panel current: the FULL list of "
+              "steps every time the plan changes. For work with several distinct steps only."
               + (" Step titles in %s." % PLAN_LANG if PLAN_LANG else ""), PLAN_SCHEMA)
         async def plan(args):
             steps = [x for x in ((args or {}).get("steps") or []) if isinstance(x, dict)]
@@ -2481,40 +2488,22 @@ class ChatSession:
                                        "additionalContext": PLAN_PROMPT}}
 
     async def _hook_post_tool(self, input_data, tool_use_id, context):
-        """PostToolUse: after PLAN_NUDGE_EVERY calls with a step still open, remind."""
+        """PostToolUse: one nudge, at the first tool call of a turn that has no open
+        plan, which is the moment the model can still tell how many steps it has
+        (a finished plan from an earlier turn does not count as one)."""
         if (input_data or {}).get("agent_id"):      # fired inside a subagent: not its plan
             return {}
         if (input_data or {}).get("tool_name") == PLAN_TOOL:
             self._since_plan = 0
             return {}
         self._since_plan += 1
-        cur = self._plan_open()
-        if not cur:
-            # working with no open plan: one nudge, at the first call of the turn,
-            # which is the moment the model can still tell how many steps it has
-            # (a finished plan from an earlier turn does not count as one)
-            if self._since_plan != 1:
-                return {}
-            return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext":
-                    "Progress panel: no plan is on the board. If this request takes more than "
-                    "one step, call mcp__console__plan now with the full list of steps."}}
-        if self._since_plan < PLAN_NUDGE_EVERY:
+        if self._since_plan != 1 or self._plan_open():
             return {}
-        self._since_plan = 0
         return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext":
-                "Progress panel: '%s' is still %s. If it is finished, or the plan has changed, "
-                "call mcp__console__plan with the full list before going on."
-                % (cur.get("subject") or "", cur.get("status") or "pending")}}
-
-    async def _hook_stop(self, input_data, tool_use_id, context):
-        """Stop: an open step blocks the stop once, so the panel is settled before
-        the answer stands. stop_hook_active is the CLI's own loop guard."""
-        if (input_data or {}).get("stop_hook_active") or not self._plan_open():
-            return {}
-        return {"decision": "block", "reason":
-                "Before finishing, bring the progress panel up to date: call mcp__console__plan "
-                "with the full list, marking finished steps completed and dropping steps you will "
-                "not do. Then finish."}
+                "Progress panel: no plan is on the board. If this request is work with several "
+                "distinct steps (a change plus its verification, edits across files), call "
+                "mcp__console__plan now with the full list of steps. A question, an explanation "
+                "or a small edit needs none."}}
 
     async def _can_use_tool(self, tool_name, tool_input, context):
         """SDK permission hook. AskUserQuestion is answered in-band: we surface the
@@ -3034,6 +3023,7 @@ class ChatSession:
             self._tok_exact = False
             self._step = 0
             self._since_plan = 0
+            self._interrupted = False
             cmd0 = text.strip().split(None, 1)[0] if text.strip() else ""
             self.compacting = (cmd0 == "/compact")
             self._compact_turn = self.compacting
@@ -3133,6 +3123,7 @@ class ChatSession:
 
     def interrupt(self):
         if self.client and not self.ended:
+            self._interrupted = True
             if self.queue:        # interrupting also cancels pending queued messages
                 self._push([{"kind": "unqueued", "qid": it["qid"]} for it in self.queue])
                 self.queue = []
@@ -3484,10 +3475,31 @@ class ChatSession:
                 return (1, 0)   # unparsable id: keep it after the rest, in arrival order
         return [dict(t, id=tid) for tid, t in sorted(self.tasks.items(), key=key)]
 
+    def _close_plan(self, evs):
+        """The turn is over: whatever the plan still has open is closed here, so
+        the panel settles without a forced extra turn. Only a turn that ended
+        normally counts; after an error or an interrupt the panel keeps showing
+        where the work stopped."""
+        done = [e for e in evs if e.get("kind") == "turn_done" and not e.get("parent")]
+        if not done:
+            return False
+        ev = done[-1]
+        if ev.get("isError") or self._interrupted or ev.get("subtype") not in (None, "success"):
+            return False
+        changed = False
+        for t in self.tasks.values():
+            if t.get("status") != "completed":
+                t["status"] = "completed"
+                changed = True
+        return changed
+
     def _push(self, evs):
         # one snapshot per batch, appended after the calls that caused it, so a
         # replayed history converges on the same plan the live viewers are showing
-        if self._fold_tasks(evs):
+        changed = self._fold_tasks(evs)
+        if self._close_plan(evs):
+            changed = True
+        if changed:
             evs = list(evs) + [{"kind": "plan", "tasks": self.plan_tasks()}]
             self._track_plan(evs)
         self._plans_after_turn(evs)
