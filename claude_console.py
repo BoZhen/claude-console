@@ -447,6 +447,14 @@ def normalize_cc(rec):
 
 
 # ───────────────────────── session discovery ─────────────────────────
+def _user_texts(msg):
+    """The non-empty text blocks of a user record's content, in order."""
+    blocks = [msg] if isinstance(msg, str) else [
+        b.get("text") for b in (msg if isinstance(msg, list) else [])
+        if isinstance(b, dict) and b.get("type", "text") == "text"]
+    return [t.strip() for t in blocks if isinstance(t, str) and t.strip()]
+
+
 def _peek_claude(path):
     cwd, branch, title = "", "", ""
     try:
@@ -467,8 +475,13 @@ def _peek_claude(path):
                     s = (s or "").strip()
                     if s.startswith("Transcript so far:") and s.endswith("Recap:"):
                         return "__recap__", "", ""   # claude-console recap-query artifact → hide it
-                    if s and not s.startswith("<") and "tool_result" not in s[:40]:
-                        title = s.replace("\n", " ")[:100]
+                    # the first block of real text: a tool-result record has none, and
+                    # a block the CLI attached (<ide_selection>, a reminder, slash-command
+                    # markup) comes before the prompt it belongs to
+                    for t in _user_texts(msg):
+                        if not t.startswith("<"):
+                            title = t.replace("\n", " ")[:100]
+                            break
                 if cwd and title:
                     break
     except Exception:
