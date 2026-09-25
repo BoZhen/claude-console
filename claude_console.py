@@ -77,6 +77,90 @@ IMPORT_MAX = int(_env("IMPORT_MAX_MB", "1024") or "1024") * 1024 * 1024
 HOME = os.path.expanduser("~")
 CLAUDE_ROOT = os.path.join(HOME, ".claude", "projects")
 CODEX_ROOT = os.path.join(HOME, ".codex", "sessions")
+# ── extra Claude accounts ─────────────────────────────────────────────────────
+# A second login is nothing but a second CLAUDE_CONFIG_DIR. The CLI keeps its
+# credentials AND its transcripts under there, so two accounts never see each
+# other's sessions. That is why the console does not record which account owns a
+# session: it reads the answer off WHERE THE TRANSCRIPT LIVES. One file in one
+# tree cannot disagree with itself, and handing a session over is then a rename,
+# which is atomic inside a filesystem. Nothing is ever left behind to go stale.
+# No accounts file (every machine, until someone adds one) → one tree → the
+# behaviour below is exactly what it was before any of this existed.
+ACCOUNTS_FILE = os.path.join(HOME, ".claude", "console-accounts.json")
+MAIN_ACCOUNT = {"id": "main", "label": "main", "dir": os.path.join(HOME, ".claude")}
+_accounts_cache = {"mtime": -1.0, "v": []}
+
+
+def load_accounts():
+    """The extra accounts, as [{id,label,dir}]. Cached, invalidated by mtime."""
+    try:
+        m = os.path.getmtime(ACCOUNTS_FILE)
+    except OSError:
+        _accounts_cache["mtime"], _accounts_cache["v"] = -1.0, []
+        return _accounts_cache["v"]
+    if m != _accounts_cache["mtime"]:
+        v = []
+        try:
+            with open(ACCOUNTS_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+            for a in (d.get("accounts") if isinstance(d, dict) else d) or []:
+                aid = str(a.get("id") or "").strip()
+                path = str(a.get("dir") or "").strip()
+                if aid and aid != "main" and path:
+                    v.append({"id": aid, "label": str(a.get("label") or aid),
+                              "dir": os.path.expanduser(path)})
+        except Exception:
+            v = []
+        _accounts_cache["v"], _accounts_cache["mtime"] = v, m
+    return _accounts_cache["v"]
+
+
+def all_accounts():
+    """Every account, the one the console itself runs under first. A list of one
+    means this machine has a single login, and no account UI is shown."""
+    return [dict(MAIN_ACCOUNT)] + [dict(a) for a in load_accounts()]
+
+
+def account_by_id(aid):
+    for a in all_accounts():
+        if a["id"] == (aid or "main"):
+            return a
+    return dict(MAIN_ACCOUNT)
+
+
+def account_roots():
+    """[(account_id, <config dir>/projects)] — every tree a transcript can be in."""
+    return [(a["id"], os.path.join(a["dir"], "projects")) for a in all_accounts()]
+
+
+def save_accounts(items):
+    """Replace the extra-account list. Every directory is checked to look like a
+    claude config dir, because a typo here would hand a session to an empty
+    folder, and the session would be the thing that goes missing."""
+    out, seen = [], {"main"}
+    for a in items or []:
+        aid = re.sub(r"[^a-zA-Z0-9_-]", "", str(a.get("id") or "").strip())[:32]
+        path = os.path.expanduser(str(a.get("dir") or "").strip())
+        if not aid or aid in seen or not path:
+            continue
+        if not os.path.isdir(path):
+            raise ValueError("not a directory: %s" % path)
+        if not (os.path.isdir(os.path.join(path, "projects"))
+                or os.path.exists(os.path.join(path, ".credentials.json"))):
+            raise ValueError("%s has no projects/ and no .credentials.json, so it is "
+                             "not a claude config dir" % path)
+        if os.path.realpath(path) == os.path.realpath(MAIN_ACCOUNT["dir"]):
+            raise ValueError("that is the account the console already runs under")
+        seen.add(aid)
+        out.append({"id": aid,
+                    "label": (str(a.get("label") or "").strip() or aid)[:40],
+                    "dir": path})
+    tmp = ACCOUNTS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"accounts": out}, f, indent=2)
+    os.replace(tmp, ACCOUNTS_FILE)
+    _accounts_cache["mtime"] = -1.0
+    return out
 # Interactive console drives the real `claude` CLI in headless stream-json mode.
 CLAUDE_BIN = (_env("CLAUDE") or shutil.which("claude")
               or os.path.expanduser("~/.local/bin/claude"))
@@ -570,7 +654,8 @@ def _peek_codex(path):
 
 def list_sessions(limit=50):
     items = []
-    claude_files = glob.glob(os.path.join(CLAUDE_ROOT, "*", "*.jsonl"))
+    claude_files = [p for _a, root in account_roots()
+                    for p in glob.glob(os.path.join(root, "*", "*.jsonl"))]
     codex_files = glob.glob(os.path.join(CODEX_ROOT, "**", "*.jsonl"), recursive=True)
     paths = ([(p, "claude") for p in claude_files] +
              [(p, "codex") for p in codex_files])
@@ -634,11 +719,48 @@ def _is_junk(p):
 
 
 def find_transcript(cc):
-    """Locate claude's on-disk transcript for a session id (filename == session id)."""
+    """Locate claude's on-disk transcript for a session id (filename == session id).
+    Every account's tree is searched, because which tree holds the file is the
+    same question as which account the session belongs to."""
     if not _valid_cc(cc):
         return None
-    hits = glob.glob(os.path.join(CLAUDE_ROOT, "*", cc + ".jsonl"))
-    return hits[0] if hits else None
+    for _aid, root in account_roots():
+        hits = glob.glob(os.path.join(root, "*", cc + ".jsonl"))
+        if hits:
+            return hits[0]
+    return None
+
+
+def transcript_account(cc):
+    """Which account's tree currently holds this session."""
+    if not _valid_cc(cc):
+        return "main"
+    for aid, root in account_roots():
+        if glob.glob(os.path.join(root, "*", cc + ".jsonl")):
+            return aid
+    return "main"
+
+
+def move_transcript(cc, cwd, to_account):
+    """Hand a session's transcript to another account, and return where it landed.
+    The CLI must already be stopped: it holds the file open and appends to it.
+    A rename keeps the file in exactly one tree the whole time, so an interrupted
+    switch can lose neither the history nor the account it belongs to."""
+    src = find_transcript(cc)
+    if not src:
+        raise ValueError("this session has no transcript on disk yet")
+    dest_dir = os.path.join(account_by_id(to_account)["dir"], "projects",
+                            proj_folder(cwd))
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, cc + ".jsonl")
+    if os.path.realpath(src) == os.path.realpath(dest):
+        return dest
+    try:
+        os.replace(src, dest)
+    except OSError:       # the two accounts sit on different filesystems
+        shutil.copy2(src, dest)
+        os.remove(src)
+    return dest
 
 
 def proj_folder(cwd):
@@ -1911,7 +2033,8 @@ def reindex():
                  in db.execute("SELECT fid, path, off FROM files")}
         added = 0
         alive = set()
-        for path in glob.glob(os.path.join(CLAUDE_ROOT, "*", "*.jsonl")):
+        for path in [p for _a, root in account_roots()
+                     for p in glob.glob(os.path.join(root, "*", "*.jsonl"))]:
             if _index_skip(path):
                 continue      # left out of `alive`, so any rows already stored go
             alive.add(path)
@@ -2187,6 +2310,36 @@ class ModelsHandler(AuthMixin, tornado.web.RequestHandler):
         self.write(json.dumps({"models": m or []}))
 
 
+class AccountsHandler(AuthMixin, tornado.web.RequestHandler):
+    """The logins this machine knows about. GET always answers at least the one
+    the console runs under, so the client can tell a single-account machine (and
+    then show no account UI at all) from one that has a choice to offer."""
+
+    async def get(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "application/json")
+        self.write(json.dumps({"accounts": all_accounts()}))
+
+    async def post(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "application/json")
+        try:
+            body = json.loads(self.request.body or b"{}")
+        except Exception:
+            self.set_status(400)
+            self.write(json.dumps({"error": "invalid json"}))
+            return
+        try:
+            save_accounts(body.get("accounts") or [])
+        except ValueError as e:
+            self.set_status(400)
+            self.write(json.dumps({"error": str(e)}))
+            return
+        self.write(json.dumps({"accounts": all_accounts()}))
+
+
 class ExportHandler(AuthMixin, tornado.web.RequestHandler):
     """Download a session's raw transcript. Streamed, because these run to hundreds
     of MB. The download keeps the name '<session-id>.jsonl' on purpose: the CLI
@@ -2395,9 +2548,14 @@ class ChatSession:
     Survives navigation/reload (viewers attach/detach); ends only on explicit end().
     Provides per-action approval (can_use_tool) and interrupt()."""
 
-    def __init__(self, sid, cwd, model, mode, resume_cc=None, effort="max"):
+    def __init__(self, sid, cwd, model, mode, resume_cc=None, effort="max",
+                 account="main"):
         self.id = sid
         self.cwd = cwd
+        # Which login runs this session. Resumed sessions inherit it from the tree
+        # their transcript sits in, so the answer survives a console restart
+        # without being written down anywhere.
+        self.account = account or "main"
         self.model = model
         self.mode = mode
         self.effort = _sanitize_effort(effort)   # thinking depth (--effort, launch-time)
@@ -2492,6 +2650,11 @@ class ChatSession:
             opts.effort = "xhigh" if self.effort == "ultracode" else self.effort
         if self.resume_cc:
             opts.resume = self.resume_cc
+        if self.account != "main":
+            # The same variable a second-login shell alias sets. The SDK
+            # layers options.env over the inherited environment, so PATH and the
+            # rest of the console's environment survive.
+            opts.env = {"CLAUDE_CONFIG_DIR": account_by_id(self.account)["dir"]}
         self.client = ClaudeSDKClient(options=opts)
         await self.client.connect()
         tornado.ioloop.IOLoop.current().spawn_callback(self._consume)
@@ -3680,6 +3843,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "name": os.path.basename(sess.cwd) or sess.cwd, "cc": sess.cc_id,
                        "title": sess.title(), "ctx": sess.ctx,
                        "model": sess.model or "default", "mode": sess.mode,
+                       "account": sess.account,
                        "busy": sess.busy, "ended": sess.ended, "events": events,
                        "events_delta": events_delta, "event_seq": sess.event_seq,
                        "turn_age": sess.turn_age(), "word": sess.turn_word, "effort": sess.effort,
@@ -3709,7 +3873,8 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                 r_model = pf.get("model") or msg.get("model") or ""
                 r_effort = _sanitize_effort(pf.get("effort") or msg.get("effort"))
                 sess = ChatSession(secrets.token_hex(6), cwd, r_model,
-                                   r_mode, resume_cc=cc, effort=r_effort)
+                                   r_mode, resume_cc=cc, effort=r_effort,
+                                   account=transcript_account(cc))
                 sess.preload()
                 try:
                     await sess.start()
@@ -3725,10 +3890,73 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "name": os.path.basename(sess.cwd) or sess.cwd, "cc": sess.cc_id,
                        "title": sess.title(), "ctx": sess.ctx,
                        "model": sess.model or "default", "mode": sess.mode,
+                       "account": sess.account,
                        "busy": sess.busy, "ended": sess.ended, "events": sess.log,
                        "turn_age": sess.turn_age(), "word": sess.turn_word, "effort": sess.effort,
                        "compacting": sess.compacting, "resumed": True, "tasks": sess.plan_tasks(), "plan_hist": sess.plan_hist_items(),
                        "events_delta": False, "event_seq": sess.event_seq})
+        elif mt == "set_account":
+            # Hand a session to another login. The CLI stops first: it holds the
+            # transcript open and appends to it, so the file cannot move under it.
+            # What comes back is a new session resuming the same conversation, so
+            # every viewer is re-attached exactly the way a resume does it.
+            sess = CHAT_SESSIONS.get(msg.get("id")) or self.session
+            to = str(msg.get("account") or "main")
+            if not sess or sess.ended:
+                self._say({"type": "error", "error": "no live session to hand over"})
+                return
+            if to not in [a["id"] for a in all_accounts()]:
+                self._say({"type": "error", "error": "unknown account"})
+                return
+            if sess.busy:
+                self._say({"type": "error",
+                           "error": "finish or interrupt the current turn first"})
+                return
+            cc, cwd = sess.cc_id, sess.cwd
+            if not _valid_cc(cc):
+                self._say({"type": "error",
+                           "error": "this session has not reached disk yet — send a message first"})
+                return
+            if sess.account == to:
+                return
+            model, mode, effort = sess.model, sess.mode, sess.effort
+            watchers = [v for v in sess.viewers]
+            sess.terminate()
+            CHAT_SESSIONS.pop(sess.id, None)
+            try:
+                move_transcript(cc, cwd, to)
+            except Exception as e:
+                self._say({"type": "error", "error": "could not move the transcript: %s" % e})
+                return
+            new = ChatSession(secrets.token_hex(6), cwd, model, mode, resume_cc=cc,
+                              effort=effort, account=to)
+            new.preload()
+            try:
+                await new.start()
+            except Exception as e:
+                self._say({"type": "error",
+                           "error": "spawn under %s failed: %s" % (to, e)})
+                return
+            CHAT_SESSIONS[new.id] = new
+            payload = {"type": "attached", "id": new.id, "cwd": new.cwd,
+                       "name": os.path.basename(new.cwd) or new.cwd, "cc": new.cc_id,
+                       "title": new.title(), "ctx": new.ctx,
+                       "model": new.model or "default", "mode": new.mode,
+                       "busy": new.busy, "ended": new.ended, "events": new.log,
+                       "turn_age": new.turn_age(), "word": new.turn_word,
+                       "effort": new.effort, "compacting": new.compacting,
+                       "resumed": True, "tasks": new.plan_tasks(),
+                       "plan_hist": new.plan_hist_items(), "events_delta": False,
+                       "event_seq": new.event_seq, "account": new.account}
+            for v in (watchers or [self]):
+                v.session = new
+                new.attach(v)
+                try:
+                    v._say(dict(payload))
+                except Exception:
+                    pass
+            new._notice("\u2699 this session now runs as %s"
+                        % account_by_id(to)["label"])
         elif mt == "detach":
             # closing the last tab stops the VIEW, never the session: drop this
             # socket's subscription so a background turn is not rendered into a
@@ -3849,7 +4077,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                 {"id": s.id, "cwd": s.cwd, "root": _norm_dir(s.cwd) or s.cwd,
                  "name": os.path.basename(s.cwd) or s.cwd,
                  "cc": s.cc_id, "model": s.model or "default", "mode": s.mode,
-                 "effort": s.effort, "title": s.title(),
+                 "account": s.account, "effort": s.effort, "title": s.title(),
                  "busy": s.busy, "ended": s.ended, "event_seq": s.event_seq}
                 for s in CHAT_SESSIONS.values()]})
 
@@ -4458,8 +4686,43 @@ body.tabdrag,body.tabdrag .stab{cursor:grabbing}
 .sb-h .grow{flex:1}
 .sb-ref{cursor:pointer}.sb-ref:hover{color:var(--fg)}
 .sb-foot{margin-top:auto;padding:8px 10px;border-top:1px solid var(--line);display:flex;align-items:center;gap:8px}
-.sb-foot-l{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);white-space:nowrap}
-.sb-foot select{flex:1;min-width:0;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:5px;padding:4px 6px;font-size:12px}
+.sb-gear{flex:1;min-width:0;background:var(--bg3);color:var(--mut);border:1px solid var(--line);
+  border-radius:5px;padding:5px 8px;font-size:12px;cursor:pointer;text-align:left}
+.sb-gear:hover{color:var(--acc);border-color:var(--acc)}
+#settings{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.55);
+  display:flex;align-items:center;justify-content:center;padding:16px}
+#settings[hidden]{display:none}
+#setpanel{width:min(620px,100%);max-height:82vh;display:flex;flex-direction:column;
+  background:var(--bg2);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+#setbody{overflow:auto;padding:4px 14px 10px;min-height:0}
+.setsec{padding:12px 0;border-top:1px solid var(--line)}
+.setsec:first-child{border-top:0}
+.seth{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);margin-bottom:7px}
+.setnote{font-size:12px;color:var(--mut);line-height:1.55;margin-bottom:9px}
+.setnote code{font-family:var(--fmono);font-size:11.5px}
+.setsec select{width:100%;background:var(--bg3);color:var(--fg);border:1px solid var(--line);
+  border-radius:5px;padding:5px 7px;font-size:12px}
+.accrow{display:flex;align-items:center;gap:9px;padding:6px 8px;border:1px solid var(--line);
+  border-radius:6px;margin-bottom:6px;font-size:12px}
+.accrow .acci{font-weight:650;color:var(--acc);flex:none}
+.accrow.accmain .acci{color:var(--mut)}
+.accrow .accd{font-family:var(--fmono);font-size:11px;color:var(--mut);
+  flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.accrow .accnote{font-size:11px;color:var(--mut);flex:none}
+.accrow .accdel{flex:none;border:0;background:none;color:var(--mut);cursor:pointer;
+  font-size:12px;border-radius:4px;padding:2px 5px}
+.accrow .accdel:hover{color:var(--del);background:var(--bg3)}
+.accadd{display:flex;gap:6px;margin-top:8px}
+.accadd input{min-width:0;background:var(--bg3);color:var(--fg);border:1px solid var(--line);
+  border-radius:5px;padding:5px 7px;font-size:12px}
+.accadd #accid{flex:0 0 76px}
+.accadd #acclabel{flex:0 0 104px}
+.accadd #accdir{flex:1}
+.accadd button{flex:none;background:var(--bg3);color:var(--fg);border:1px solid var(--line);
+  border-radius:5px;padding:5px 10px;font-size:12px;cursor:pointer}
+.accadd button:hover{border-color:var(--acc);color:var(--acc)}
+#accerr{margin-top:8px;font-size:12px;color:var(--del)}
+#accerr[hidden]{display:none}
 .sb-empty{color:var(--mut);font-size:12px;padding:5px 10px;line-height:1.4}
 .srow{padding:7px 9px;cursor:pointer;display:flex;gap:8px;align-items:center;border-left:2px solid transparent}
 .srow:hover{background:var(--bg3)}
@@ -4687,26 +4950,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
       <div id="recentList" class="seclist"><div class="sb-empty">—</div></div>
     </div>
     <div class="sb-foot">
-      <span class="sb-foot-l">Theme</span>
-      <select id="theme" title="color theme">
-        <optgroup label="Dark">
-          <option value="dark">Dark</option>
-          <option value="dracula">Dracula</option>
-          <option value="nord">Nord</option>
-          <option value="tokyo-night">Tokyo Night</option>
-          <option value="catppuccin">Catppuccin Mocha</option>
-          <option value="gruvbox">Gruvbox Dark</option>
-        </optgroup>
-        <optgroup label="Light">
-          <option value="light">Light</option>
-          <option value="solarized-light">Solarized Light</option>
-          <option value="catppuccin-latte">Catppuccin Latte</option>
-          <option value="gruvbox-light">Gruvbox Light</option>
-          <option value="rose-pine-dawn">Rosé Pine Dawn</option>
-          <option value="one-light">One Light</option>
-          <option value="ayu-light">Ayu Light</option>
-        </optgroup>
-      </select>
+      <button id="settingsbtn" class="sb-gear" title="Accounts and theme">⚙ Settings</button>
     </div>
   </aside>
   <div id="sbresize"></div>
@@ -4786,6 +5030,51 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
     <div id="phistlist"></div>
     <div class="fbtns"><button class="fcancel" id="phistclose">Close</button>
       <button id="phistdel" disabled>🗑 Delete selected</button></div>
+  </div>
+</div>
+<div id="settings" hidden>
+  <div id="setpanel">
+    <div class="fh"><span class="ft">⚙ Settings</span><span class="grow"></span>
+      <button class="btn" id="setx" title="close">✕</button></div>
+    <div id="setbody">
+      <div class="setsec">
+        <div class="seth">Claude accounts</div>
+        <div class="setnote">A second login is a second <code>CLAUDE_CONFIG_DIR</code> —
+          its own credentials and its own transcripts. Add one here and any session
+          can be handed to it from the ⚙ Configure menu on its card.</div>
+        <div id="acclist"></div>
+        <div class="accadd">
+          <input id="accid" placeholder="id" spellcheck="false" autocomplete="off">
+          <input id="acclabel" placeholder="label" spellcheck="false" autocomplete="off">
+          <input id="accdir" placeholder="config dir, e.g. ~/.claude-alt" spellcheck="false" autocomplete="off">
+          <button id="accadd">+ Add</button>
+        </div>
+        <div id="accerr" hidden></div>
+      </div>
+      <div class="setsec">
+        <div class="seth">Theme</div>
+      <select id="theme" title="color theme">
+        <optgroup label="Dark">
+          <option value="dark">Dark</option>
+          <option value="dracula">Dracula</option>
+          <option value="nord">Nord</option>
+          <option value="tokyo-night">Tokyo Night</option>
+          <option value="catppuccin">Catppuccin Mocha</option>
+          <option value="gruvbox">Gruvbox Dark</option>
+        </optgroup>
+        <optgroup label="Light">
+          <option value="light">Light</option>
+          <option value="solarized-light">Solarized Light</option>
+          <option value="catppuccin-latte">Catppuccin Latte</option>
+          <option value="gruvbox-light">Gruvbox Light</option>
+          <option value="rose-pine-dawn">Rosé Pine Dawn</option>
+          <option value="one-light">One Light</option>
+          <option value="ayu-light">Ayu Light</option>
+        </optgroup>
+      </select>
+      </div>
+    </div>
+    <div class="fbtns"><button class="fcancel" id="setclose">Close</button></div>
   </div>
 </div>
 <div id="fimp" hidden>
@@ -5742,6 +6031,10 @@ function openConfigure(s,anchor){const m=$('#cardMenu');m.innerHTML='';m._anchor
   row('Permission',mkSel([['acceptEdits','⚡ Auto-accept'],['default','🔐 Approve'],['plan','📋 Plan'],['bypassPermissions','⏩ Full auto']],s.mode||'default',
     v=>{wsSend({type:'configure',id:s.id,mode:v});setTimeout(reqList,200);}));
   row('Effort',mkSel(EFFORTS.map(e=>[e,e]),curEffort,v=>{setEffort(v);closeCardMenu();}));
+  /* only worth a row when this machine actually has a second login configured */
+  if(ACCOUNTS.length>1)
+    row('Account',mkSel(ACCOUNTS.map(a=>[a.id,a.label]),s.account||'main',
+      v=>switchAccount(s,v)));
   m.classList.add('on');
   const r=anchor.getBoundingClientRect(),mw=m.offsetWidth,mh=m.offsetHeight;
   let left,top;
@@ -6858,6 +7151,65 @@ function applyTheme(t){if(t&&t!=='dark')document.documentElement.setAttribute('d
 (function(){const t=localStorage.getItem('al_theme')||'dark';const sel=$('#theme');
   if(sel){sel.value=t;sel.onchange=()=>{const v=sel.value;localStorage.setItem('al_theme',v);applyTheme(v);};}
   applyTheme(t);})();
+/* ⚙ Settings: the logins this machine knows about, and the theme. ACCOUNTS
+   always holds at least the one the console runs under, so a length of 1 is how
+   the rest of the UI knows there is no choice to offer and stays as it was. */
+let ACCOUNTS=[{id:'main',label:'main',dir:''}];
+function loadAccounts(){return fetch('/api/accounts').then(r=>r.json()).then(j=>{
+  if(j&&j.accounts&&j.accounts.length)ACCOUNTS=j.accounts;return ACCOUNTS;}).catch(()=>ACCOUNTS);}
+function accLabel(id){const a=ACCOUNTS.find(x=>x.id===(id||'main'));return a?a.label:(id||'main');}
+function accErr(m){const e=$('#accerr');if(!e)return;
+  if(m){e.textContent=m;e.removeAttribute('hidden');}else{e.textContent='';e.setAttribute('hidden','');}}
+function renderAccounts(){const h=$('#acclist');if(!h)return;
+  const main=ACCOUNTS[0]||{dir:'~/.claude'};
+  h.innerHTML='<div class="accrow accmain"><span class="acci">main</span>'+
+    '<span class="accd">'+esc(main.dir||'~/.claude')+'</span>'+
+    '<span class="accnote">the console runs here</span></div>'+
+    ACCOUNTS.filter(a=>a.id!=='main').map(a=>'<div class="accrow" data-id="'+escAttr(a.id)+'">'+
+      '<span class="acci">'+esc(a.label)+'</span><span class="accd">'+esc(a.dir)+'</span>'+
+      '<button class="accdel" title="remove">✕</button></div>').join('');
+  h.querySelectorAll('.accdel').forEach(b=>b.onclick=()=>{
+    const id=b.parentNode.getAttribute('data-id');
+    /* Removing an account here only forgets where it is. Its transcripts stay in
+       its own tree, which is also why a session living there would drop out of
+       the list until the account is added back. */
+    if(!confirm('Forget the account “'+id+'”?\n\nNothing is deleted. Sessions whose '+
+      'transcript lives in that account stop being listed until you add it again.'))return;
+    saveAccounts(ACCOUNTS.filter(a=>a.id!=='main'&&a.id!==id));});}
+function saveAccounts(list){accErr('');
+  return fetch('/api/accounts',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({accounts:list})}).then(r=>r.json()).then(j=>{
+      if(j&&j.error){accErr(j.error);return;}
+      ACCOUNTS=(j&&j.accounts)||ACCOUNTS;renderAccounts();reqList();
+    }).catch(()=>accErr('could not save'));}
+function openSettings(){loadAccounts().then(()=>{accErr('');renderAccounts();
+  $('#settings').removeAttribute('hidden');});}
+function closeSettings(){$('#settings').setAttribute('hidden','');}
+$('#settingsbtn').onclick=openSettings;
+$('#setx').onclick=closeSettings;
+$('#setclose').onclick=closeSettings;
+$('#settings').onclick=ev=>{if(ev.target===$('#settings'))closeSettings();};
+$('#accadd').onclick=()=>{const id=$('#accid').value.trim(),lb=$('#acclabel').value.trim(),
+  d=$('#accdir').value.trim();
+  if(!id||!d){accErr('an id and a config dir are both needed');return;}
+  saveAccounts(ACCOUNTS.filter(a=>a.id!=='main').concat([{id:id,label:lb||id,dir:d}]))
+    .then(()=>{if(!$('#accerr').textContent){$('#accid').value='';$('#acclabel').value='';$('#accdir').value='';}});};
+/* Handing a session to another login is not a hot-swap the way the model is. The
+   CLI stops, the transcript moves to that account's tree, and a new CLI resumes
+   from it. The conversation is then read again from the start, because a prompt
+   cache belongs to one login and cannot be shared, so the next turn costs what
+   reading the whole thing costs. That is worth saying before it happens. */
+function switchAccount(s,to){
+  const cur=s.account||'main',a=ACCOUNTS.find(x=>x.id===to);
+  closeCardMenu();
+  if(!a||to===cur)return;
+  if(!confirm('Hand this session to “'+a.label+'”?\n\n'+
+    'The running CLI stops and a new one resumes the same conversation under that '+
+    'login. The transcript moves to that account and leaves this one.\n\n'+
+    'That login has to read the whole conversation again, so the next turn is '+
+    'slower and costs more.'))return;
+  wsSend({type:'set_account',id:s.id,account:to});}
+loadAccounts();
 $('#navtoggle').onclick=toggleSidebar;
 $('#sb-backdrop').onclick=closeSidebar;
 /* effort pill: click to pick thinking depth (low/medium/high/xhigh/max) */
@@ -7074,6 +7426,7 @@ def main():
         (r"/api/diff", DiffHandler),
         (r"/api/usage", UsageHandler),
         (r"/api/models", ModelsHandler),
+        (r"/api/accounts", AccountsHandler),
         (r"/api/export", ExportHandler),
         (r"/api/import", ImportHandler),
         (r"/api/search", SearchHandler),
