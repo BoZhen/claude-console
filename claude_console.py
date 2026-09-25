@@ -686,7 +686,8 @@ def list_projects():
     junk = [os.path.realpath(p) for p in (
         "/tmp", os.path.join(HOME, ".cache"), os.path.join(HOME, ".claude-mem"),
         os.path.join(HOME, ".claude"), os.path.join(HOME, ".codex"),
-        os.path.join(HOME, ".config"))]
+        os.path.join(HOME, ".config"))] + [
+        os.path.realpath(a["dir"]) for a in all_accounts()]   # every login's config dir
 
     def is_junk(p):
         rp = os.path.realpath(p)
@@ -713,7 +714,8 @@ def _is_junk(p):
         _JUNK_ROOTS = [os.path.realpath(x) for x in (
             "/tmp", os.path.join(HOME, ".cache"), os.path.join(HOME, ".claude-mem"),
             os.path.join(HOME, ".claude"), os.path.join(HOME, ".codex"),
-            os.path.join(HOME, ".config"))]
+            os.path.join(HOME, ".config"))] + [
+            os.path.realpath(a["dir"]) for a in all_accounts()]
     rp = os.path.realpath(p)
     return any(rp == j or rp.startswith(j + os.sep) for j in _JUNK_ROOTS)
 
@@ -1239,22 +1241,43 @@ def project_tree(force=False):
     return out
 
 
-_usage_cache = {"t": 0.0, "v": None}
+def account_token(account="main"):
+    """One account's OAuth access token. Every login keeps its own beside its own
+    transcripts, which is exactly why a session can be handed between them — and
+    also why anything derived from a token has to name the account it meant."""
+    try:
+        with open(os.path.join(account_by_id(account)["dir"], ".credentials.json"),
+                  encoding="utf-8") as f:
+            return (json.load(f).get("claudeAiOauth") or {}).get("accessToken")
+    except Exception:
+        return None
 
-def fetch_usage():
+
+def _cache_slot(store, account):
+    """Per-account cache slot. Two logins have different models and different
+    allowances, so one shared slot would serve whichever was asked for first."""
+    return store.setdefault(account or "main", {"t": 0.0, "v": None})
+
+
+_usage_cache = {}     # {account_id: {"t", "v"}}
+
+def fetch_usage(account="main"):
     """The rolling 5h / 7d usage limits, from Claude's OAuth usage endpoint — the
     same numbers the CLI shows. Reads the local OAuth token; cached ~5 min (the
     endpoint is itself rate-limited). Blocking (run it off the IO loop). Returns a
     dict {window: {utilization, resets_at}} plus, when the account has per-model
     weekly quotas, "model_scoped": [{label, utilization, resets_at, severity}].
     Returns the last good value on a transient error, or None when never
-    available (no token)."""
+    available (no token).
+    The numbers belong to ONE login. A session handed to another account spends
+    that account's allowance, so reporting the console's own would be quoting the
+    wrong budget back at the user."""
     now = time.monotonic()
-    if _usage_cache["v"] is not None and now - _usage_cache["t"] < 300:
-        return _usage_cache["v"]
+    c = _cache_slot(_usage_cache, account)
+    if c["v"] is not None and now - c["t"] < 300:
+        return c["v"]
     try:
-        with open(os.path.join(HOME, ".claude", ".credentials.json"), encoding="utf-8") as f:
-            tok = (json.load(f).get("claudeAiOauth") or {}).get("accessToken")
+        tok = account_token(account)
         if not tok:
             return None
         req = urllib.request.Request(
@@ -1285,33 +1308,36 @@ def fetch_usage():
                            "resets_at": it.get("resets_at"), "severity": it.get("severity")})
         if scoped:
             out["model_scoped"] = scoped
-        _usage_cache["t"], _usage_cache["v"] = now, out
+        c["t"], c["v"] = now, out
         return out
     except Exception:
         # transient failure (rate-limited 429 / network): keep serving the last
         # good value so the indicator doesn't blink out. Don't touch the timer,
         # so a real refresh is retried on the next poll.
-        return _usage_cache["v"]
+        return c["v"]
 
 
 # Above this input window, the CLI can be asked for the long-context beta with a
 # `[1m]` model suffix. At or below it the request is refused, so the picker must
 # not offer the variant.
 LONG_CONTEXT_FLOOR = 200000
-_models_cache = {"t": 0.0, "v": None}
+_models_cache = {}    # {account_id: {"t", "v"}}
 
-def fetch_models(force=False):
+def fetch_models(force=False, account="main"):
     """Live model list from the API's /v1/models (id + display name), so the
     picker self-updates when Anthropic ships/retires models (e.g. fable).
-    Same OAuth token as fetch_usage; cached ~1h — force=True bypasses the cache
-    (the picker's manual ↻ refresh). Blocking (run off the IO loop).
+    Same OAuth token as fetch_usage; cached ~1h per account — force=True bypasses
+    the cache (the picker's manual ↻ refresh). Blocking (run off the IO loop).
+    Two logins need not be entitled to the same models, so the list is only ever
+    true of the account it was fetched for: offering another account's models
+    would hand the user a choice that fails at spawn.
     Returns [{id, name}], the last good value on a transient error, or None."""
     now = time.monotonic()
-    if not force and _models_cache["v"] is not None and now - _models_cache["t"] < 3600:
-        return _models_cache["v"]
+    c = _cache_slot(_models_cache, account)
+    if not force and c["v"] is not None and now - c["t"] < 3600:
+        return c["v"]
     try:
-        with open(os.path.join(HOME, ".claude", ".credentials.json"), encoding="utf-8") as f:
-            tok = (json.load(f).get("claudeAiOauth") or {}).get("accessToken")
+        tok = account_token(account)
         if not tok:
             return None
         req = urllib.request.Request(
@@ -1340,10 +1366,10 @@ def fetch_models(force=False):
             if int(m.get("max_input_tokens") or 0) > LONG_CONTEXT_FLOOR:
                 out.append({"id": mid + "[1m]", "name": name + " (1M)"})
         if out:
-            _models_cache["t"], _models_cache["v"] = now, out
-        return _models_cache["v"]
+            c["t"], c["v"] = now, out
+        return c["v"]
     except Exception:
-        return _models_cache["v"]
+        return c["v"]
 
 
 def load_transcript_events(cc, cap=1000):
@@ -2295,7 +2321,8 @@ class UsageHandler(AuthMixin, tornado.web.RequestHandler):
             return
         self.set_header("Content-Type", "application/json")
         loop = tornado.ioloop.IOLoop.current()
-        u = await loop.run_in_executor(None, fetch_usage)   # blocking HTTP off-loop
+        acct = self.get_argument("account", "main")
+        u = await loop.run_in_executor(None, fetch_usage, acct)   # blocking HTTP off-loop
         self.write(json.dumps({"usage": u}))
 
 
@@ -2306,7 +2333,8 @@ class ModelsHandler(AuthMixin, tornado.web.RequestHandler):
         self.set_header("Content-Type", "application/json")
         loop = tornado.ioloop.IOLoop.current()
         fresh = self.get_argument("fresh", "") == "1"        # manual ↻: skip the 1h cache
-        m = await loop.run_in_executor(None, fetch_models, fresh)   # blocking HTTP off-loop
+        acct = self.get_argument("account", "main")
+        m = await loop.run_in_executor(None, fetch_models, fresh, acct)   # blocking HTTP off-loop
         self.write(json.dumps({"models": m or []}))
 
 
@@ -2437,7 +2465,8 @@ class ImportHandler(AuthMixin, tornado.web.RequestHandler):
             return fail("write failed: %s" % e, 500)
         # the same id living in another folder is fine (verified) — just say so
         elsewhere = [os.path.basename(os.path.dirname(p))
-                     for p in glob.glob(os.path.join(CLAUDE_ROOT, "*", cc + ".jsonl"))
+                     for _a, root in account_roots()
+                     for p in glob.glob(os.path.join(root, "*", cc + ".jsonl"))
                      if os.path.realpath(p) != os.path.realpath(dest)]
         self.write(json.dumps({"ok": True, "cc": cc, "cwd": cwd, "bytes": len(body),
                                "rewritten": rewritten, "also_in": elsewhere}))
@@ -5835,6 +5864,11 @@ function onMsg(e){const m=JSON.parse(e.data);
     const incremental=!!m.events_delta&&restoredViewId===m.id,stick=incremental&&atBottom();
     if(!incremental){clearUI();restoredViewId='';}
     pendingStart=false;sid=m.id;curCC=m.cc||null;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
+    /* the models on offer and the allowance shown both belong to this session's
+       login, so a different one means both have to be asked again */
+    const acctWas=curAccount;curAccount=m.account||'main';
+    if(curAccount!==acctWas){MODELS=acctModels(curAccount);rebuildModelPicker();
+      loadModels(false,curAccount);loadUsage();}
     ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));setModelPill(m.model,false);setEffortPill(m.effort);renderCtx(m.ctx);statset(m.ended?'ended':'ready');
     const tab=ensureTab(m,true);if(tab&&!incremental)planCollapsed=!!tab.planCollapsed;
     replaying=true;m.events.forEach(route);replaying=false;
@@ -5940,7 +5974,10 @@ function renderUsage(u){const el=$('#usage');const f=u&&u.five_hour,w=u&&u.seven
   all.forEach(([k,lbl])=>row(lbl,u&&u[k]));
   sc.forEach(o=>row('7-day '+o.label,o));
   el.title=t;}
-function loadUsage(){fetch('api/usage').then(r=>r.json()).then(j=>renderUsage(j.usage)).catch(()=>{});}
+/* The allowance shown belongs to whichever login is running the attached
+   session, not to the console. Getting this wrong quotes the wrong budget. */
+function loadUsage(){fetch('api/usage?account='+encodeURIComponent(curAccount))
+  .then(r=>r.json()).then(j=>renderUsage(j.usage)).catch(()=>{});}
 /* dynamic model list from the live /v1/models API: aliases (track the latest of
    each family) stay on top; the full list — incl. temporary models like fable —
    loads into an "all models" group. Static opus/sonnet/haiku = offline fallback. */
@@ -5956,9 +5993,20 @@ function rebuildModelPicker(){
   sel.appendChild(g);
   for(const o of sel.options)if(o.value===want){sel.value=want;break;}   /* keep the saved/current pick */
 }
-function loadModels(fresh){return fetch('api/models'+(fresh?'?fresh=1':'')).then(r=>r.json()).then(j=>{
-  if(j.models&&j.models.length&&JSON.stringify(j.models)!==JSON.stringify(MODELS)){
-    MODELS=j.models;rebuildModelPicker();}}).catch(()=>{});}
+/* Two logins need not be entitled to the same models, so every list is filed
+   under the account it came from. MODELS stays the attached session's list, which
+   is what the pill and the @model completion are asking about. */
+let MODELS_BY_ACCT={};
+function loadModels(fresh,acct){acct=acct||curAccount;
+  return fetch('api/models?account='+encodeURIComponent(acct)+(fresh?'&fresh=1':''))
+    .then(r=>r.json()).then(j=>{
+      if(!j.models||!j.models.length)return;
+      MODELS_BY_ACCT[acct]=j.models;
+      if(acct===curAccount&&JSON.stringify(j.models)!==JSON.stringify(MODELS)){
+        MODELS=j.models;rebuildModelPicker();}}).catch(()=>{});}
+/* What a given session may be switched to — its own account's list, falling back
+   to the attached one only before that account's list has arrived. */
+function acctModels(aid){return MODELS_BY_ACCT[aid||'main']||MODELS;}
 /* thinking effort: a clickable pill on the right of the status row. A live
    session takes the change through `/effort` (no relaunch); the choice is
    remembered for new sessions. */
@@ -6026,7 +6074,8 @@ function openConfigure(s,anchor){const m=$('#cardMenu');m.innerHTML='';m._anchor
     o.onchange=()=>fn(o.value);return o;};
   const row=(label,sel)=>{const w=document.createElement('div');w.className='cfgrow';
     const l=document.createElement('span');l.textContent=label;w.appendChild(l);w.appendChild(sel);m.appendChild(w);};
-  row('Model',mkSel([['opus','opus'],['sonnet','sonnet'],['haiku','haiku'],...MODELS.map(m=>[m.id,m.name])],s.model||'opus',
+  row('Model',mkSel([['opus','opus'],['sonnet','sonnet'],['haiku','haiku'],
+      ...acctModels(s.account).map(m=>[m.id,m.name])],s.model||'opus',
     v=>{wsSend({type:'configure',id:s.id,model:v});setTimeout(reqList,200);}));
   row('Permission',mkSel([['acceptEdits','⚡ Auto-accept'],['default','🔐 Approve'],['plan','📋 Plan'],['bypassPermissions','⏩ Full auto']],s.mode||'default',
     v=>{wsSend({type:'configure',id:s.id,mode:v});setTimeout(reqList,200);}));
@@ -7155,8 +7204,15 @@ function applyTheme(t){if(t&&t!=='dark')document.documentElement.setAttribute('d
    always holds at least the one the console runs under, so a length of 1 is how
    the rest of the UI knows there is no choice to offer and stays as it was. */
 let ACCOUNTS=[{id:'main',label:'main',dir:''}];
+let curAccount='main';   /* the login running the attached session */
 function loadAccounts(){return fetch('/api/accounts').then(r=>r.json()).then(j=>{
-  if(j&&j.accounts&&j.accounts.length)ACCOUNTS=j.accounts;return ACCOUNTS;}).catch(()=>ACCOUNTS);}
+  if(j&&j.accounts&&j.accounts.length)ACCOUNTS=j.accounts;
+  /* With a second login configured, every account's model list is wanted up
+     front: the Configure popover is transient, and a list arriving after it has
+     been drawn would be a list the user never sees. A single-account machine
+     makes exactly the one call it always made. */
+  if(ACCOUNTS.length>1)ACCOUNTS.forEach(a=>{if(!MODELS_BY_ACCT[a.id])loadModels(false,a.id);});
+  return ACCOUNTS;}).catch(()=>ACCOUNTS);}
 function accLabel(id){const a=ACCOUNTS.find(x=>x.id===(id||'main'));return a?a.label:(id||'main');}
 function accErr(m){const e=$('#accerr');if(!e)return;
   if(m){e.textContent=m;e.removeAttribute('hidden');}else{e.textContent='';e.setAttribute('hidden','');}}
@@ -7203,11 +7259,17 @@ function switchAccount(s,to){
   const cur=s.account||'main',a=ACCOUNTS.find(x=>x.id===to);
   closeCardMenu();
   if(!a||to===cur)return;
+  /* Two logins need not be entitled to the same models. Say so now, rather than
+     letting the handover look clean and the spawn fail on the far side. */
+  const cm=(s.model&&s.model!=='default')?s.model:'',have=MODELS_BY_ACCT[to];
+  const warn=(cm&&have&&have.length&&!have.some(x=>x.id===cm))
+    ? String.fromCharCode(10,10)+'\u26a0 '+cm+' is not among the models that account '+
+      'offers, so it may not start there. Change the model first to be sure.' : '';
   if(!confirm('Hand this session to “'+a.label+'”?\n\n'+
     'The running CLI stops and a new one resumes the same conversation under that '+
     'login. The transcript moves to that account and leaves this one.\n\n'+
     'That login has to read the whole conversation again, so the next turn is '+
-    'slower and costs more.'))return;
+    'slower and costs more.'+warn))return;
   wsSend({type:'set_account',id:s.id,account:to});}
 loadAccounts();
 $('#navtoggle').onclick=toggleSidebar;
