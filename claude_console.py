@@ -654,8 +654,21 @@ def _peek_codex(path):
 
 def list_sessions(limit=50):
     items = []
-    claude_files = [p for _a, root in account_roots()
-                    for p in glob.glob(os.path.join(root, "*", "*.jsonl"))]
+    # One session id should exist in one account's tree, and after a clean
+    # handover it does. When it does not, the same conversation would otherwise
+    # be offered twice in the sidebar, once per copy, and the smaller copy is the
+    # one that fails to resume. Keep the copy with the most of it.
+    biggest = {}
+    for _a, root in account_roots():
+        for p in glob.glob(os.path.join(root, "*", "*.jsonl")):
+            cc = os.path.basename(p)[:-6]
+            try:
+                sz = os.path.getsize(p)
+            except OSError:
+                continue
+            if cc not in biggest or sz > biggest[cc][0]:
+                biggest[cc] = (sz, p)
+    claude_files = [p for _sz, p in biggest.values()]
     codex_files = glob.glob(os.path.join(CODEX_ROOT, "**", "*.jsonl"), recursive=True)
     paths = ([(p, "claude") for p in claude_files] +
              [(p, "codex") for p in codex_files])
@@ -726,21 +739,37 @@ def find_transcript(cc):
     same question as which account the session belongs to."""
     if not _valid_cc(cc):
         return None
-    for _aid, root in account_roots():
-        hits = glob.glob(os.path.join(root, "*", cc + ".jsonl"))
-        if hits:
-            return hits[0]
-    return None
+    hits = _transcript_candidates(cc)
+    return hits[0][2] if hits else None
+
+
+def _transcript_candidates(cc):
+    """[(size, account_id, path)] for every tree holding this id, biggest first.
+    One id should live in one tree, and after a clean handover it does. It can
+    still end up in two: a CLI killed mid-shutdown, a transcript copied in by
+    hand, a move interrupted by a full disk. Whichever the cause, the conversation
+    is the big file and the leftover is a few hundred bytes of closing metadata,
+    so size answers the question and the order the accounts happen to be listed
+    in does not. Choosing by list order once sent a resume at a 696-byte stub and
+    the CLI exited 1, which reads as a broken session rather than a stray file."""
+    out = []
+    for aid, root in account_roots():
+        for p in glob.glob(os.path.join(root, "*", cc + ".jsonl")):
+            try:
+                out.append((os.path.getsize(p), aid, p))
+            except OSError:
+                continue
+    out.sort(reverse=True)
+    return out
 
 
 def transcript_account(cc):
-    """Which account's tree currently holds this session."""
+    """Which account's tree holds this session, by the copy that has the most of
+    the conversation in it. See _transcript_candidates for why not the first."""
     if not _valid_cc(cc):
         return "main"
-    for aid, root in account_roots():
-        if glob.glob(os.path.join(root, "*", cc + ".jsonl")):
-            return aid
-    return "main"
+    hits = _transcript_candidates(cc)
+    return hits[0][1] if hits else "main"
 
 
 def move_transcript(cc, cwd, to_account):
@@ -3774,7 +3803,8 @@ class ChatSession:
             return self.log, False    # the gap itself has been trimmed away
         return [ev for ev in self.log if int(ev.get("_seq") or 0) > after], True
 
-    def terminate(self):
+    def _release(self):
+        """Mark ended and hand back the client, without closing it."""
         self.ended = True
         for aid, fut in list(self._pending.items()):
             if not fut.done():
@@ -3782,6 +3812,11 @@ class ChatSession:
         self._pending.clear()
         client = self.client
         self.client = None
+        return client
+
+    def terminate(self):
+        """Fire-and-forget close, for callers with nothing to sequence after it."""
+        client = self._release()
         if client:
             async def _d():
                 try:
@@ -3789,6 +3824,23 @@ class ChatSession:
                 except Exception:
                     pass
             tornado.ioloop.IOLoop.current().spawn_callback(_d)
+
+    async def terminate_and_wait(self):
+        """Close and do not return until the CLI is actually gone.
+        Anything that touches the transcript afterwards has to use this. After
+        stdin EOF the CLI still writes its closing records to the session file BY
+        PATH, so a move that starts before it exits gets the conversation renamed
+        out from under it and a few bytes of closing metadata written back to the
+        old path. The transcript then exists in two trees, and the leftover looks
+        from the outside exactly like a real session with no messages in it.
+        The SDK already waits for that flush (5s, then SIGTERM, then SIGKILL);
+        terminate() simply threw the wait away by not awaiting it."""
+        client = self._release()
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
 
 
 class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
@@ -3950,7 +4002,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                 return
             model, mode, effort = sess.model, sess.mode, sess.effort
             watchers = [v for v in sess.viewers]
-            sess.terminate()
+            await sess.terminate_and_wait()   # the file cannot move until it is gone
             CHAT_SESSIONS.pop(sess.id, None)
             try:
                 move_transcript(cc, cwd, to)
