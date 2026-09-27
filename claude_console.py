@@ -33,6 +33,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import shlex
 import threading
 import time
 import urllib.parse
@@ -1624,6 +1625,13 @@ TRANSCRIBE_IDLE_SECONDS = max(
 TRANSCRIBE_PREVIEW_INTERVAL_MS = 1600
 TRANSCRIBE_WORKER = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "faster_whisper_worker.py")
+# Transcription on another machine, which keeps its model loaded there. The value
+# is a command the console runs and talks to over its stdin and stdout, typically
+# `ssh <host> <relay>`; see RemoteTranscriber for the protocol. When it is set it
+# replaces the local worker, and the worker settings above are not used.
+TRANSCRIBE_REMOTE = (_env("TRANSCRIBE_REMOTE", "") or "").strip()
+TRANSCRIBE_CONTEXT = _env("TRANSCRIBE_CONTEXT", "") or ""   # words the model should expect
+TRANSCRIBE_FFMPEG = _env("TRANSCRIBE_FFMPEG", "") or shutil.which("ffmpeg") or ""
 
 
 def _transcribe_status():
@@ -1631,6 +1639,18 @@ def _transcribe_status():
     if not TRANSCRIBE_ENABLED:
         return {"enabled": False, "available": False,
                 "reason": "voice transcription is disabled"}
+    if TRANSCRIBE_REMOTE:
+        try:
+            argv = shlex.split(TRANSCRIBE_REMOTE)
+        except ValueError:
+            argv = []
+        if not argv:
+            return {"enabled": True, "available": False,
+                    "reason": "the remote transcription command is invalid"}
+        if not TRANSCRIBE_FFMPEG:
+            return {"enabled": True, "available": False,
+                    "reason": "ffmpeg is needed to send audio to the transcription host"}
+        return {"enabled": True, "available": True, "reason": ""}
     python_path = (TRANSCRIBE_PYTHON if os.path.isabs(TRANSCRIBE_PYTHON)
                    else shutil.which(TRANSCRIBE_PYTHON))
     if not python_path or not os.path.isfile(python_path):
@@ -1802,7 +1822,268 @@ class TranscriberManager:
             })
 
 
-_TRANSCRIBER = TranscriberManager()
+def flac_streaminfo_only(data):
+    """16-bit FLAC reduced to its STREAMINFO block and the audio frames, and its
+    length in seconds. ffmpeg adds a comment block and 8 kB of padding, which for a
+    few seconds of speech is a tenth of what crosses the link. Returns the input
+    unchanged and None when it is not a FLAC stream this can read."""
+    try:
+        if data[:4] != b"fLaC":
+            return data, None
+        i, info = 4, None
+        while True:
+            head = data[i]
+            size = int.from_bytes(data[i + 1:i + 4], "big")
+            if head & 0x7F == 0:
+                info = data[i + 4:i + 4 + size]
+            i += 4 + size
+            if head & 0x80:
+                break
+        if info is None or len(info) != 34:
+            return data, None
+        rate = (info[10] << 12) | (info[11] << 4) | (info[12] >> 4)
+        total = ((info[13] & 0x0F) << 32) | int.from_bytes(info[14:18], "big")
+        seconds = total / rate if rate else None
+        return b"fLaC" + bytes([0x80]) + (34).to_bytes(3, "big") + info + data[i:], seconds
+    except IndexError:
+        return data, None
+
+
+def _asr_language(name):
+    """The model host names languages ("Chinese"); the preview logic keys on codes."""
+    name = str(name or "").strip().lower()
+    return {"chinese": "zh", "english": "en", "cantonese": "yue"}.get(name, name)
+
+
+class RemoteTranscriber:
+    """Transcription by a model host on another machine (TRANSCRIBE_REMOTE).
+
+    The command relays its stdin and stdout to the host. The console writes a
+    hello line, {"kind": "asr"}, and the host answers {"ready": true, ...} once its
+    model is loaded, or {"ready": false, "error": ...}. Each request is then one
+    JSON line, {"fmt": "flac", "bytes": N, "context": ...}, followed by N bytes of
+    16 kHz mono 16-bit FLAC, and each answer is one line, {"text", "language", "s"}
+    or {"error"}. {"ping": 1} lines keep the relay's lease and get no answer.
+
+    One connection, opened on first use (pressing the mic opens it) and kept while
+    dictation goes on: a ping every PING_SEC holds it, and IDLE_SEC without a
+    request closes it. The live preview keeps the same per-recording state as the
+    local worker, so confirmed words stay put in the same way."""
+
+    PING_SEC = 10
+
+    def __init__(self, command=None, ffmpeg=None, context=None, idle_seconds=None,
+                 timeout_seconds=None, max_seconds=None):
+        self.command = TRANSCRIBE_REMOTE if command is None else command
+        self.ffmpeg = TRANSCRIBE_FFMPEG if ffmpeg is None else ffmpeg
+        self.context = TRANSCRIBE_CONTEXT if context is None else context
+        self.idle_seconds = idle_seconds or TRANSCRIBE_IDLE_SECONDS
+        self.timeout_seconds = timeout_seconds or TRANSCRIBE_TIMEOUT_SECONDS
+        self.max_seconds = max_seconds or TRANSCRIBE_MAX_SECONDS
+        self.proc = None
+        self.header = None
+        self._buf = b""
+        self._stderr = []
+        self._last = 0.0
+        self._live = {}
+        self._lock = threading.Lock()
+        self._pinger = None
+
+    # ── connection ──
+    def _drain(self, proc):
+        for line in proc.stderr:
+            self._stderr = (self._stderr + [line.decode("utf-8", "replace").strip()])[-8:]
+
+    def _why(self):
+        tail = [x for x in self._stderr if x]
+        return (": " + tail[-1][:300]) if tail else ""
+
+    def _close_locked(self):
+        proc, self.proc, self.header, self._buf = self.proc, None, None, b""
+        if not proc:
+            return
+        try:
+            proc.stdin.close()            # the relay ends when its input does
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _send_locked(self, data):
+        self.proc.stdin.write(data)
+        self.proc.stdin.flush()
+
+    def _line_locked(self, timeout):
+        """One line from the host, parsed. The buffer is ours, so a line that came
+        in with the previous read is not lost to select()."""
+        fd = self.proc.stdout.fileno()
+        deadline = time.monotonic() + timeout
+        while b"\n" not in self._buf:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("the transcription host did not answer in time")
+            ready, _, _ = select.select([fd], [], [], left)
+            if not ready:
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                raise ConnectionError("the transcription host closed the connection" + self._why())
+            self._buf += chunk
+        line, self._buf = self._buf.split(b"\n", 1)
+        try:
+            return json.loads(line)
+        except Exception:
+            raise ConnectionError("unreadable answer from the transcription host")
+
+    def _connect_locked(self):
+        if self.proc and self.proc.poll() is None:
+            return
+        self._close_locked()
+        self._stderr = []
+        try:
+            argv = shlex.split(self.command)
+            self.proc = subprocess.Popen(
+                argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, start_new_session=True)
+        except Exception as exc:
+            self.proc = None
+            raise RuntimeError("could not start the transcription relay: %s" % exc)
+        threading.Thread(target=self._drain, args=(self.proc,), daemon=True).start()
+        try:
+            self._send_locked(b'{"kind": "asr"}\n')
+            hello = self._line_locked(self.timeout_seconds)
+        except Exception:
+            self._close_locked()
+            raise
+        if not hello.get("ready"):
+            self._close_locked()
+            raise RuntimeError("the transcription host is not ready: %s"
+                               % (hello.get("error") or "no reason given"))
+        self.header = hello
+        self._last = time.monotonic()
+        if not (self._pinger and self._pinger.is_alive()):
+            self._pinger = threading.Thread(target=self._keep, daemon=True)
+            self._pinger.start()
+
+    def _keep(self):
+        """Hold the relay's lease while dictation goes on; let it go when idle."""
+        while True:
+            time.sleep(self.PING_SEC)
+            if not self._lock.acquire(blocking=False):
+                continue                     # a request is running: that is input enough
+            try:
+                if not self.proc:
+                    return
+                if self.proc.poll() is not None:
+                    self._close_locked()
+                    return
+                if time.monotonic() - self._last > self.idle_seconds:
+                    self._close_locked()
+                    return
+                try:
+                    self._send_locked(b'{"ping": 1}\n')
+                except Exception:
+                    self._close_locked()
+                    return
+            finally:
+                self._lock.release()
+
+    def _ask_locked(self, head, payload):
+        """One request. A connection that died while idle is found out here, on the
+        write or as an immediate close, and is opened again once."""
+        for attempt in (0, 1):
+            fresh = not (self.proc and self.proc.poll() is None)
+            self._connect_locked()
+            try:
+                self._send_locked(json.dumps(head).encode() + b"\n" + payload)
+                return self._line_locked(self.timeout_seconds)
+            except TimeoutError:
+                self._close_locked()           # an answer may still come: do not reuse
+                raise
+            except (ConnectionError, BrokenPipeError, OSError):
+                self._close_locked()
+                if attempt or fresh:
+                    raise ConnectionError("could not reach the transcription host" + self._why())
+
+    # ── audio ──
+    def _flac(self, path):
+        out = tempfile.NamedTemporaryFile(prefix="claude-console-voice-", suffix=".flac", delete=False)
+        out.close()
+        try:
+            os.chmod(out.name, 0o600)
+            r = subprocess.run(
+                [self.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                 "-i", path, "-vn", "-map_metadata", "-1", "-ac", "1", "-ar", "16000",
+                 "-sample_fmt", "s16", "-f", "flac", out.name],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=60)
+            if r.returncode != 0:
+                said = r.stderr.decode("utf-8", "replace").strip().splitlines()
+                raise RuntimeError("could not decode the recording: %s"
+                                   % (said[-1][:200] if said else r.returncode))
+            with open(out.name, "rb") as f:
+                return flac_streaminfo_only(f.read())
+        finally:
+            try:
+                os.unlink(out.name)
+            except OSError:
+                pass
+
+    # ── the manager's interface ──
+    def warmup(self):
+        started = time.monotonic()
+        with self._lock:
+            self._connect_locked()
+            self._last = time.monotonic()
+        return {"ok": True, "warmed": True, "elapsed": round(time.monotonic() - started, 3)}
+
+    def transcribe(self, path, final=True, stream_id="", duration_hint=None):
+        """Blocking; call it off the IOLoop."""
+        from faster_whisper_worker import (_preserve_confirmed_prefix, _purge_live_states,
+                                           _stable_live_prefix)
+        started = time.monotonic()
+        flac, seconds = self._flac(path)
+        if seconds is None:
+            seconds = duration_hint
+        if seconds is not None and seconds > self.max_seconds + 2:
+            error = RuntimeError("recording is too long")
+            error.code = "too_long"
+            raise error
+        with self._lock:
+            reply = self._ask_locked({"fmt": "flac", "bytes": len(flac), "context": self.context}, flac)
+            self._last = time.monotonic()
+            if reply.get("error"):
+                raise RuntimeError("transcription host: %s" % str(reply["error"])[:500])
+            text = (reply.get("text") or "").strip()
+            language = _asr_language(reply.get("language"))
+            state = self._live.get(stream_id) if stream_id else None
+            if state and state.get("stable_text"):
+                text = _preserve_confirmed_prefix(state.get("text", ""), text, state["stable_text"])
+            stable_text = ""
+            if final:
+                if stream_id:
+                    self._live.pop(stream_id, None)
+            else:
+                stable_text = _stable_live_prefix((state or {}).get("text", ""), text,
+                                                  (state or {}).get("stable_text", ""), language)
+                if stream_id:
+                    self._live[stream_id] = {"text": text, "stable_text": stable_text,
+                                             "language": language, "seen": time.monotonic()}
+                    _purge_live_states(self._live, time.monotonic())
+        return {"ok": True, "text": text, "stable_text": stable_text, "partial": not final,
+                "language": language, "duration": seconds,
+                "elapsed": round(time.monotonic() - started, 3)}
+
+    def shutdown(self):
+        with self._lock:
+            self._close_locked()
+
+
+_TRANSCRIBER = RemoteTranscriber() if TRANSCRIBE_REMOTE else TranscriberManager()
 # The GPU fits one transcription at a time; a second caller is told to wait
 # rather than queued behind a lock holding an open request.
 _TRANSCRIBER_GATE = threading.BoundedSemaphore(1)

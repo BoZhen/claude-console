@@ -121,7 +121,8 @@ which is the whole point.
   directory** and named in the message, so Claude can read, edit and *run* them
   rather than only look at them. Works from a phone, which pasting did not.
 - **Voice input** — a 🎙 button beside 📎 (or **Alt+M**) records, transcribes on
-  *your* machine with [faster-whisper](https://github.com/SYSTRAN/faster-whisper),
+  *your* machine with [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
+  or on another machine that keeps a speech model loaded,
   and shows a revisable draft while you speak. Pressing the mic prewarms the model;
   confirmed words and punctuation stay fixed, the latest 10 Chinese characters
   remain revisable, and stopping re-runs the whole recording to correct whatever
@@ -197,6 +198,18 @@ python claude_console.py
 worth turning on. Without the first, a paragraph of dictation arrives as one
 unbroken run of words.
 
+The model can also live on another machine that keeps it loaded. Set
+`CLAUDE_CONSOLE_TRANSCRIBE_REMOTE` to a command that reaches it, typically
+`ssh <host> <relay>`; it then replaces the local worker, and needs only `ffmpeg`
+on the console's machine. The console writes `{"kind": "asr"}` and waits for
+`{"ready": true}`. Each request is one JSON line, `{"fmt": "flac", "bytes": N,
+"context": "..."}`, followed by N bytes of 16 kHz mono 16-bit FLAC, and is answered
+by one line, `{"text": "...", "language": "..."}` or `{"error": "..."}`. A
+`{"ping": 1}` line every ten seconds keeps the connection while you dictate, and
+it closes after `CLAUDE_CONSOLE_TRANSCRIBE_IDLE_SEC`. A model that punctuates by
+itself, such as Qwen3-ASR, needs neither `PAUSE_PUNCTUATION` nor
+`CHINESE_CONVERSION`, and those apply to the local worker only.
+
 Browsers only expose a microphone in a secure context, so serve the console over
 HTTPS (a reverse proxy, or `tailscale serve`) unless you open it on `localhost`.
 
@@ -229,7 +242,10 @@ HTTPS (a reverse proxy, or `tailscale serve`) unless you open it on `localhost`.
 | `CLAUDE_CONSOLE_TRANSCRIBE_MAX_MB` | `16` | audio upload ceiling |
 | `CLAUDE_CONSOLE_TRANSCRIBE_MAX_SEC` | `120` | recording length cap |
 | `CLAUDE_CONSOLE_TRANSCRIBE_TIMEOUT_SEC` | `180` | give up on a transcription after this |
-| `CLAUDE_CONSOLE_TRANSCRIBE_IDLE_SEC` | `600` | worker exits after this, releasing the model's memory |
+| `CLAUDE_CONSOLE_TRANSCRIBE_IDLE_SEC` | `600` | worker exits after this, releasing the model's memory; a remote connection closes after this |
+| `CLAUDE_CONSOLE_TRANSCRIBE_REMOTE` | *(unset)* | command that reaches a model on another machine; replaces the local worker |
+| `CLAUDE_CONSOLE_TRANSCRIBE_CONTEXT` | *(unset)* | words the remote model should expect, sent with each request |
+| `CLAUDE_CONSOLE_TRANSCRIBE_FFMPEG` | first on `PATH` | `ffmpeg` that converts the recording for the remote model |
 
 The legacy `AGENTLENS_*` names are still honored as a fallback.
 

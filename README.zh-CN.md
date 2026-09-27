@@ -97,7 +97,8 @@
   **保存到该 session 的工作目录**并在消息中写明文件名，于是 Claude 可以读它、改它、
   *运行*它，而不只是看一眼。手机上也能用，而粘贴在手机上根本无从下手。
 - **语音输入** —— 📎 旁边的 🎙 按钮（或 **Alt+M**）开始录音，在*你自己*的机器上用
-  [faster-whisper](https://github.com/SYSTRAN/faster-whisper) 实时转写。按下麦克风即
+  [faster-whisper](https://github.com/SYSTRAN/faster-whisper) 实时转写，也可以交给另一台
+  常驻加载语音模型的机器。按下麦克风即
   预热模型；已确认的词语和标点保持不变，最近 10 个中文字符仍可修正，停止后会用完整
   录音再跑一遍，校正其中尚未确认的部分。它绝不自动发送，文字也始终回到发起录音的那个
   session。
@@ -159,6 +160,14 @@ python claude_console.py
 `PAUSE_PUNCTUATION` 和 `CHINESE_CONVERSION` 默认都是关的，而两个都值得打开。少了
 前者，一整段口述会变成一串不断句的词。
 
+模型也可以放在另一台常驻加载它的机器上。把 `CLAUDE_CONSOLE_TRANSCRIBE_REMOTE` 设成
+能连到它的命令，通常是 `ssh <host> <relay>`；此后它取代本地 worker，console 所在机器只需要
+`ffmpeg`。console 先写 `{"kind": "asr"}`，等对方回 `{"ready": true}`。每个请求是一行 JSON
+`{"fmt": "flac", "bytes": N, "context": "..."}`，后面紧跟 N 字节 16 kHz 单声道 16 位 FLAC；
+回复是一行 `{"text": "...", "language": "..."}` 或 `{"error": "..."}`。口述期间每十秒发一行
+`{"ping": 1}` 保持连接，闲置 `CLAUDE_CONSOLE_TRANSCRIBE_IDLE_SEC` 后断开。自带标点的模型
+（如 Qwen3-ASR）不需要 `PAUSE_PUNCTUATION` 和 `CHINESE_CONVERSION`，这两项只作用于本地 worker。
+
 浏览器只在安全上下文中开放麦克风，所以除非你在 `localhost` 上访问，否则请让 console
 走 HTTPS（反向代理，或 `tailscale serve`）。
 
@@ -191,7 +200,10 @@ python claude_console.py
 | `CLAUDE_CONSOLE_TRANSCRIBE_MAX_MB` | `16` | 音频上传大小上限 |
 | `CLAUDE_CONSOLE_TRANSCRIBE_MAX_SEC` | `120` | 录音时长上限 |
 | `CLAUDE_CONSOLE_TRANSCRIBE_TIMEOUT_SEC` | `180` | 超过此时长即放弃转写 |
-| `CLAUDE_CONSOLE_TRANSCRIBE_IDLE_SEC` | `600` | worker 闲置此时长后退出，释放模型占用的内存 |
+| `CLAUDE_CONSOLE_TRANSCRIBE_IDLE_SEC` | `600` | worker 闲置此时长后退出，释放模型占用的内存；远程连接闲置此时长后断开 |
+| `CLAUDE_CONSOLE_TRANSCRIBE_REMOTE` | *(unset)* | 连到另一台机器上模型的命令；设了就取代本地 worker |
+| `CLAUDE_CONSOLE_TRANSCRIBE_CONTEXT` | *(unset)* | 远程模型应预期的词，随每个请求发送 |
+| `CLAUDE_CONSOLE_TRANSCRIBE_FFMPEG` | first on `PATH` | 为远程模型转换录音的 `ffmpeg` |
 
 旧的 `AGENTLENS_*` 名称仍作为回退被识别。
 
