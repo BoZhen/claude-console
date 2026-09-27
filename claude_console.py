@@ -2454,14 +2454,39 @@ def min_query_len(q):
     return 1 if CJK_RE.search(q or "") else 2
 
 
+# The spans the client typesets as LaTeX, with md()'s delimiters and precedence:
+# display ($$…$$, \[…\]) before inline (\(…\), $…$).
+_MATH_SPAN_RES = (re.compile(r"\$\$[\s\S]+?\$\$"), re.compile(r"\\\[[\s\S]+?\\\]"),
+                  re.compile(r"\\\([\s\S]+?\\\)"), re.compile(r"\$(?!\s)[^\n$]*?[^\s$]\$(?!\d)"))
+SNIPPET_MATH_REACH = 300   # how far a snippet edge may move to take in a whole formula
+
+
+def _math_spans(txt):
+    spans = []
+    for rx in _MATH_SPAN_RES:
+        for m in rx.finditer(txt):
+            a, b = m.span()
+            if not any(a < y and x < b for x, y in spans):
+                spans.append((a, b))
+    return spans
+
+
 def _snippet(txt, q, span=160):
     """A window of text around the first match, split so the client can highlight
-    the hit without re-running the search or trusting a regex."""
+    the hit without re-running the search or trusting a regex. An edge that falls
+    inside a formula moves out to the formula's delimiter, when that is near, so
+    the client gets TeX it can typeset rather than half of one."""
     i = txt.lower().find(q.lower())
     if i < 0:
         return {"pre": txt[:span], "hit": "", "post": ""}
     a = max(0, i - span // 2)
     b = min(len(txt), i + len(q) + span)
+    if "$" in txt or "\\" in txt:
+        for x, y in _math_spans(txt):
+            if x < a < y and a - x <= SNIPPET_MATH_REACH:
+                a = x
+            if x < b < y and y - b <= SNIPPET_MATH_REACH:
+                b = y
     return {"pre": ("…" if a else "") + txt[a:i],
             "hit": txt[i:i + len(q)],
             "post": txt[i + len(q):b] + ("…" if b < len(txt) else "")}
@@ -5001,6 +5026,12 @@ body.tabdrag,body.tabdrag .stab{cursor:grabbing}
 .shit .sh2{font-size:12.5px;line-height:1.5;color:var(--fg);word-break:break-word;
   display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
 .shit .sh2 mark{background:var(--acc);color:var(--bg);border-radius:2px;padding:0 1px}
+/* a hit inside a formula: the typeset formula has no characters to mark, so the
+   whole of it is outlined instead */
+.shit .sh2 mark.mhit,.thmsg .tht mark.mhit{background:color-mix(in srgb,var(--acc) 18%,transparent);
+  color:inherit;box-shadow:inset 0 -2px 0 var(--acc);border-radius:2px;padding:0 1px;
+  -webkit-box-decoration-break:clone;box-decoration-break:clone}
+.thmsg .tht .math.display{display:block;margin:4px 0;overflow-x:auto;overflow-y:hidden;max-width:100%;white-space:normal}
 /* read-only transcript viewer — a search hit opens here, never in the live chat */
 #srchthread{display:flex;flex-direction:column;min-height:0;overflow:hidden}
 #srchthread[hidden]{display:none}
@@ -6715,16 +6746,22 @@ function runSearch(){
         ? list.length+(j.more?'+':'')+' match'+(list.length===1?'':'es')+' · '+((Date.now()-t0)/1000).toFixed(1)+'s'
             +(j.more?' · showing the 200 most recent':'')
         : (j.note||j.error||'no matches');
-      res.innerHTML='';
+      untypesetIn(res);res.innerHTML='';
       list.forEach(h=>{
         const d=document.createElement('div');d.className='shit';
         const proj=(h.cwd||'').split('/').slice(-2).join('/');
         d.innerHTML='<div class="sh1"><b>'+esc(h.title||'session')+'</b>'+
           '<span class="role">'+esc(h.role)+'</span><span>'+esc(proj)+'</span>'+
           '<span>'+esc((h.ts||'').slice(0,16).replace('T',' '))+'</span></div>'+
-          '<div class="sh2">'+esc(h.pre)+'<mark>'+esc(h.hit)+'</mark>'+esc(h.post)+'</div>';
+          '<div class="sh2"></div>';
+        /* conversation text gets its LaTeX typeset; tool output stays literal,
+           where a $ is a shell variable far more often than a formula */
+        const pre=h.pre||'',hit=h.hit||'',body=pre+hit+(h.post||''),s2=d.querySelector('.sh2');
+        if(h.role==='tool')highlightInto(s2,body,hit);
+        else mathText(s2,body,pre.length,pre.length+hit.length,true);
         d.onclick=()=>openThread(h);
         res.appendChild(d);});
+      typesetIn(res);
     }).catch(e=>{if(e.name!=='AbortError'&&seq===srchSeq)meta.textContent='search failed: '+e;});
 }
 /* Clicking a hit opens it HERE, read-only. It used to call resumeSession(), which
@@ -6735,6 +6772,43 @@ function runSearch(){
 let thState=null;
 function showResults(){$('#srchthread').setAttribute('hidden','');
   $('#srchres').removeAttribute('hidden');}
+/* LaTeX inside plain text: [start, end, tex, display] for each span md() would
+   typeset, with md()'s delimiters and precedence, in reading order. */
+const MATH_SPAN_RES=[[/\$\$([\s\S]+?)\$\$/g,1],[/\\\[([\s\S]+?)\\\]/g,1],
+                     [/\\\(([\s\S]+?)\\\)/g,0],[/\$(?!\s)([^\n$]*?[^\s$])\$(?!\d)/g,0]];
+function mathSpans(t){const out=[];
+  for(const [re,d] of MATH_SPAN_RES){re.lastIndex=0;let m;
+    while((m=re.exec(t))){const a=m.index,b=a+m[0].length;
+      if(!out.some(x=>a<x[1]&&x[0]<b))out.push([a,b,m[1],d]);}}
+  return out.sort((x,y)=>x[0]-y[0]);}
+/* Plain text into el with its formulas as .math spans (typeset by typesetIn) and
+   the range [h0,h1) marked. A formula the range touches is marked whole. inline
+   keeps display formulas on the line, which is what a three-line snippet needs;
+   otherwise a display formula takes the newline on either side as its own. */
+function mathText(el,t,h0,h1,inline){el.textContent='';
+  const hit=h1>h0;
+  const put=(a,b,mk)=>{if(a>=b)return;const x=document.createTextNode(t.slice(a,b));
+    if(!mk){el.appendChild(x);return;}const m=document.createElement('mark');m.appendChild(x);el.appendChild(m);};
+  const text=(a,b)=>{if(a>=b)return;const x=Math.max(a,h0),y=Math.min(b,h1);
+    if(hit&&x<y){put(a,x);put(x,y,true);put(y,b);}else put(a,b);};
+  let p=0;
+  for(const [a,b,tex,d] of mathSpans(t)){const disp=d&&!inline;
+    text(p,disp&&t[a-1]==='\n'&&a-1>=p?a-1:a);
+    const m=document.createElement('span');m.className='math'+(disp?' display':'');
+    m.dataset.d=disp?'1':'0';m.textContent=tex;
+    if(hit&&a<h1&&h0<b){const w=document.createElement('mark');w.className='mhit';w.appendChild(m);el.appendChild(w);}
+    else el.appendChild(m);
+    p=disp&&t[b]==='\n'?b+1:b;}
+  text(p,t.length);}
+/* typeset .math under a scrolling panel as it comes near view, as the chat does */
+const _mathObsByRoot=new Map();
+function typesetIn(root){if(!window.katex||!root)return;
+  let o=_mathObsByRoot.get(root);
+  if(!o){o=new IntersectionObserver(es=>es.forEach(en=>{if(en.isIntersecting){
+      _renderMathEl(en.target);o.unobserve(en.target);}}),{root:root,rootMargin:'600px 0px'});
+    _mathObsByRoot.set(root,o);}
+  root.querySelectorAll('.math:not([data-done])').forEach(el=>o.observe(el));}
+function untypesetIn(root){const o=_mathObsByRoot.get(root);if(o)o.disconnect();}
 function highlightInto(el,txt,q){
   el.textContent=txt;
   if(!q)return;
@@ -6746,7 +6820,7 @@ function highlightInto(el,txt,q){
   el.appendChild(m);
   el.appendChild(document.createTextNode(txt.slice(i+q.length)));}
 function renderThread(j,q,targetMid){
-  const body=$('#thbody');body.innerHTML='';
+  const body=$('#thbody');untypesetIn(body);body.innerHTML='';
   $('.thtitle').textContent=(j.title||'session')+' · '+(j.cwd||'').split('/').slice(-2).join('/')
     +' · '+(j.total||0)+' messages';
   if(!j.atStart){const b=document.createElement('button');b.className='thmore';
@@ -6760,9 +6834,13 @@ function renderThread(j,q,targetMid){
     d.className='thmsg '+m.role+(m.mid===targetMid?' target':'');
     d.innerHTML='<div class="thr">'+esc(m.role)+' · '+esc((m.ts||'').slice(0,16).replace('T',' '))+'</div>';
     const t=document.createElement('div');t.className='tht';
-    highlightInto(t,m.txt||'',m.mid===targetMid?q:'');
+    const txt=m.txt||'',qq=m.mid===targetMid?q:'';
+    if(m.role==='tool')highlightInto(t,txt,qq);
+    else{const i=qq?txt.toLowerCase().indexOf(qq.toLowerCase()):-1;
+      mathText(t,txt,i<0?0:i,i<0?0:i+qq.length,false);}
     d.appendChild(t);body.appendChild(d);
     if(m.mid===targetMid)tgt=d;});
+  typesetIn(body);
   if(!j.atEnd){const b=document.createElement('button');b.className='thmore';
     b.textContent='↓ load 60 later';
     b.onclick=()=>loadThread(thState.mid,thState.before,thState.after+60,q,targetMid);

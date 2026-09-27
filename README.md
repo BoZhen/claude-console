@@ -95,7 +95,9 @@ which is the whole point.
 - **Full-text history search** (`⌘/Ctrl+K`) — search everything you and Claude
   ever said, plus the files and commands it touched, scoped to all history / this
   folder / this conversation. Results open in a read-only viewer, so finding
-  something never disturbs the session you are in.
+  something never disturbs the session you are in. LaTeX in the results and in
+  the viewer is typeset; a match inside a formula marks the whole formula, and
+  tool output stays literal.
 - **Export / import** — take a conversation to another machine as `.jsonl`, or
   adopt one here; **Import folder** pins a directory as a project before it has
   any history.
