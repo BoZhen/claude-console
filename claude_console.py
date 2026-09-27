@@ -4437,6 +4437,7 @@ pre code{background:none;border:none;padding:0}
 .bubble th,.bubble td{border:1px solid var(--line);padding:3px 9px;text-align:left}
 .bubble thead th{background:var(--bg3);font-weight:600}
 .msg.asst ul,.msg.asst ol,.tool .res .b ul,.tool .res .b ol{margin:4px 0 4px 20px}   /* the report box renders markdown too */
+li.mdl1{margin-left:1.4em} li.mdl2{margin-left:2.8em} li.mdl3{margin-left:4.2em}   /* indented markdown list items, see md() */
 .msg.asst a{color:var(--acc)}
 .diffline{font-family:var(--fmono);font-size:12px;white-space:pre-wrap;line-height:1.4}
 .dl-add{color:var(--addfg)}.dl-del{color:var(--delfg)}.dl-hdr{color:var(--acc)}.dl-ctx{color:var(--mut)}
@@ -5254,9 +5255,14 @@ function md(src){
   h=h.replace(/\*\*([^*\n]+)\*\*/g,'<b>$1</b>');
   h=h.replace(/^### (.*)$/gm,'<h3>$1</h3>').replace(/^## (.*)$/gm,'<h2>$1</h2>').replace(/^# (.*)$/gm,'<h2>$1</h2>');
   h=h.replace(/%%LK(\d+)%%/g,(m,i)=>ll[+i]);   /* restore protected links */
-  h=h.replace(/^(\d+)\. (.*)$/gm,'<oli>$2</oli>').replace(/^[\-\*] (.*)$/gm,'<uli>$1</uli>');
-  h=h.replace(/(<uli>.*?<\/uli>(?:\n<uli>.*?<\/uli>)*)/g,m=>'<ul>'+m.replace(/\n/g,'').replace(/uli>/g,'li>')+'</ul>');
-  h=h.replace(/(<oli>.*?<\/oli>(?:\n<oli>.*?<\/oli>)*)/g,m=>'<ol>'+m.replace(/\n/g,'').replace(/oli>/g,'li>')+'</ol>');
+  /* list items. An ordered item keeps its own number (li value=N): a numbered list interrupted by
+     sub-items or blank lines is split into several <ol>, and without value each would restart at 1.
+     Indented items (2+ spaces) are sub-items: class mdl1..mdl3 indents them by depth. */
+  const lvl=sp=>sp.length<2?'':' class="mdl'+(sp.length<4?1:sp.length<7?2:3)+'"';
+  h=h.replace(/^( *)(\d+)\. (.*)$/gm,(m,sp,n,t)=>'<oli value="'+n+'"'+lvl(sp)+'>'+t+'</oli>')
+   .replace(/^( *)[\-\*] (.*)$/gm,(m,sp,t)=>'<uli'+lvl(sp)+'>'+t+'</uli>');
+  h=h.replace(/(<uli[^>]*>.*?<\/uli>(?:\n<uli[^>]*>.*?<\/uli>)*)/g,m=>'<ul>'+m.replace(/\n/g,'').replace(/<(\/?)uli/g,'<$1li')+'</ul>');
+  h=h.replace(/(<oli[^>]*>.*?<\/oli>(?:\n<oli[^>]*>.*?<\/oli>)*)/g,m=>'<ol>'+m.replace(/\n/g,'').replace(/<(\/?)oli/g,'<$1li')+'</ol>');
   h=h.replace(/\*(\S[^*\n]*?\S|\S)\*/g,'<i>$1</i>');
   h=h.replace(/\n/g,'<br>').replace(/<br>(<(?:pre|h2|h3|ul|ol|table)>)/g,'$1').replace(/(<\/(?:pre|h2|h3|ul|ol|table)>)<br>/g,'$1');
   h=h.replace(/%%CB(\d+)%%/g,(m,i)=>bl[+i]);
