@@ -5099,7 +5099,8 @@ CONSOLE_HTML = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,interactive-widget=resizes-content">
 <title>Claude Console</title>
-<script>try{var _t=localStorage.getItem('al_theme');if(_t&&_t!=='dark')document.documentElement.setAttribute('data-theme',_t);}catch(e){}</script>
+<script>try{var _t=localStorage.getItem('al_theme');if(_t&&_t!=='dark')document.documentElement.setAttribute('data-theme',_t);
+var _f=parseFloat(localStorage.getItem('al_fs'));if(_f>=12&&_f<=22)document.documentElement.style.setProperty('--chat-zoom',String(_f/14));}catch(e){}</script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 /* ── theme palettes: 13 base vars each; panels/tints derived below ── */
@@ -5203,6 +5204,12 @@ header select,header input{background:var(--bg3);color:var(--fg);border:1px soli
 
 #chat{flex:1;overflow-y:auto;overflow-x:hidden;padding:14px;-webkit-overflow-scrolling:touch}
 .wrap{max-width:820px;margin:0 auto}
+/* ⚙ Settings → Text size. The conversation, the plan above it, a thread opened from
+   history search and the edits drawer scale as a whole (CSS zoom), so code, tool
+   cards, images and spacing keep their proportions to the text; the sidebar, header
+   and composer chrome keep their size. 14px text = 1. */
+:root{--chat-zoom:1}
+#stream,#planDock,#thbody,#drawer .dc{zoom:var(--chat-zoom)}
 .msg{margin-bottom:14px;line-height:1.5;word-wrap:break-word;overflow-wrap:anywhere}
 .msg.user{display:flex;flex-direction:column;align-items:flex-end}
 .msg.user .b{background:var(--sel);border:1px solid var(--selln);border-radius:10px;padding:8px 12px;max-width:85%;white-space:pre-wrap}
@@ -5398,7 +5405,8 @@ li.mdl1{margin-left:1.4em} li.mdl2{margin-left:2.8em} li.mdl3{margin-left:4.2em}
 #queue .qmsg:hover .qsteer{color:var(--tool)}
 #queue .qmsg .qsteer:hover{filter:brightness(1.25)}
 #ta{flex:1;min-width:0;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:10px;
-  padding:9px 12px;font-size:14px;font-family:inherit;resize:none;max-height:160px;line-height:1.4}
+  padding:9px 12px;font-size:calc(14px * var(--chat-zoom));font-family:inherit;resize:none;
+  max-height:calc(160px * var(--chat-zoom));line-height:1.4}
 #ta:focus{outline:1px solid var(--acc)}
 #send{background:var(--acc);color:var(--onacc);border:none;border-radius:10px;width:38px;height:38px;flex:none;display:inline-flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;cursor:pointer}
 #send:disabled{background:var(--line);color:var(--mut);cursor:default}
@@ -5697,40 +5705,100 @@ body.tabdrag,body.tabdrag .stab{cursor:grabbing}
 .sb-gear{flex:1;min-width:0;background:var(--bg3);color:var(--mut);border:1px solid var(--line);
   border-radius:5px;padding:5px 8px;font-size:12px;cursor:pointer;text-align:left}
 .sb-gear:hover{color:var(--acc);border-color:var(--acc)}
-#settings{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.55);
-  display:flex;align-items:center;justify-content:center;padding:16px}
-#settings[hidden]{display:none}
-#setpanel{width:min(620px,100%);max-height:82vh;display:flex;flex-direction:column;
-  background:var(--bg2);border:1px solid var(--line);border-radius:10px;overflow:hidden}
-#setbody{overflow:auto;padding:4px 14px 10px;min-height:0}
-.setsec{padding:12px 0;border-top:1px solid var(--line)}
-.setsec:first-child{border-top:0}
-.seth{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);margin-bottom:7px}
-.setnote{font-size:12px;color:var(--mut);line-height:1.55;margin-bottom:9px}
-.setnote code{font-family:var(--fmono);font-size:11.5px}
-.setsec select{width:100%;background:var(--bg3);color:var(--fg);border:1px solid var(--line);
-  border-radius:5px;padding:5px 7px;font-size:12px}
-.accrow{display:flex;align-items:center;gap:9px;padding:6px 8px;border:1px solid var(--line);
-  border-radius:6px;margin-bottom:6px;font-size:12px}
-.accrow .acci{font-weight:650;color:var(--acc);flex:none}
-.accrow.accmain .acci{color:var(--mut)}
-.accrow .accd{font-family:var(--fmono);font-size:11px;color:var(--mut);
-  flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.accrow .accnote{font-size:11px;color:var(--mut);flex:none}
-.accrow .accdel{flex:none;border:0;background:none;color:var(--mut);cursor:pointer;
-  font-size:12px;border-radius:4px;padding:2px 5px}
-.accrow .accdel:hover{color:var(--del);background:var(--bg3)}
-.accadd{display:flex;gap:6px;margin-top:8px}
-.accadd input{min-width:0;background:var(--bg3);color:var(--fg);border:1px solid var(--line);
-  border-radius:5px;padding:5px 7px;font-size:12px}
-.accadd #accid{flex:0 0 76px}
-.accadd #acclabel{flex:0 0 104px}
-.accadd #accdir{flex:1}
-.accadd button{flex:none;background:var(--bg3);color:var(--fg);border:1px solid var(--line);
-  border-radius:5px;padding:5px 10px;font-size:12px;cursor:pointer}
-.accadd button:hover{border-color:var(--acc);color:var(--acc)}
-#accerr{margin-top:8px;font-size:12px;color:var(--del)}
-#accerr[hidden]{display:none}
+/* ── ⚙ Settings: a modal <dialog> with two tabs. Appearance holds the text size and
+   the theme, Accounts the extra Claude logins. Everything applies at once; there is
+   nothing to save, so there is no footer. ── */
+#settings{margin:auto;width:min(660px,calc(100% - 24px));max-width:none;
+  height:min(640px,calc(100dvh - 24px));max-height:none;padding:0;
+  border:1px solid var(--line);border-radius:12px;background:var(--bg2);color:var(--fg);
+  box-shadow:0 18px 56px rgba(0,0,0,.38);font:14px var(--fsans);overflow:hidden}
+#settings[open]{display:flex;flex-direction:column}
+#settings::backdrop{background:rgba(0,0,0,.5)}
+.set-head{display:flex;align-items:center;gap:12px;padding:14px 14px 0 20px}
+.set-head h2{flex:1;font-size:17px;font-weight:650;line-height:1.4}
+.set-icon{display:grid;place-items:center;flex:none;width:34px;height:34px;padding:0;
+  border:0;border-radius:7px;background:none;color:var(--mut);cursor:pointer}
+.set-icon:hover{color:var(--fg);background:var(--bg3)}
+.set-icon svg{width:18px;height:18px}
+.set-tabs{display:flex;gap:2px;padding:6px 20px 0;border-bottom:1px solid var(--line);flex:none}
+.set-tab{background:none;border:0;border-bottom:2px solid transparent;margin-bottom:-1px;
+  padding:9px 10px 10px;color:var(--mut);font:600 13px var(--fsans);cursor:pointer}
+.set-tab:hover{color:var(--fg)}
+.set-tab[aria-selected="true"]{color:var(--fg);border-bottom-color:var(--acc)}
+.set-body{flex:1;min-height:0;overflow:auto;padding:0 20px 20px}
+.set-pane[hidden]{display:none}
+.set-group{padding:18px 0;border-bottom:1px solid var(--line)}
+.set-group:last-child{border-bottom:0}
+.set-row{display:flex;align-items:baseline;gap:10px;margin-bottom:4px}
+.set-name{font-weight:650;font-size:13.5px}
+.set-value{margin-left:auto;color:var(--mut);font:12px var(--fmono);white-space:nowrap}
+.set-hint{font-size:12.5px;color:var(--mut);line-height:1.55;margin-bottom:14px}
+.set-hint code{font-size:11.5px;background:var(--bg3);border:0;padding:1px 5px;border-radius:4px}
+.set-btn{flex:none;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:7px;
+  padding:6px 12px;font:12.5px var(--fsans);cursor:pointer}
+.set-btn:hover:not(:disabled){border-color:var(--acc);color:var(--acc)}
+.set-btn:disabled{opacity:.45;cursor:default}
+.set-btn.primary{background:var(--acc);border-color:var(--acc);color:var(--onacc);font-weight:650}
+.set-btn.primary:hover:not(:disabled){filter:brightness(1.08);color:var(--onacc)}
+/* text size */
+.fs-ctl{display:flex;align-items:center;gap:10px}
+.fs-a{flex:none;width:28px;height:28px;display:grid;place-items:center;border:1px solid var(--line);
+  border-radius:7px;background:var(--bg3);color:var(--fg);font-family:var(--fsans);line-height:1;cursor:pointer;padding:0}
+.fs-a.small{font-size:11px}.fs-a.big{font-size:17px}
+.fs-a:hover:not(:disabled){border-color:var(--acc);color:var(--acc)}
+.fs-a:disabled{opacity:.4;cursor:default}
+#fsRange{flex:1;min-width:0;accent-color:var(--acc);height:28px}
+.fs-preview{margin-top:14px;padding:14px 16px 2px;border:1px solid var(--line);border-radius:10px;
+  background:var(--bg);overflow:hidden;max-height:260px}
+.fs-preview .zoom{zoom:var(--chat-zoom)}
+/* theme swatches: colours come from the stylesheet's own palettes (themePalettes) */
+.theme-grp{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);margin:14px 0 8px}
+.theme-grp:first-child{margin-top:2px}
+.theme-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(132px,1fr));gap:8px}
+.theme-card{display:flex;flex-direction:column;gap:7px;padding:6px 6px 7px;border:1px solid var(--line);
+  border-radius:9px;background:var(--bg);color:var(--fg);cursor:pointer;text-align:left;font:12px var(--fsans)}
+.theme-card:hover{border-color:var(--mut)}
+.theme-card[aria-checked="true"]{border-color:var(--acc);box-shadow:0 0 0 1px var(--acc)}
+.tc-prev{display:flex;flex-direction:column;height:58px;border-radius:5px;overflow:hidden;border:1px solid}
+.tc-bar{flex:none;height:12px;display:flex;align-items:center;gap:3px;padding:0 6px}
+.tc-bar i{width:4px;height:4px;border-radius:50%;opacity:.7}
+.tc-main{flex:1;display:flex;flex-direction:column;gap:5px;padding:7px 7px 0}
+.tc-line{display:block;height:4px;border-radius:2px}
+.tc-foot{display:flex;align-items:center;gap:5px;margin-top:auto;padding-bottom:6px}
+.tc-chip{width:16px;height:6px;border-radius:3px}
+.tc-bub{margin-left:auto;width:40%;height:9px;border-radius:4px;opacity:.55}
+.tc-name{display:flex;align-items:center;gap:6px;padding:0 3px;white-space:nowrap;overflow:hidden}
+.tc-check{margin-left:auto;color:var(--acc);font-weight:700;visibility:hidden}
+.theme-card[aria-checked="true"] .tc-check{visibility:visible}
+/* accounts */
+.acc-list{display:flex;flex-direction:column;gap:6px;margin-bottom:16px}
+.acc-row{display:flex;align-items:center;gap:10px;padding:9px 8px 9px 12px;border:1px solid var(--line);
+  border-radius:9px;background:var(--bg)}
+.acc-body{flex:1;min-width:0}
+.acc-name{display:flex;align-items:center;gap:7px;font-weight:650;font-size:13px;color:var(--acc)}
+.acc-row.acc-main .acc-name{color:var(--fg)}
+.acc-id{font:11px var(--fmono);font-weight:400;color:var(--mut);background:var(--bg3);border-radius:4px;padding:0 5px}
+.acc-dir{margin-top:2px;font:11.5px var(--fmono);color:var(--mut);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.acc-tag{flex:none;font-size:11px;color:var(--mut);border:1px solid var(--line);border-radius:10px;padding:1px 8px;margin-right:4px}
+.acc-row .accdel:hover{color:var(--del)}
+.acc-form{border:1px dashed var(--line);border-radius:10px;padding:14px}
+.acc-form-title{font-weight:650;font-size:13px;margin-bottom:12px}
+.acc-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px}
+.acc-grid .acc-wide{grid-column:1/-1}
+.acc-grid label{display:block;font-size:12px;color:var(--mut);margin-bottom:5px}
+.acc-grid input{width:100%;height:34px;padding:6px 9px;border:1px solid var(--line);border-radius:7px;
+  background:var(--bg);color:var(--fg);font:13px var(--fsans)}
+.acc-grid input:focus{outline:none;border-color:var(--acc)}
+.acc-grid #accdir{font-family:var(--fmono);font-size:12.5px}
+.acc-actions{display:flex;align-items:center;gap:12px;margin-top:14px}
+#accerr{flex:1;min-width:0;font-size:12px;color:var(--delfg);overflow-wrap:anywhere}
+#accerr[hidden]{display:block;visibility:hidden}
+@media(max-width:480px){
+  #settings{width:100%;height:calc(100dvh - 16px);border-radius:10px}
+  .set-head{padding:10px 8px 0 14px}.set-tabs{padding:4px 14px 0}.set-body{padding:0 14px 16px}
+  .theme-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .acc-grid{grid-template-columns:minmax(0,1fr)}
+  .fs-a{width:36px;height:36px}.set-icon{width:40px;height:40px}}
 .sb-empty{color:var(--mut);font-size:12px;padding:5px 10px;line-height:1.4}
 .srow{padding:7px 9px;cursor:pointer;display:flex;gap:8px;align-items:center;border-left:2px solid transparent}
 .srow:hover{background:var(--bg3)}
@@ -5993,7 +6061,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
       <div id="recentList" class="seclist"><div class="sb-empty">—</div></div>
     </div>
     <div class="sb-foot">
-      <button id="settingsbtn" class="sb-gear" title="Accounts and theme">⚙ Settings</button>
+      <button id="settingsbtn" class="sb-gear" title="Text size, theme and accounts">⚙ Settings</button>
     </div>
   </aside>
   <div id="sbresize"></div>
@@ -6075,51 +6143,58 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
       <button id="phistdel" disabled>🗑 Delete selected</button></div>
   </div>
 </div>
-<div id="settings" hidden>
-  <div id="setpanel">
-    <div class="fh"><span class="ft">⚙ Settings</span><span class="grow"></span>
-      <button class="btn" id="setx" title="close">✕</button></div>
-    <div id="setbody">
-      <div class="setsec">
-        <div class="seth">Claude accounts</div>
-        <div class="setnote">A second login is a second <code>CLAUDE_CONFIG_DIR</code> —
-          its own credentials and its own transcripts. Add one here and any session
-          can be handed to it from the ⚙ Configure menu on its card.</div>
-        <div id="acclist"></div>
-        <div class="accadd">
-          <input id="accid" placeholder="id" spellcheck="false" autocomplete="off">
-          <input id="acclabel" placeholder="label" spellcheck="false" autocomplete="off">
-          <input id="accdir" placeholder="config dir, e.g. ~/.claude-alt" spellcheck="false" autocomplete="off">
-          <button id="accadd">+ Add</button>
-        </div>
-        <div id="accerr" hidden></div>
-      </div>
-      <div class="setsec">
-        <div class="seth">Theme</div>
-      <select id="theme" title="color theme">
-        <optgroup label="Dark">
-          <option value="dark">Dark</option>
-          <option value="dracula">Dracula</option>
-          <option value="nord">Nord</option>
-          <option value="tokyo-night">Tokyo Night</option>
-          <option value="catppuccin">Catppuccin Mocha</option>
-          <option value="gruvbox">Gruvbox Dark</option>
-        </optgroup>
-        <optgroup label="Light">
-          <option value="light">Light</option>
-          <option value="solarized-light">Solarized Light</option>
-          <option value="catppuccin-latte">Catppuccin Latte</option>
-          <option value="gruvbox-light">Gruvbox Light</option>
-          <option value="rose-pine-dawn">Rosé Pine Dawn</option>
-          <option value="one-light">One Light</option>
-          <option value="ayu-light">Ayu Light</option>
-        </optgroup>
-      </select>
-      </div>
-    </div>
-    <div class="fbtns"><button class="fcancel" id="setclose">Close</button></div>
+<dialog id="settings" aria-labelledby="setTitle">
+  <div class="set-head">
+    <h2 id="setTitle">Settings</h2>
+    <button id="setx" class="set-icon" type="button" title="Close (Esc)" aria-label="Close" data-session-icon="x"></button>
   </div>
-</div>
+  <div class="set-tabs" role="tablist">
+    <button class="set-tab" type="button" role="tab" data-pane="appearance" aria-selected="true">Appearance</button>
+    <button class="set-tab" type="button" role="tab" data-pane="accounts" aria-selected="false">Accounts</button>
+  </div>
+  <div class="set-body">
+    <section class="set-pane" data-pane="appearance" role="tabpanel">
+      <div class="set-group">
+        <div class="set-row"><span class="set-name">Text size</span><span class="set-value" id="fsVal"></span></div>
+        <div class="set-hint">The conversation and the message box, with code, tool output and images
+          scaled to match. Kept in this browser.</div>
+        <div class="fs-ctl">
+          <button class="fs-a small" id="fsDown" type="button" title="Smaller" aria-label="Smaller text">A</button>
+          <input type="range" id="fsRange" min="12" max="22" step="1" aria-label="Text size">
+          <button class="fs-a big" id="fsUp" type="button" title="Larger" aria-label="Larger text">A</button>
+          <button class="set-btn" id="fsReset" type="button">Default</button>
+        </div>
+        <div class="fs-preview" aria-hidden="true"><div class="zoom">
+          <div class="msg user"><div class="b">Can you check why the tests fail?</div></div>
+          <div class="msg asst"><div class="b bubble">The fixture in <code>tests/conftest.py</code> opens the
+            port before the server is up. 我会先修复这个问题，再重新运行测试。</div></div>
+        </div></div>
+      </div>
+      <div class="set-group">
+        <div class="set-row"><span class="set-name">Theme</span><span class="set-value" id="themeVal"></span></div>
+        <div id="themeGrid"></div>
+      </div>
+    </section>
+    <section class="set-pane" data-pane="accounts" role="tabpanel" hidden>
+      <div class="set-group">
+        <div class="set-hint">A second login is a second <code>CLAUDE_CONFIG_DIR</code>: its own credentials
+          and its own transcripts. Add it here, then hand any session to it from ⚙ Configure on the
+          session's card.</div>
+        <div id="acclist" class="acc-list"></div>
+        <form id="accform" class="acc-form" autocomplete="off">
+          <div class="acc-form-title">Add an account</div>
+          <div class="acc-grid">
+            <div><label for="accid">ID</label><input id="accid" placeholder="alt" spellcheck="false" required></div>
+            <div><label for="acclabel">Label</label><input id="acclabel" placeholder="as shown on cards" spellcheck="false"></div>
+            <div class="acc-wide"><label for="accdir">Config directory</label><input id="accdir" placeholder="~/.claude-alt" spellcheck="false" required></div>
+          </div>
+          <div class="acc-actions"><span id="accerr" role="alert" hidden></span>
+            <button id="accadd" class="set-btn primary" type="submit">Add account</button></div>
+        </form>
+      </div>
+    </section>
+  </div>
+</dialog>
 <dialog id="newSessionDialog" class="session-dialog" aria-labelledby="newSessionTitle">
   <form id="newSessionForm">
     <div class="dialog-heading"><h2 id="newSessionTitle">New session</h2><button id="newSessionClose" class="dialog-icon" type="button" title="Close" aria-label="Close" data-session-icon="x"></button></div>
@@ -8429,15 +8504,70 @@ $('#filePick').onchange=e=>{takeFiles(e.target.files);e.target.value='';};
 sendBtn.onclick=sendMsg;
 $('#stop').onclick=doInterrupt;
 document.addEventListener('keydown',e=>{
-  if(e.key==='Escape'&&running&&!document.querySelector('.session-dialog[open]')&&!srchOpen()&&!phistOpened()){e.preventDefault();doInterrupt();}});
+  if(e.key==='Escape'&&running&&!document.querySelector('dialog[open]')&&!srchOpen()&&!phistOpened()){e.preventDefault();doInterrupt();}});
 $('#newbtn').onclick=()=>newSession();
 /* color theme: apply + persist (the <head> script already set it pre-paint) */
+const THEMES=[['dark','Dark',1],['dracula','Dracula',1],['nord','Nord',1],['tokyo-night','Tokyo Night',1],
+  ['catppuccin','Catppuccin Mocha',1],['gruvbox','Gruvbox Dark',1],
+  ['light','Light',0],['solarized-light','Solarized Light',0],['catppuccin-latte','Catppuccin Latte',0],
+  ['gruvbox-light','Gruvbox Light',0],['rose-pine-dawn','Rosé Pine Dawn',0],['one-light','One Light',0],
+  ['ayu-light','Ayu Light',0]];
 function applyTheme(t){if(t&&t!=='dark')document.documentElement.setAttribute('data-theme',t);
   else document.documentElement.removeAttribute('data-theme');}
-(function(){const t=localStorage.getItem('al_theme')||'dark';const sel=$('#theme');
-  if(sel){sel.value=t;sel.onchange=()=>{const v=sel.value;localStorage.setItem('al_theme',v);applyTheme(v);};}
-  applyTheme(t);})();
-/* ⚙ Settings: the logins this machine knows about, and the theme. ACCOUNTS
+function curTheme(){const t=localStorage.getItem('al_theme')||'dark';return THEMES.some(x=>x[0]===t)?t:'dark';}
+function setTheme(t){localStorage.setItem('al_theme',t);applyTheme(t);syncThemeGrid();}
+/* Each palette read back from this page's stylesheet, so a swatch cannot drift from
+   the theme it stands for. */
+function themePalettes(){const out={};
+  for(const sh of document.styleSheets){let rules;try{rules=sh.cssRules;}catch(e){continue;}
+    for(const r of rules){const m=/^:root(?:\[data-theme="([^"]+)"\])?$/.exec(r.selectorText||'');
+      if(!m||!r.style||!r.style.getPropertyValue('--bg'))continue;
+      const g=k=>r.style.getPropertyValue(k).trim();
+      out[m[1]||'dark']={bg:g('--bg'),bg2:g('--bg2'),line:g('--line'),fg:g('--fg'),mut:g('--mut'),
+        acc:g('--acc'),usr:g('--usr'),add:g('--add'),del:g('--del'),tool:g('--tool')};}}
+  return out;}
+function buildThemeGrid(){const host=$('#themeGrid');if(!host||host.childElementCount)return;
+  const pal=themePalettes();
+  const card=([id,name])=>{const p=pal[id]||{};
+    return '<button type="button" class="theme-card" role="radio" aria-checked="false" data-theme-id="'+id+'">'+
+      '<span class="tc-prev" style="background:'+p.bg+';border-color:'+p.line+'">'+
+        '<span class="tc-bar" style="background:'+p.bg2+';border-bottom:1px solid '+p.line+'">'+
+          '<i style="background:'+p.del+'"></i><i style="background:'+p.tool+'"></i><i style="background:'+p.add+'"></i></span>'+
+        '<span class="tc-main"><span class="tc-line" style="width:78%;background:'+p.fg+'"></span>'+
+          '<span class="tc-line" style="width:52%;background:'+p.mut+'"></span>'+
+          '<span class="tc-foot"><span class="tc-chip" style="background:'+p.acc+'"></span>'+
+          '<span class="tc-bub" style="background:'+p.usr+'"></span></span></span></span>'+
+      '<span class="tc-name">'+esc(name)+'<span class="tc-check">✓</span></span></button>';};
+  const grid=(dark,label)=>'<div class="theme-grp">'+label+'</div><div class="theme-grid" role="radiogroup" aria-label="'+label+' themes">'+
+    THEMES.filter(t=>t[2]===dark).map(card).join('')+'</div>';
+  host.innerHTML=grid(1,'Dark')+grid(0,'Light');
+  host.querySelectorAll('.theme-card').forEach(b=>b.onclick=()=>setTheme(b.dataset.themeId));}
+function syncThemeGrid(){const t=curTheme();
+  document.querySelectorAll('#themeGrid .theme-card').forEach(b=>b.setAttribute('aria-checked',String(b.dataset.themeId===t)));
+  const n=THEMES.find(x=>x[0]===t);if($('#themeVal'))$('#themeVal').textContent=n?n[1]:t;}
+applyTheme(curTheme());
+/* text size: 14px is the console's own size; others scale the conversation by
+   --chat-zoom (see the CSS next to .wrap). Kept per browser, like the theme. */
+const FS_MIN=12,FS_MAX=22,FS_DEF=14;
+function curFs(){const v=parseFloat(localStorage.getItem('al_fs'));return v>=FS_MIN&&v<=FS_MAX?Math.round(v):FS_DEF;}
+function applyFs(px){document.documentElement.style.setProperty('--chat-zoom',String(px/FS_DEF));}
+function setFs(px){px=Math.min(FS_MAX,Math.max(FS_MIN,Math.round(px)));
+  if(px===FS_DEF)localStorage.removeItem('al_fs');else localStorage.setItem('al_fs',String(px));
+  applyFs(px);syncFs();}
+function syncFs(){const v=curFs();
+  $('#fsRange').value=String(v);
+  $('#fsVal').textContent=v===FS_DEF?v+' px · default':v+' px';
+  $('#fsDown').disabled=v<=FS_MIN;$('#fsUp').disabled=v>=FS_MAX;$('#fsReset').disabled=v===FS_DEF;}
+$('#fsRange').oninput=e=>setFs(+e.target.value);
+$('#fsDown').onclick=()=>setFs(curFs()-1);
+$('#fsUp').onclick=()=>setFs(curFs()+1);
+$('#fsReset').onclick=()=>setFs(FS_DEF);
+applyFs(curFs());
+/* another tab of this console changed one of them */
+window.addEventListener('storage',e=>{
+  if(e.key==='al_theme'){applyTheme(curTheme());syncThemeGrid();}
+  if(e.key==='al_fs'){applyFs(curFs());syncFs();}});
+/* ⚙ Settings → Accounts: the logins this machine knows about. ACCOUNTS
    always holds at least the one the console runs under, so a length of 1 is how
    the rest of the UI knows there is no choice to offer and stays as it was. */
 let ACCOUNTS=[{id:'main',label:'main',dir:''}];
@@ -8455,14 +8585,16 @@ function accErr(m){const e=$('#accerr');if(!e)return;
   if(m){e.textContent=m;e.removeAttribute('hidden');}else{e.textContent='';e.setAttribute('hidden','');}}
 function renderAccounts(){const h=$('#acclist');if(!h)return;
   const main=ACCOUNTS[0]||{dir:'~/.claude'};
-  h.innerHTML='<div class="accrow accmain"><span class="acci">main</span>'+
-    '<span class="accd">'+esc(main.dir||'~/.claude')+'</span>'+
-    '<span class="accnote">the console runs here</span></div>'+
-    ACCOUNTS.filter(a=>a.id!=='main').map(a=>'<div class="accrow" data-id="'+escAttr(a.id)+'">'+
-      '<span class="acci">'+esc(a.label)+'</span><span class="accd">'+esc(a.dir)+'</span>'+
-      '<button class="accdel" title="remove">✕</button></div>').join('');
+  const row=(a,isMain)=>'<div class="acc-row'+(isMain?' acc-main':'')+'"'+(isMain?'':' data-id="'+escAttr(a.id)+'"')+'>'+
+    '<div class="acc-body"><div class="acc-name">'+esc(isMain?'main':a.label)+
+      (isMain||a.label===a.id?'':'<span class="acc-id">'+esc(a.id)+'</span>')+'</div>'+
+    '<div class="acc-dir" title="'+escAttr(a.dir||'')+'">'+esc(a.dir||'~/.claude')+'</div></div>'+
+    (isMain?'<span class="acc-tag">this console</span>'
+      :'<button type="button" class="set-icon accdel" title="Forget this account" aria-label="Forget '+escAttr(a.label)+'">'+sessionIcon('x')+'</button>')+
+    '</div>';
+  h.innerHTML=row(main,true)+ACCOUNTS.filter(a=>a.id!=='main').map(a=>row(a,false)).join('');
   h.querySelectorAll('.accdel').forEach(b=>b.onclick=()=>{
-    const id=b.parentNode.getAttribute('data-id');
+    const id=b.closest('.acc-row').getAttribute('data-id');
     /* Removing an account here only forgets where it is. Its transcripts stay in
        its own tree, which is also why a session living there would drop out of
        the list until the account is added back. */
@@ -8475,16 +8607,25 @@ function saveAccounts(list){accErr('');
       if(j&&j.error){accErr(j.error);return;}
       ACCOUNTS=(j&&j.accounts)||ACCOUNTS;renderAccounts();reqList();
     }).catch(()=>accErr('could not save'));}
-function openSettings(){loadAccounts().then(()=>{accErr('');renderAccounts();
-  $('#settings').removeAttribute('hidden');});}
-function closeSettings(){$('#settings').setAttribute('hidden','');}
-$('#settingsbtn').onclick=openSettings;
+function settingsOpen(){const d=$('#settings');return !!(d&&d.open);}
+function settingsTab(name){
+  document.querySelectorAll('#settings .set-tab').forEach(b=>b.setAttribute('aria-selected',String(b.dataset.pane===name)));
+  document.querySelectorAll('#settings .set-pane').forEach(p=>{p.hidden=p.dataset.pane!==name;});}
+function openSettings(tab){buildThemeGrid();syncThemeGrid();syncFs();accErr('');renderAccounts();
+  settingsTab(tab||'appearance');
+  const d=$('#settings');if(!d.open)d.showModal();
+  loadAccounts().then(renderAccounts);}
+function closeSettings(){const d=$('#settings');if(d&&d.open)d.close();}
+$('#settingsbtn').onclick=()=>openSettings();
 $('#setx').onclick=closeSettings;
-$('#setclose').onclick=closeSettings;
-$('#settings').onclick=ev=>{if(ev.target===$('#settings'))closeSettings();};
-$('#accadd').onclick=()=>{const id=$('#accid').value.trim(),lb=$('#acclabel').value.trim(),
-  d=$('#accdir').value.trim();
-  if(!id||!d){accErr('an id and a config dir are both needed');return;}
+document.querySelectorAll('#settings .set-tab').forEach(b=>b.onclick=()=>settingsTab(b.dataset.pane));
+/* a click outside the panel lands on the dialog element itself (its ::backdrop) */
+$('#settings').addEventListener('click',ev=>{if(ev.target!==ev.currentTarget)return;
+  const r=ev.currentTarget.getBoundingClientRect();
+  if(ev.clientX<r.left||ev.clientX>r.right||ev.clientY<r.top||ev.clientY>r.bottom)closeSettings();});
+$('#accform').onsubmit=ev=>{ev.preventDefault();
+  const id=$('#accid').value.trim(),lb=$('#acclabel').value.trim(),d=$('#accdir').value.trim();
+  if(!id||!d){accErr('An ID and a config directory are both needed.');return;}
   saveAccounts(ACCOUNTS.filter(a=>a.id!=='main').concat([{id:id,label:lb||id,dir:d}]))
     .then(()=>{if(!$('#accerr').textContent){$('#accid').value='';$('#acclabel').value='';$('#accdir').value='';}});};
 /* Handing a session to another login is not a hot-swap the way the model is. The

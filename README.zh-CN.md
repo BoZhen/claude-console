@@ -138,7 +138,10 @@
 
 - **13 种配色主题** —— 明暗皆有（Dark、Dracula、Nord、Tokyo Night、Catppuccin、
   Gruvbox、Light、Solarized Light、Rosé Pine Dawn、One Light、Ayu Light…），
-  从侧栏切换；选择按设备保存。
+  在 ⚙ Settings → Appearance 里点色块切换；选择按设备保存。
+- **字号** —— ⚙ Settings → Appearance，12–22 px（默认 14 px），带预览。整个对话区
+  （消息、代码、工具卡片、图片、计划面板、改动抽屉）和输入框按同一比例缩放，侧栏和
+  顶栏保持原样。和主题一样按设备保存。
 - **一眼可见的状态** —— 头部有上下文窗口、5 小时滚动用量和每周用量计量，账号若有按
   模型细分的周额度（Max 上的 Fable）也一并显示，悬停可看各自的复位时间；全宽输入框上方有一个
   浮动状态药丸（ready / 工作计时 / 实时 token 计数）以及模型和思考深度药丸。上下文用到
