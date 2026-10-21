@@ -99,8 +99,8 @@ which is the whole point.
   the viewer is typeset; a match inside a formula marks the whole formula, and
   tool output stays literal.
 - **Export / import** — take a conversation to another machine as `.jsonl`, or
-  adopt one here; **Import folder** pins a directory as a project before it has
-  any history.
+  choose a destination folder and import one here; **Import folder** pins a
+  directory as a project before it has any history.
 - **Session recap** — come back to a session that has been idle and it opens with
   a short summary of where it was left.
 - **Per-session drafts** — half-typed messages stay with their session and
@@ -153,9 +153,9 @@ which is the whole point.
   sixth setting,
   **ultracode**, runs at xhigh and opts every message into multi-agent
   orchestration.
-- Pick **project dir**, **model** (`↻` refreshes the list from the API) and
-  **permission mode** (⚡ Auto-accept / 🔐 Approve / 📋 Plan / ⏩ Full auto) when
-  starting a session, or change them per session afterwards.
+- **New session dialog** — browse or create a folder, then choose the model,
+  thinking effort and permission mode (⚡ Auto-accept / 🔐 Approve / 📋 Plan / ⏩ Full auto).
+  The model list can be refreshed inside the dialog. Active-session controls remain available.
 
 ### Everything else
 

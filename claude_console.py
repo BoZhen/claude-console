@@ -1513,6 +1513,77 @@ def dir_complete(q, limit=500):
     return out[:limit], len(out) > limit
 
 
+def _directory_path(raw=""):
+    if raw is not None and not isinstance(raw, str):
+        raise ValueError("Invalid directory path")
+    raw = (raw or "~").strip()
+    if raw == "~" or raw.startswith("~/"):
+        raw = os.path.join(HOME, raw[2:]) if raw != "~" else HOME
+    elif not os.path.isabs(raw):
+        raw = os.path.join(HOME, raw)
+    path = safe_cwd(raw)
+    if not path:
+        raise ValueError("Choose an existing directory inside your home folder")
+    return path
+
+
+def browse_directories(raw="", hidden=False, limit=500):
+    """List one directory, without discovering repositories or changing projects."""
+    path = _directory_path(raw)
+    home = os.path.realpath(HOME)
+    folders = []
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if entry.name.startswith(".") and not hidden:
+                    continue
+                try:
+                    target = safe_cwd(entry.path) if entry.is_dir() else None
+                except OSError:
+                    continue
+                if target:
+                    folders.append({"name": entry.name, "path": target})
+    except OSError as exc:
+        raise ValueError("Cannot read this directory") from exc
+    folders.sort(key=lambda row: (row["name"].casefold(), row["name"]))
+    return {"path": path, "parent": path if path == home else os.path.dirname(path),
+            "home": home, "folders": folders[:limit], "truncated": len(folders) > limit}
+
+
+def create_directory(parent, name):
+    if not isinstance(parent, str) or not parent.strip():
+        raise ValueError("Choose a parent directory")
+    if not isinstance(name, str):
+        raise ValueError("Enter a folder name")
+    name = name.strip()
+    if (not name or name in (".", "..") or "/" in name or "\\" in name
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in name)):
+        raise ValueError("Enter a single folder name, without path separators")
+    try:
+        if len(name.encode("utf-8")) > 255:
+            raise ValueError("Folder name is too long")
+    except UnicodeError as exc:
+        raise ValueError("Invalid folder name") from exc
+    path = _directory_path(parent)
+    home = os.path.realpath(HOME)
+    if os.mkdir not in os.supports_dir_fd or not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError("Secure folder creation is unavailable on this platform")
+    # Anchor traversal at HOME and refuse symlinks changed since validation.
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(home, flags)
+    try:
+        for part in os.path.relpath(path, home).split(os.sep):
+            if part == ".":
+                continue
+            child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        os.mkdir(name, mode=0o755, dir_fd=fd)
+    finally:
+        os.close(fd)
+    return {"path": os.path.join(path, name)}
+
+
 # ───────────────────────── git diff (ground truth) ─────────────────────────
 def _git(cwd, args, timeout=6):
     try:
@@ -2643,6 +2714,67 @@ class DirCompleteHandler(AuthMixin, tornado.web.RequestHandler):
         self.set_header("Content-Type", "application/json")
         dirs, more = dir_complete(self.get_argument("q", ""))
         self.write(json.dumps({"dirs": dirs, "more": more}))
+
+
+class DirectoriesHandler(AuthMixin, tornado.web.RequestHandler):
+    async def get(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "application/json")
+        try:
+            result = await asyncio.get_running_loop().run_in_executor(
+                None, browse_directories, self.get_argument("path", "~"),
+                self.get_argument("hidden", "0") == "1")
+        except ValueError as exc:
+            self.set_status(400)
+            self.write({"error": str(exc)})
+            return
+        self.write(result)
+
+    async def post(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "application/json")
+        origin = self.request.headers.get("Origin")
+        if origin:
+            try:
+                parsed = urllib.parse.urlsplit(origin)
+                same_origin = parsed.scheme in ("http", "https") and parsed.netloc.lower() == self.request.host.lower()
+            except ValueError:
+                same_origin = False
+            if not same_origin:
+                self.set_status(403)
+                self.write({"error": "Cross-origin folder creation is not allowed"})
+                return
+        if self.request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+            self.set_status(415)
+            self.write({"error": "Expected a JSON request"})
+            return
+        if len(self.request.body) > 8192:
+            self.set_status(413)
+            self.write({"error": "Request is too large"})
+            return
+        try:
+            body = json.loads(self.request.body)
+            if not isinstance(body, dict):
+                raise ValueError("Invalid request")
+            result = await asyncio.get_running_loop().run_in_executor(
+                None, create_directory, body.get("path"), body.get("name"))
+        except ValueError as exc:
+            self.set_status(400)
+            self.write({"error": str(exc)})
+        except FileExistsError:
+            self.set_status(409)
+            self.write({"error": "A file or folder with that name already exists"})
+        except PermissionError:
+            self.set_status(403)
+            self.write({"error": "No permission to create a folder here"})
+        except OSError:
+            self.set_status(500)
+            self.write({"error": "Could not create the folder"})
+        else:
+            self.set_status(201)
+            self.write(result)
 
 
 class DiffHandler(AuthMixin, tornado.web.RequestHandler):
@@ -4200,12 +4332,14 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             return
         mt = msg.get("type")
         if mt == "start":
+            request_id = msg.get("requestId")
+            reply = {"requestId": request_id} if isinstance(request_id, str) and len(request_id) <= 80 else {}
             if not CLAUDE_BIN or not os.path.exists(CLAUDE_BIN):
-                self._say({"type": "error", "error": "claude CLI not found"})
+                self._say({"type": "error", "error": "claude CLI not found", **reply})
                 return
             cwd = safe_cwd(msg.get("cwd") or HOME)
             if not cwd:
-                self._say({"type": "error", "error": "invalid working directory"})
+                self._say({"type": "error", "error": "invalid working directory", **reply})
                 return
             sid = secrets.token_hex(6)
             sess = ChatSession(sid, cwd, msg.get("model") or "", _sanitize_mode(msg.get("mode")),
@@ -4213,16 +4347,17 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             try:
                 await sess.start()
             except Exception as e:
-                self._say({"type": "error", "error": "spawn failed: %s" % e})
+                self._say({"type": "error", "error": "spawn failed: %s" % e, **reply})
                 return
             CHAT_SESSIONS[sid] = sess
             if self.session and self.session is not sess:
                 self.session.detach(self)   # keep it alive, just stop viewing it
             self.session = sess
             sess.attach(self)
-            self._say({"type": "started", "id": sid, "cwd": cwd,
+            self._say({"type": "started", "id": sid, "cwd": cwd, **reply,
                        "name": os.path.basename(cwd) or cwd,
-                       "model": sess.model or "default", "mode": sess.mode, "effort": sess.effort})
+                       "model": sess.model or "default", "mode": sess.mode, "effort": sess.effort,
+                       "account": sess.account})
         elif mt == "attach":
             sess = CHAT_SESSIONS.get(msg.get("id"))
             if not sess:
@@ -4564,8 +4699,6 @@ header{display:flex;gap:6px;align-items:center;padding:6px 10px;background:var(-
 .sb-brand{font-weight:700;color:var(--acc);font-size:15px;padding:11px 12px 9px;border-bottom:1px solid var(--line);white-space:nowrap}
 header select,header input{background:var(--bg3);color:var(--fg);border:1px solid var(--line);
   border-radius:5px;padding:4px 7px;font-size:12.5px}
-header select#project{flex:1;min-width:120px;max-width:380px}
-header input#cwd{flex:1;min-width:120px;display:none}
 .status{font-size:11.5px;color:var(--mut);white-space:nowrap;margin-left:auto;display:flex;gap:6px;align-items:center}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--mut)}
 .dot.on{background:var(--add);box-shadow:0 0 6px var(--add)}
@@ -4988,11 +5121,6 @@ body.tabdrag,body.tabdrag .stab{cursor:grabbing}
 #sbresize:hover,#sbresize.drag{background:var(--acc)}
 #sidebar.collapsed + #sbresize{display:none}
 .sb-new{padding:8px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:6px}
-.sb-new select,.sb-new input{width:100%;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:5px;padding:5px 7px;font-size:12.5px}
-.cwdwrap{position:relative;display:none}
-.cwdwrap.show{display:block}
-#cwdac{position:absolute;left:0;right:0;top:100%;z-index:50;background:var(--bg3);border:1px solid var(--acc);border-top:none;border-radius:0 0 6px 6px;max-height:240px;overflow:auto;display:none;box-shadow:0 8px 18px rgba(0,0,0,.5)}
-#cwdac.on{display:block}
 .acitem{padding:5px 8px;cursor:pointer;border-bottom:1px solid var(--line)}
 .acitem:last-child{border-bottom:none}
 .acitem:hover,.acitem.sel{background:var(--acc)}
@@ -5000,7 +5128,6 @@ body.tabdrag,body.tabdrag .stab{cursor:grabbing}
 .acpath{font-size:10px;font-family:var(--fmono);color:var(--mut);overflow-wrap:anywhere;line-height:1.3}
 .acitem:hover .acname,.acitem.sel .acname,.acitem:hover .acpath,.acitem.sel .acpath{color:var(--onacc)}
 .acmore{padding:5px 8px;font-size:10px;color:var(--mut);font-style:italic}
-.sb-row2{display:flex;gap:6px}.sb-row2 select{flex:1;min-width:0}
 #srchopen{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;
   margin:0 0 8px;padding:6px 8px;background:var(--bg3);color:var(--dim);
   border:1px solid var(--line);border-radius:6px;font-size:12px;cursor:pointer}
@@ -5075,9 +5202,8 @@ body.tabdrag,body.tabdrag .stab{cursor:grabbing}
 #impmsg{font-size:11px;color:var(--dim);line-height:1.35;word-break:break-word}
 #impmsg:empty{display:none}   /* no dead gap when there is nothing to report */
 #impmsg.bad{color:var(--delfg)}
-#mrefresh{flex:0 0 auto;width:26px;padding:0;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:5px;font-size:13px;cursor:pointer;line-height:1}
-#mrefresh:hover{color:var(--acc);border-color:var(--acc)}
-#mrefresh.busy{color:var(--acc);animation:mrspin .8s linear infinite;pointer-events:none}
+#mrefresh.busy{color:var(--acc);cursor:progress}
+#mrefresh.busy svg{animation:mrspin .8s linear infinite}
 @keyframes mrspin{to{transform:rotate(360deg)}}
 .newbtn{background:var(--acc);color:var(--onacc);font-weight:700;border:none;border-radius:6px;padding:7px;font-size:13px;cursor:pointer}
 .newbtn:hover{filter:brightness(1.08)}
@@ -5284,6 +5410,47 @@ body.tabdrag,body.tabdrag .stab{cursor:grabbing}
 #cardMenu .cfgrow .cfgsel{background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:5px;padding:3px 6px;font-size:12px;cursor:pointer}
 .fscope{font-size:10px;color:var(--mut);font-family:var(--fmono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:130px}
 #sb-backdrop{display:none}
+.session-dialog{margin:auto;width:min(560px,calc(100% - 24px));max-height:calc(100dvh - 24px);
+  padding:18px;border:1px solid var(--line);border-radius:8px;background:var(--bg2);color:var(--fg);overflow:auto;
+  box-shadow:0 16px 48px rgba(0,0,0,.3);font:14px var(--fsans)}
+.session-dialog::backdrop{background:rgba(0,0,0,.5)}
+.session-dialog .dialog-heading{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-bottom:16px}
+.session-dialog .dialog-tools{display:flex;gap:6px}
+.session-dialog h2{font-size:17px;font-weight:650;line-height:1.4}
+.session-dialog label{display:block;font-size:12px;color:var(--mut);margin:0 0 6px}
+.session-dialog input:not([type=checkbox]),.session-dialog select{width:100%;min-width:0;height:36px;
+  padding:6px 8px;border:1px solid var(--line);border-radius:5px;background:var(--bg);color:var(--fg);font:13px var(--fsans)}
+.session-dialog .path-input{font-family:var(--fmono)!important}
+.session-dialog .dialog-field{min-width:0;margin-bottom:14px}
+.session-dialog .path-row{display:flex;gap:6px;min-width:0;align-items:center}
+.session-dialog .path-row input{flex:1;width:0}
+.session-dialog .path-row select{flex:1;width:0}
+.session-dialog .dialog-icon{display:grid;place-items:center;flex:none;width:36px;height:36px;padding:0;
+  border:1px solid var(--line);border-radius:5px;background:var(--bg3);color:var(--fg);cursor:pointer}
+.session-dialog .dialog-icon svg,.session-dialog .folder-row svg{width:18px;height:18px;flex:none}
+.session-dialog .dialog-icon:hover:not(:disabled){color:var(--acc);border-color:var(--acc)}
+.session-dialog .dialog-settings{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px}
+.session-dialog .dialog-settings .dialog-field{margin:0}
+.session-dialog fieldset{border:0;min-width:0}
+.session-dialog button:disabled{opacity:.45;cursor:default}
+.session-dialog .dialog-error{min-height:1.4em;margin:12px 0;color:var(--delfg);font-size:12px;overflow-wrap:anywhere}
+.session-dialog .dialog-actions{display:flex;justify-content:flex-end;align-items:center;gap:8px}
+.session-dialog .dialog-actions button{min-height:36px;padding:7px 14px}
+.session-dialog .dialog-actions .check-label{display:flex;gap:7px;align-items:center;margin:0 auto 0 0}
+.session-dialog .dialog-actions input{accent-color:var(--acc)}
+#folderList{height:min(320px,42dvh);min-height:100px;overflow:auto;margin:12px 0;border-block:1px solid var(--line);background:var(--bg)}
+#folderCreateForm{margin-top:14px}
+#folderCreateForm[hidden]{display:none}
+#folderCreateForm .path-row button{height:36px;flex:none}
+#folderCreateSubmit{width:92px}
+.session-dialog .folder-row{display:flex;gap:10px;align-items:center;width:100%;min-height:40px;padding:8px 10px;
+  border:0;border-bottom:1px solid var(--line);background:transparent;color:var(--fg);text-align:left;cursor:pointer}
+.session-dialog .folder-row:hover{background:var(--sel)}
+.session-dialog .folder-row span{flex:1;min-width:0;overflow-wrap:anywhere;line-height:1.4}
+.session-dialog .folder-row svg:first-child{color:var(--tool)}
+.session-dialog .folder-row svg:last-child{color:var(--mut)}
+@media(max-width:480px){.session-dialog{padding:14px}.session-dialog .dialog-settings{grid-template-columns:1fr}
+  .session-dialog .dialog-icon{width:40px;height:40px}.session-dialog .dialog-actions button{min-height:40px}}
 @media(max-width:860px){
   #sidebar{position:fixed;left:0;top:0;bottom:0;z-index:40;transform:translateX(-100%);transition:transform .34s cubic-bezier(.32,.72,0,1);width:min(310px,86vw);box-shadow:2px 0 14px rgba(0,0,0,.5)}
   #sidebar.open{transform:none}
@@ -5329,14 +5496,8 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
     <div class="sb-brand">⬡ Claude Console</div>
     <button id="srchopen" title="search all conversation history"><span>🔍 Search history</span><kbd>⌘K</kbd></button>
     <div class="sb-new">
-      <select id="project" title="working directory for a new session"></select>
-      <div class="cwdwrap" id="cwdwrap"><input id="cwd" placeholder="type a path…  ↑↓ to pick" autocomplete="off"><div id="cwdac"></div></div>
-      <div class="sb-row2">
-        <select id="model" title="model"><option value="opus">model: opus</option><option>sonnet</option><option>haiku</option></select><button id="mrefresh" title="refresh model list from the API">↻</button>
-        <select id="mode" title="permission mode"><option value="acceptEdits">⚡ Auto-accept</option><option value="default">🔐 Approve</option><option value="plan">📋 Plan</option><option value="bypassPermissions">⏩ Full auto</option></select>
-      </div>
       <button class="newbtn" id="newbtn">＋ New session</button>
-      <div class="impline"><div class="improw"><input type="file" id="impfile" accept=".jsonl,application/x-ndjson" hidden><button id="impbtn" title="adopt a .jsonl transcript exported from another machine — it lands in the folder above">Import session</button><button id="fimpbtn" title="add a folder to the sidebar as a project">Import folder</button></div><span id="imphint"></span><span id="impmsg"></span></div>
+      <div class="impline"><div class="improw"><input type="file" id="impfile" accept=".jsonl,application/x-ndjson" hidden><button id="impbtn" title="Choose a folder and import a saved transcript">Import session</button><button id="fimpbtn" title="add a folder to the sidebar as a project">Import folder</button></div><span id="imphint"></span><span id="impmsg"></span></div>
     </div>
     <div class="sb-sec">
       <div class="sb-h">Live <span id="liveN" class="cnt">0</span></div>
@@ -5478,6 +5639,50 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
     <div class="fbtns"><button class="fcancel" id="setclose">Close</button></div>
   </div>
 </div>
+<dialog id="newSessionDialog" class="session-dialog" aria-labelledby="newSessionTitle">
+  <form id="newSessionForm">
+    <div class="dialog-heading"><h2 id="newSessionTitle">New session</h2><button id="newSessionClose" class="dialog-icon" type="button" title="Close" aria-label="Close" data-session-icon="x"></button></div>
+    <fieldset id="newSessionFields">
+      <div class="dialog-field"><label for="newRecent">Recent folders</label><select id="newRecent"></select></div>
+      <div class="dialog-field"><label for="newCwd">Working directory</label><div class="path-row">
+        <input id="newCwd" class="path-input" autocomplete="off" spellcheck="false" placeholder="~/project" required>
+        <button id="newBrowse" class="dialog-icon" type="button" title="Browse folders" aria-label="Browse folders" data-session-icon="folder-open"></button>
+      </div></div>
+      <div class="dialog-field"><label for="newModel">Model</label><div class="path-row">
+        <select id="newModel"><option value="opus">model: opus</option></select>
+        <button id="mrefresh" class="dialog-icon" type="button" title="Refresh model list" aria-label="Refresh model list" data-session-icon="refresh"></button>
+      </div></div>
+      <div class="dialog-settings">
+        <div class="dialog-field"><label for="newEffort">Thinking depth</label><select id="newEffort"></select></div>
+        <div class="dialog-field"><label for="newMode">Permissions</label><select id="newMode"></select></div>
+      </div>
+    </fieldset>
+    <div id="newSessionError" class="dialog-error" role="alert"></div>
+    <div class="dialog-actions"><button id="newSessionCancel" class="btn" type="button">Cancel</button><button id="newSessionSubmit" class="newbtn" type="submit">Start session</button></div>
+  </form>
+</dialog>
+<dialog id="folderDialog" class="session-dialog" aria-labelledby="folderTitle">
+  <div class="dialog-heading"><h2 id="folderTitle">Select folder</h2><div class="dialog-tools">
+    <button id="folderNew" class="dialog-icon" type="button" title="New folder" aria-label="New folder" data-session-icon="folder-plus" disabled></button>
+    <button id="folderClose" class="dialog-icon" type="button" title="Close" aria-label="Close" data-session-icon="x"></button>
+  </div></div>
+  <form id="folderPathForm" class="path-row">
+    <button id="folderUp" class="dialog-icon" type="button" title="Parent folder" aria-label="Parent folder" data-session-icon="arrow-up"></button>
+    <button id="folderHome" class="dialog-icon" type="button" title="Home folder" aria-label="Home folder" data-session-icon="house"></button>
+    <input id="folderPath" class="path-input" aria-label="Folder path" autocomplete="off" spellcheck="false">
+    <button class="dialog-icon" type="submit" title="Open folder path" aria-label="Open folder path" data-session-icon="arrow-right"></button>
+  </form>
+  <form id="folderCreateForm" hidden>
+    <label for="folderName">Folder name</label>
+    <div class="path-row"><input id="folderName" autocomplete="off" spellcheck="false" required>
+      <button id="folderCreateSubmit" class="newbtn" type="submit">Create</button>
+      <button id="folderCreateCancel" class="btn" type="button">Cancel</button></div>
+    <div id="folderCreateError" class="dialog-error" role="alert"></div>
+  </form>
+  <div id="folderList" aria-label="Folders" aria-busy="false"></div>
+  <div id="folderError" class="dialog-error" role="status"></div>
+  <div class="dialog-actions"><label class="check-label"><input id="folderHidden" type="checkbox">Hidden folders</label><button id="folderSelect" class="newbtn" type="button" disabled>Select folder</button></div>
+</dialog>
 <div id="fimp" hidden>
   <div id="fimppanel">
     <div class="fh"><span class="ft">📁 Import folder</span>
@@ -5501,10 +5706,16 @@ let ws=null, running=false, ready=false, compacting=false, cwd='', tools={};
 let tokUp=0,tokOut=0,tokShow=false;   /* live streaming token counts shown in the pill */
 let sid=null, curCC=null, editCount=0, pendingStart=false, reconnectT=0;
 const EFFORTS=['low','medium','high','xhigh','max','ultracode'];
+const MODE_OPTIONS=[['acceptEdits','⚡ Auto-accept'],['default','🔐 Approve'],['plan','📋 Plan'],['bypassPermissions','⏩ Full auto']];
+let preferredModel=localStorage.getItem('al_model')||'opus';
+if(preferredModel==='default')preferredModel='opus';
+let preferredMode=localStorage.getItem('al_mode')||'acceptEdits';
+if(!MODE_OPTIONS.some(([id])=>id===preferredMode))preferredMode='acceptEdits';
 let curEffort=localStorage.getItem('al_effort')||'max';
 let curModel='default', modelOnce='';   /* the live session's model; the model a @prefix put one turn on */
 let showThink=false;
 let liveSessions=[], projData=[], HOMEDIR='';
+let recentFolders=[],selectedFolder='';
 /* which project groups are expanded — per device, survives reloads */
 let pExp=new Set();try{pExp=new Set(JSON.parse(localStorage.getItem('al_pexp')||'[]'));}catch(e){}
 const EDIT_TOOLS=new Set(['Edit','MultiEdit','Write','NotebookEdit']);
@@ -6008,10 +6219,7 @@ function statset(t){const el=$('#thinking');if(!el)return;
   if(!running){const m=el.querySelector('.meta');if(m)m.textContent='';}}
 /* CLI-style ↑input / ↓output token counts for the pill (reuses the project fmtTok) */
 function tokStr(){return '↑'+fmtTok(tokUp)+' ↓'+fmtTok(tokOut);}
-function bindProject(p){if(!p)return;const sel=$('#project');let ok=false;
-  for(const o of sel.options){if(o.value===p){ok=true;break;}}
-  if(!ok){const o=document.createElement('option');o.value=p;o.textContent='● '+p.split('/').slice(-2).join('/');sel.insertBefore(o,sel.firstChild);}
-  sel.value=p;}
+function bindProject(p){if(p)selectedFolder=p;}
 function setBusy(b,wordSeed,elapsedMs){running=b;$('#dot').className='dot '+(b?'busy':(ready?'on':''));
   $('#thinking').classList.toggle('busy',b);
   if(!b&&ready)statset('ready');      /* busy: startThinking owns the word + timer */
@@ -6230,7 +6438,9 @@ function markEnded(msg){ready=false;ta.disabled=true;sendBtn.disabled=true;attac
   localStorage.removeItem(SKEY);if(msg)addNotice(msg);}
 function onMsg(e){const m=JSON.parse(e.data);
   if(m.type==='hello'){if(m.stamp&&m.stamp!==PAGE_STAMP){try{saveDraft();}catch(_){}location.reload();}return;}   /* served under older code: pick up the new page */
+  if(handleNewSessionReply(m))return;
   if(m.type==='started'){pendingStart=false;sid=m.id;cwd=m.cwd;bindProject(m.cwd);localStorage.setItem(SKEY,sid);loadDraft(sid);
+    const account=m.account||'main';if(curAccount!==account){curAccount=account;MODELS=MODELS_BY_ACCT[account]||[];loadModels(false,account);loadUsage();}
     ready=true;setBusy(false);ta.focus();setCurname(m.name||'session');setModelPill(m.model,false);setEffortPill(m.effort);renderCtx(null);statset('ready');
     const startedTab=ensureTab(m,true);
     if(startedTab){startedTab.lastSeq=0;startedTab.serverSeq=0;persistTabs();renderTabs();}
@@ -6301,6 +6511,7 @@ function openWs(cb){const proto=location.protocol==='https:'?'wss:':'ws:';
       if(restoredViewId===saved&&t)req.after_seq=Number(t.lastSeq||0);else statset('reattaching…');
       ws.send(JSON.stringify(req));}};
   ws.onclose=()=>{$('#dot').className='dot';statset('disconnected');ta.disabled=true;sendBtn.disabled=true;attachOff(true);
+    if(newSessionRequest){resetNewSessionRequest();$('#newSessionError').textContent='Connection lost. Check Live sessions before trying again.';}
     clearTimeout(reconnectT);reconnectT=setTimeout(()=>openWs(),1800);};
   ws.onmessage=onMsg;}
 function wsSend(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));}
@@ -6355,21 +6566,17 @@ function renderUsage(u){const el=$('#usage');const f=u&&u.five_hour,w=u&&u.seven
    session, not to the console. Getting this wrong quotes the wrong budget. */
 function loadUsage(){fetch('api/usage?account='+encodeURIComponent(curAccount))
   .then(r=>r.json()).then(j=>renderUsage(j.usage)).catch(()=>{});}
-/* dynamic model list from the live /v1/models API: aliases (track the latest of
-   each family) stay on top; the full list — incl. temporary models like fable —
-   loads into an "all models" group. Static opus/sonnet/haiku = offline fallback. */
+/* Model choices combine stable CLI aliases with the account's live API catalog.
+   Static opus/sonnet/haiku aliases remain available offline. */
 const MODEL_ALIASES=[['opus','model: opus'],['sonnet','sonnet'],['haiku','haiku']];
 let MODELS=[];   /* [{id,name}] mirror of the API list */
-function rebuildModelPicker(){
-  if(!MODELS.length)return;
-  const sel=$('#model');const want=localStorage.getItem('al_model')||sel.value;
-  sel.innerHTML='';
-  MODEL_ALIASES.forEach(([v,t])=>{const o=document.createElement('option');o.value=v;o.textContent=t;sel.appendChild(o);});
-  const g=document.createElement('optgroup');g.label='all models';
-  MODELS.forEach(m=>{const o=document.createElement('option');o.value=m.id;o.textContent=m.name;o.title=m.id;g.appendChild(o);});
-  sel.appendChild(g);
-  for(const o of sel.options)if(o.value===want){sel.value=want;break;}   /* keep the saved/current pick */
-}
+function modelOptionsFor(current){const options=MODEL_ALIASES.map(x=>x.slice());
+  const catalog=MODELS_BY_ACCT.main||(curAccount==='main'?MODELS:[]);
+  catalog.forEach(m=>{if(!options.some(([id])=>id===m.id))options.push([m.id,m.name||m.id]);});
+  if(current&&!options.some(([id])=>id===current))options.push([current,current+' (saved)']);return options;}
+function rebuildModelPicker(){if(!$('#newSessionDialog').open||newSessionRequest)return;
+  const model=$('#newModel').value||preferredModel,effort=$('#newEffort').value;
+  fillSelect($('#newModel'),modelOptionsFor(model),model);newEffortOptions(effort);}
 /* Two logins need not be entitled to the same models, so every list is filed
    under the account it came from. MODELS stays the attached session's list, which
    is what the pill and the @model completion are asking about. */
@@ -6377,10 +6584,11 @@ let MODELS_BY_ACCT={};
 function loadModels(fresh,acct){acct=acct||curAccount;
   return fetch('api/models?account='+encodeURIComponent(acct)+(fresh?'&fresh=1':''))
     .then(r=>r.json()).then(j=>{
-      if(!j.models||!j.models.length)return;
+      if(!j.models||!j.models.length)return false;
       MODELS_BY_ACCT[acct]=j.models;
       if(acct===curAccount&&JSON.stringify(j.models)!==JSON.stringify(MODELS)){
-        MODELS=j.models;rebuildModelPicker();}}).catch(()=>{});}
+        MODELS=j.models;}
+      if(acct==='main')rebuildModelPicker();return true;}).catch(()=>false);}
 /* What a given session may be switched to — its own account's list, falling back
    to the attached one only before that account's list has arrived. */
 function acctModels(aid){return MODELS_BY_ACCT[aid||'main']||MODELS;}
@@ -6419,9 +6627,7 @@ function modelLabel(real,maxTok){
   let lbl=fam+(m?(' '+m[1]+(m[2]?'.'+m[2]:'')):'');
   if(maxTok)lbl+='['+fmtTok(maxTok)+']';
   return lbl;}
-/* the sidebar #model picker now holds the NEW-session default, so it no longer
-   reflects the live session's resolved model (that moved to ⚙ Configure). Kept
-   as a no-op shim so existing callers (ready / context) stay valid. */
+/* Active-session choices stay separate from the new-session defaults. */
 function setResolvedModel(real,maxTok){if(real)_rmodel=real;if(maxTok)_rmax=maxTok;}
 
 /* sidebar: live sessions (in-RAM) + resume-from-disk (past transcripts) */
@@ -6615,13 +6821,8 @@ function renameProject(p){
   if(nm===null)return;
   wsSend({type:'proj_rename',path:p.path,name:nm});}
 
-/* start a session in a specific folder: route through the custom-path box so the
-   picker visibly shows where the new session will run */
-function newSessionIn(path){
-  $('#project').value='__custom__';
-  $('#cwdwrap').classList.add('show');
-  $('#cwd').value=path;
-  $('#newbtn').click();}
+/* Open the creation dialog with this project's folder selected. */
+function newSessionIn(path){newSession(path);}
 
 /* ── Manage sessions ──────────────────────────────────────────────────────
    Batch cleanup for one project. Sub-agent threads can pile up dozens deep, and
@@ -6721,10 +6922,7 @@ function openSearch(){const w=$('#srch');w.removeAttribute('hidden');
   const q=$('#srchq');q.focus();q.select();}
 function closeSearch(){$('#srch').setAttribute('hidden','');
   if(srchAbort){srchAbort.abort();srchAbort=null;}}
-/* the folder "this folder" means: the open conversation's own working dir when there
-   is one, else whatever the sidebar's project picker points at. Keying it off the
-   picker alone would be a trap — you'd be chatting in project A while the search
-   silently scoped itself to project B. */
+/* Search the active conversation's folder, falling back to the last used folder. */
 function searchFolder(){
   const s=(liveSessions||[]).find(x=>x.id===sid);
   return (s&&s.cwd)||currentFolder()||'';}
@@ -6887,34 +7085,26 @@ function wireSearch(){
 function impMsg(t,bad){const el=$('#impmsg');if(!el)return;
   el.textContent=t||'';el.classList.toggle('bad',!!bad);
   if(t&&!bad)setTimeout(()=>{if(el.textContent===t)el.textContent='';},6000);}
-/* An import's target folder is the one selected above, the same control New session
-   uses — NOT the conversation currently open. That choice decides where the session
-   will live and resume, and it used to be invisible at the moment of clicking, so it
-   is now shown under the button at all times and confirmed before anything uploads. */
-function importTarget(){return (($('#cwd').value||'').trim())||$('#project').value||'';}
 /* HOMEDIR arrives asynchronously from /api/projects; guard it, because
    ''.replace('','~') would prepend a tilde and show /data/x as ~/data/x. */
 function shortPath(p){p=p||'';
   return (HOMEDIR&&p.startsWith(HOMEDIR))?('~'+p.slice(HOMEDIR.length)):p;}
-function refreshImportHint(){
+function refreshImportHint(d=''){
   const el=$('#imphint');if(!el)return;
-  const d=importTarget();
-  el.textContent=d?('→ '+shortPath(d)):'→ pick a project folder above first';
-  el.classList.toggle('bad',!d);}
+  el.textContent=d?('→ '+shortPath(d)):'';
+  el.classList.remove('bad');}
 function wireImport(){
   const btn=$('#impbtn'),inp=$('#impfile');if(!btn||!inp)return;
   refreshImportHint();
-  ['#project','#cwd'].forEach(s=>{const el=$(s);if(!el)return;
-    el.addEventListener('change',refreshImportHint);
-    el.addEventListener('input',refreshImportHint);});
-  btn.onclick=()=>{if(!importTarget()){impMsg('pick a project folder above first',true);return;}
-    inp.click();};
+  let importDirectory='';
+  btn.onclick=()=>{importDirectory='';impMsg('');refreshImportHint();openFolderDialog(currentFolder()||'~',path=>{
+    importDirectory=path;refreshImportHint(path);inp.value='';inp.click();});};
   inp.onchange=()=>{const f=inp.files&&inp.files[0];if(!f){return;}
-    const dir=importTarget();
-    if(!dir){impMsg('pick a project folder above first',true);inp.value='';return;}
+    const dir=importDirectory;
+    if(!dir){impMsg('choose an import folder first',true);inp.value='';return;}
     if(!confirm('Import this conversation into\n\n    '+shortPath(dir)+
                 '\n\nfile: '+f.name+'\n\nIt will resume in that folder. To use a different one, '
-                +'cancel and change the project selector above.')){
+                +'cancel and choose another folder with Import session.')){
       impMsg('import cancelled');inp.value='';return;}
     const fd=new FormData();fd.append('file',f);fd.append('cwd',dir);
     impMsg('importing '+f.name+' → '+shortPath(dir)+' …');
@@ -6938,8 +7128,7 @@ function delResumable(s){
     {sessions:(p.sessions||[]).filter(x=>x.cc!==s.cc)}));
   renderSidebar();}
 
-function currentFolder(){const p=$('#project').value;
-  return p==='__custom__'?$('#cwd').value.trim():(p||'');}
+function currentFolder(){return (sid&&cwd)||selectedFolder||HOMEDIR||'';}
 
 /* pull the folder-grouped sidebar. The socket also pushes it on connect and after
    any change, so this is the cold-start and manual-rescan path. */
@@ -6948,23 +7137,6 @@ function loadTree(){
     .then(j=>{projData=j.projects||[];renderSidebar();})
     .catch(()=>{});}
 
-/* directory autocomplete for the custom path box (server /api/dircomplete) */
-let acItems=[],acSel=-1,acTimer=0;
-function acClose(){const b=$('#cwdac');b.classList.remove('on');b.innerHTML='';acItems=[];acSel=-1;}
-function acRender(j){const b=$('#cwdac');acItems=(j&&j.dirs)||[];acSel=-1;
-  if(!acItems.length){acClose();return;}
-  let html=acItems.map((p,i)=>{const base=(p.split('/').filter(Boolean).slice(-1)[0])||p;
-    return '<div class="acitem" data-i="'+i+'"><div class="acname">'+esc(base)+'</div><div class="acpath">'+esc(p)+'</div></div>';}).join('');
-  if(j&&j.more)html+='<div class="acmore">… more — keep typing to narrow</div>';
-  b.innerHTML=html;b.classList.add('on');
-  b.querySelectorAll('.acitem').forEach(el=>el.onmousedown=ev=>{ev.preventDefault();acPick(+el.dataset.i);});}
-function acPick(i){if(i<0||i>=acItems.length)return;
-  $('#cwd').value=acItems[i]+'/';   /* auto-append slash → keep drilling with the mouse, no typing */
-  $('#cwd').focus();loadTree();acQuery();}
-function acMove(d){const els=$('#cwdac').querySelectorAll('.acitem');if(!els.length)return;
-  acSel=(acSel+d+els.length)%els.length;els.forEach((el,i)=>el.classList.toggle('sel',i===acSel));els[acSel].scrollIntoView({block:'nearest'});}
-function acQuery(){clearTimeout(acTimer);const q=$('#cwd').value;
-  acTimer=setTimeout(()=>fetch('api/dircomplete?q='+encodeURIComponent(q)).then(r=>r.json()).then(acRender).catch(acClose),130);}
 
 /* ── session tabs, cached views, bounded chat window ──────────────────────────
    Switching used to cost a full rebuild: clearUI() threw the rendered chat away
@@ -7224,16 +7396,142 @@ function switchSession(id){
 function resumeSession(s){if(!s||!s.cc)return;
   stashView(sid);saveDraft();clearUI();restoredViewId='';pendingStart=true;sid=null;
   renderTabs();statset('resuming…');
-  const go=()=>wsSend({type:'resume',cc:s.cc,cwd:s.cwd,model:$('#model').value,mode:$('#mode').value});
+  const go=()=>wsSend({type:'resume',cc:s.cc,cwd:s.cwd,model:preferredModel,mode:preferredMode});
   if(ws&&ws.readyState===1)go();else openWs(go);
   if(window.innerWidth<=860)closeSidebar();}
-function newSession(){const proj=$('#project').value;const dir=proj==='__custom__'?$('#cwd').value.trim():proj;
-  if(!dir){addErr('pick a project directory first');return;}
-  /* keep any current session alive in the background — just spin up another */
-  stashView(sid);saveDraft();clearUI();restoredViewId='';pendingStart=true;sid=null;renderTabs();
-  const start=()=>wsSend({type:'start',cwd:dir,model:$('#model').value,mode:$('#mode').value,effort:curEffort});
-  if(ws&&ws.readyState===1)start();else openWs(start);statset('starting…');
-  if(window.innerWidth<=860)closeSidebar();}
+// Lucide icon paths; licenses are in static/icons/lucide-LICENSE.txt.
+const SESSION_ICON_PATHS={
+  'folder-plus':['M12 10v6','M9 13h6','M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z'],
+  refresh:['M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8','M21 3v5h-5','M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16','M8 16H3v5'],
+  x:['M18 6 6 18','m6 6 12 12'],
+  'arrow-up':['m5 12 7-7 7 7','M12 19V5'],
+  'arrow-right':['M5 12h14','m12 5 7 7-7 7'],
+  folder:['M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z'],
+  'folder-open':['m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2'],
+  house:['M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8','M3 10a2 2 0 0 1 .709-1.528l7-6a2 2 0 0 1 2.582 0l7 6A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z']};
+function sessionIcon(name){return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+
+  (SESSION_ICON_PATHS[name]||[]).map(d=>'<path d="'+d+'"/>').join('')+'</svg>';}
+document.querySelectorAll('[data-session-icon]').forEach(b=>b.innerHTML=sessionIcon(b.dataset.sessionIcon));
+let newSessionRequest=null,newSessionSerial=0,folderSerial=0,folderAbort=null,folderState=null,folderSelectHandler=null;
+let folderCreateRequest=null;
+function fillSelect(sel,options,value){sel.replaceChildren();options.forEach(([v,label])=>{
+  const option=document.createElement('option');option.value=v;option.textContent=label;sel.appendChild(option);});sel.value=value;}
+function newEffortOptions(value){fillSelect($('#newEffort'),EFFORTS.map(v=>[v,v]),EFFORTS.includes(value)?value:'max');}
+function newSession(path){if($('#newSessionDialog').open)return;
+  closeCardMenu();
+  const dir=(typeof path==='string'&&path)||currentFolder()||'~';
+  $('#newCwd').value=dir;$('#newSessionError').textContent='';
+  const folders=new Map();if(cwd)folders.set(cwd,cwd);
+  (projData||[]).forEach(p=>folders.set(p.path,p.path));
+  recentFolders.forEach(p=>folders.set(p,p));
+  if(selectedFolder)folders.set(selectedFolder,selectedFolder);
+  fillSelect($('#newRecent'),[['','Choose a folder'],...[...folders].map(([p])=>[p,shortPath(p)])],folders.has(dir)?dir:'');
+  fillSelect($('#newModel'),modelOptionsFor(preferredModel),preferredModel);newEffortOptions(curEffort);
+  fillSelect($('#newMode'),MODE_OPTIONS,preferredMode);
+  resetNewSessionRequest();$('#newSessionDialog').showModal();$('#newCwd').focus();if(!MODELS_BY_ACCT.main)loadModels(false,'main');}
+function resetNewSessionRequest(){if(newSessionRequest&&newSessionRequest.abort)newSessionRequest.abort.abort();newSessionRequest=null;
+  $('#newSessionFields').disabled=false;$('#newSessionSubmit').disabled=false;$('#newSessionSubmit').textContent='Start session';
+  $('#newSessionCancel').disabled=false;$('#newSessionClose').disabled=false;}
+function closeNewSession(){if(folderCreateRequest||(newSessionRequest&&newSessionRequest.phase==='starting'))return;
+  resetNewSessionRequest();$('#folderDialog').close();$('#newSessionDialog').close();}
+async function directoryData(path,hidden,signal){const r=await fetch('api/directories?path='+encodeURIComponent(path)+'&hidden='+(hidden?'1':'0'),{signal});
+  if(r.status===401)throw new Error('Authentication required. Reload after signing in.');
+  const data=await r.json();if(!r.ok||data.error)throw new Error(data.error||'Could not read this directory');
+  if(typeof data.path!=='string'||!Array.isArray(data.folders))throw new Error('Invalid directory response');return data;}
+async function submitNewSession(e){e.preventDefault();if(newSessionRequest)return;
+  const path=$('#newCwd').value.trim();if(!path){$('#newSessionError').textContent='Choose a working directory';return;}
+  if(!ws||ws.readyState!==1){$('#newSessionError').textContent='Not connected. Wait for the connection, then try again.';return;}
+  const request={id:'new-'+Date.now()+'-'+(++newSessionSerial),phase:'validating',abort:new AbortController(),
+    model:$('#newModel').value,mode:$('#newMode').value,effort:$('#newEffort').value};
+  newSessionRequest=request;$('#newSessionError').textContent='';$('#newSessionFields').disabled=true;
+  $('#newSessionSubmit').disabled=true;$('#newSessionSubmit').textContent='Checking...';
+  try{const data=await directoryData(path,false,request.abort.signal);
+    if(newSessionRequest!==request||!$('#newSessionDialog').open)return;
+    if(!ws||ws.readyState!==1)throw new Error('Not connected. Try again when the connection returns.');
+    request.phase='starting';request.cwd=data.path;$('#newCwd').value=data.path;
+    $('#newSessionSubmit').textContent='Starting...';$('#newSessionCancel').disabled=true;$('#newSessionClose').disabled=true;
+    ws.send(JSON.stringify({type:'start',requestId:request.id,cwd:data.path,model:request.model,mode:request.mode,effort:request.effort}));
+  }catch(error){if(newSessionRequest!==request)return;resetNewSessionRequest();$('#newSessionError').textContent=error.message||'Could not start session';}}
+function handleNewSessionReply(m){const request=newSessionRequest;
+  if(!request||request.phase!=='starting'||m.requestId!==request.id)return false;
+  if(m.type==='error'){resetNewSessionRequest();$('#newSessionError').textContent=m.error||'Could not start session';return true;}
+  if(m.type!=='started')return false;
+  // Keep the current view and draft intact until the new process actually exists.
+  stashView(sid);saveDraft();clearUI();restoredViewId='';curCC=null;
+  preferredModel=request.model;preferredMode=request.mode;
+  localStorage.setItem('al_model',request.model);localStorage.setItem('al_mode',request.mode);localStorage.setItem('al_effort',request.effort);
+  resetNewSessionRequest();$('#newSessionDialog').close();if(window.innerWidth<=860)closeSidebar();return false;}
+function hideFolderCreate(){if(folderCreateRequest)return;$('#folderCreateForm').hidden=true;$('#folderCreateError').textContent='';$('#folderName').value='';}
+function syncFolderCreateBusy(){const busy=!!folderCreateRequest,valid=!!folderState&&$('#folderPath').value===folderState.path;
+  $('#folderName').disabled=busy;$('#folderCreateSubmit').disabled=busy;$('#folderCreateCancel').disabled=busy;
+  $('#folderCreateSubmit').textContent=busy?'Creating...':'Create';
+  $('#folderPath').disabled=busy;$('#folderHome').disabled=busy;$('#folderHidden').disabled=busy;$('#folderClose').disabled=busy;
+  $('#folderPathForm button[type=submit]').disabled=busy;
+  $('#folderUp').disabled=busy||!valid||folderState.path===folderState.parent;
+  $('#folderSelect').disabled=busy||!valid;$('#folderNew').disabled=busy||!valid;
+  $('#folderList').querySelectorAll('button').forEach(b=>b.disabled=busy);}
+function dismissFolderDialog(){if(folderCreateRequest)return;
+  if(!$('#folderCreateForm').hidden){hideFolderCreate();$('#folderNew').focus();}else $('#folderDialog').close();}
+async function createFolder(e){e.preventDefault();if(folderCreateRequest)return;
+  if(!folderState||$('#folderPath').value!==folderState.path)return;
+  const name=$('#folderName').value.trim();if(!name){$('#folderCreateError').textContent='Enter a folder name';return;}
+  const request={path:folderState.path,serial:folderSerial};folderCreateRequest=request;
+  $('#folderCreateError').textContent='';syncFolderCreateBusy();
+  try{const r=await fetch('api/directories',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:request.path,name})});
+    if(r.status===401)throw new Error('Authentication required. Reload after signing in.');
+    const data=await r.json();if(!r.ok||data.error)throw new Error(data.error||'Could not create folder');
+    if(typeof data.path!=='string')throw new Error('Could not confirm creation. Refresh the folder before trying again.');
+    if(folderCreateRequest!==request||request.serial!==folderSerial||!$('#folderDialog').open)return;
+    folderCreateRequest=null;syncFolderCreateBusy();hideFolderCreate();$('#folderPath').value=data.path;
+    await loadFolder(data.path);if($('#folderDialog').open&&folderState&&folderState.path===data.path)$('#folderSelect').focus();
+  }catch(error){if(folderCreateRequest===request&&$('#folderDialog').open)
+    $('#folderCreateError').textContent=error instanceof TypeError?'Could not confirm creation. Refresh the folder before trying again.':error.message;
+  }finally{if(folderCreateRequest===request){folderCreateRequest=null;syncFolderCreateBusy();}}}
+function openFolderDialog(path,onSelect){if($('#folderDialog').open)return;
+  folderState=null;folderCreateRequest=null;hideFolderCreate();syncFolderCreateBusy();folderSelectHandler=onSelect;
+  $('#folderDialog').showModal();loadFolder(path||HOMEDIR||'~');}
+async function loadFolder(path){if(folderCreateRequest)return;hideFolderCreate();const serial=++folderSerial;
+  if(folderAbort)folderAbort.abort();folderAbort=new AbortController();folderState=null;
+  $('#folderError').textContent='';$('#folderList').textContent='Loading...';$('#folderList').setAttribute('aria-busy','true');
+  $('#folderSelect').disabled=true;$('#folderUp').disabled=true;$('#folderNew').disabled=true;
+  try{const data=await directoryData(path,$('#folderHidden').checked,folderAbort.signal);
+    if(serial!==folderSerial||!$('#folderDialog').open)return;
+    folderState=data;$('#folderPath').value=data.path;$('#folderUp').disabled=data.path===data.parent;$('#folderList').replaceChildren();
+    data.folders.forEach(folder=>{const b=document.createElement('button');b.type='button';b.className='folder-row';
+      b.innerHTML=sessionIcon('folder')+'<span></span>'+sessionIcon('arrow-right');b.querySelector('span').textContent=folder.name;
+      b.onclick=()=>loadFolder(folder.path);$('#folderList').appendChild(b);});
+    if(!data.folders.length)$('#folderList').textContent='No subfolders';
+    if(data.truncated)$('#folderError').textContent='Showing the first 500 folders';$('#folderSelect').disabled=false;$('#folderNew').disabled=false;
+  }catch(error){if(serial!==folderSerial||!$('#folderDialog').open)return;$('#folderList').replaceChildren();$('#folderError').textContent=error.message||'Could not read directory';
+  }finally{if(serial===folderSerial)$('#folderList').setAttribute('aria-busy','false');}}
+$('#newSessionForm').onsubmit=submitNewSession;
+$('#newSessionCancel').onclick=$('#newSessionClose').onclick=closeNewSession;
+$('#newSessionDialog').addEventListener('cancel',e=>{e.preventDefault();closeNewSession();});
+document.addEventListener('keydown',e=>{if(e.key!=='Escape'||e.isComposing||!document.querySelector('.session-dialog[open]'))return;
+  e.preventDefault();e.stopImmediatePropagation();if($('#folderDialog').open)dismissFolderDialog();else closeNewSession();},true);
+$('#newRecent').onchange=()=>{if($('#newRecent').value)$('#newCwd').value=$('#newRecent').value;};
+$('#newCwd').oninput=()=>{$('#newRecent').value='';};
+$('#newModel').onchange=()=>newEffortOptions($('#newEffort').value);
+$('#newBrowse').onclick=()=>openFolderDialog($('#newCwd').value.trim()||currentFolder(),path=>{
+  $('#newCwd').value=path;$('#newRecent').value='';});
+$('#folderNew').onclick=()=>{if(!folderState||folderCreateRequest)return;
+  $('#folderCreateForm').hidden=false;$('#folderCreateError').textContent='';$('#folderName').value='';$('#folderName').focus();};
+$('#folderCreateForm').onsubmit=createFolder;
+$('#folderCreateCancel').onclick=()=>{hideFolderCreate();$('#folderNew').focus();};
+$('#folderName').addEventListener('keydown',e=>{if(e.key==='Enter'&&e.isComposing)e.preventDefault();});
+$('#folderClose').onclick=()=>{if(!folderCreateRequest)$('#folderDialog').close();};
+$('#folderDialog').addEventListener('cancel',e=>{e.preventDefault();e.stopPropagation();dismissFolderDialog();});
+$('#folderDialog').addEventListener('close',()=>{if($('#folderDialog').open)return;folderSerial++;
+  if(folderAbort)folderAbort.abort();folderState=null;folderSelectHandler=null;folderCreateRequest=null;hideFolderCreate();syncFolderCreateBusy();
+  if($('#newSessionDialog').open)$('#newCwd').focus();});
+$('#folderPathForm').onsubmit=e=>{e.preventDefault();loadFolder($('#folderPath').value.trim()||'~');};
+$('#folderPath').oninput=()=>{folderSerial++;if(folderAbort)folderAbort.abort();folderState=null;
+  hideFolderCreate();$('#folderNew').disabled=true;$('#folderSelect').disabled=true;$('#folderUp').disabled=true;$('#folderList').setAttribute('aria-busy','false');};
+$('#folderUp').onclick=()=>{if(folderState)loadFolder(folderState.parent);};
+$('#folderHome').onclick=()=>loadFolder(HOMEDIR||'~');
+$('#folderHidden').onchange=()=>loadFolder($('#folderPath').value||HOMEDIR||'~');
+$('#folderSelect').onclick=()=>{if(!folderState||$('#folderSelect').disabled)return;
+  const path=folderState.path,select=folderSelectHandler;folderSelectHandler=null;$('#folderDialog').close();if(select)select(path);};
 function endSessionById(id,name){if(!id)return;
   if(!confirm('End session '+(name?'« '+name+' »':'')+'?\nIts claude process stops; you can still resume it from disk later.'))return;
   wsSend({type:'end',id:id});
@@ -7616,8 +7914,8 @@ $('#filePick').onchange=e=>{takeFiles(e.target.files);e.target.value='';};
 sendBtn.onclick=sendMsg;
 $('#stop').onclick=doInterrupt;
 document.addEventListener('keydown',e=>{
-  if(e.key==='Escape'&&running&&!srchOpen()&&!phistOpened()&&!$('#cwdac').classList.contains('on')){e.preventDefault();doInterrupt();}});
-$('#newbtn').onclick=newSession;
+  if(e.key==='Escape'&&running&&!document.querySelector('.session-dialog[open]')&&!srchOpen()&&!phistOpened()){e.preventDefault();doInterrupt();}});
+$('#newbtn').onclick=()=>newSession();
 /* color theme: apply + persist (the <head> script already set it pre-paint) */
 function applyTheme(t){if(t&&t!=='dark')document.documentElement.setAttribute('data-theme',t);
   else document.documentElement.removeAttribute('data-theme');}
@@ -7744,14 +8042,6 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeCardMenu();
   if(fimpOpened())fimpClose();if(pmanOpened())pmanClose();}});
 window.addEventListener('resize',closeCardMenu);
 window.addEventListener('scroll',closeCardMenu,true);
-/* model/mode pickers set the NEW-session default only (persisted). A running
-   session is reconfigured per-session via the ⚙ Configure menu, so editing the
-   new-session default no longer disturbs the current session. */
-$('#model').onchange=()=>localStorage.setItem('al_model',$('#model').value);
-$('#mode').onchange=()=>localStorage.setItem('al_mode',$('#mode').value);
-{let sm=localStorage.getItem('al_model');if(sm==='default'){localStorage.removeItem('al_model');sm=null;}   /* legacy 'default' → use the new opus default */
- if(sm){const o=$('#model');for(const x of o.options)if(x.value===sm){o.value=sm;break;}}
- const smd=localStorage.getItem('al_mode');if(smd){const o=$('#mode');for(const x of o.options)if(x.value===smd){o.value=smd;break;}}}
 $('#tabEdits').onclick=()=>showTab('edits');
 $('#tabGit').onclick=()=>showTab('git');
 $('#dclose').onclick=()=>$('#drawer').classList.remove('open');
@@ -7762,24 +8052,11 @@ document.addEventListener('click',e=>{
   if(drawerOpen()&&!e.target.closest('#drawer')&&!e.target.closest('.emark'))$('#drawer').classList.remove('open');});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&drawerOpen())$('#drawer').classList.remove('open');});
 $('#grefresh').onclick=refreshGit;
-$('#project').onchange=()=>{const c=$('#project').value==='__custom__';
-  $('#cwdwrap').classList.toggle('show',c);
-  if(c){if(!$('#cwd').value)$('#cwd').value=HOMEDIR?(HOMEDIR+'/'):'';$('#cwd').focus();acQuery();}else acClose();
-  loadTree();};
-$('#cwd').addEventListener('input',acQuery);
-$('#cwd').addEventListener('focus',acQuery);
-$('#cwd').addEventListener('change',loadTree);
-$('#cwd').addEventListener('blur',()=>setTimeout(acClose,160));
-$('#cwd').addEventListener('keydown',e=>{const b=$('#cwdac');if(!b.classList.contains('on'))return;
-  if(e.key==='ArrowDown'){e.preventDefault();acMove(1);}
-  else if(e.key==='ArrowUp'){e.preventDefault();acMove(-1);}
-  else if(e.key==='Enter'&&acSel>=0){e.preventDefault();acPick(acSel);}
-  else if(e.key==='Escape')acClose();});
 
 /* ── Import folder ────────────────────────────────────────────────────────
    Register a directory as a sidebar project. Folders normally reach the sidebar
    by owning a session, so a fresh directory would otherwise be invisible until
-   its first session existed. Same /api/dircomplete backend as the path box. */
+   its first session existed. Paths use /api/dircomplete for autocomplete. */
 let fimpItems=[],fimpSel=-1,fimpT=0;
 function fimpMsg(t,bad){const e=$('#fimpmsg');if(!e)return;e.textContent=t||'';e.classList.toggle('bad',!!bad);}
 function fimpOpen(){const w=$('#fimp');w.removeAttribute('hidden');fimpMsg('');
@@ -7824,19 +8101,11 @@ $('#fimpq').addEventListener('keydown',e=>{
     else fimpAdd();}
   else if(e.key==='Escape'){e.preventDefault();fimpClose();}});
 
-/* project picker: recent project dirs (+ Custom path…) */
-(async function(){try{const r=await fetch('api/projects');const j=await r.json();HOMEDIR=j.home||'';const sel=$('#project');
-  /* Custom path… first (easy to reach); recent dirs as a labelled group */
-  const cust=document.createElement('option');cust.value='__custom__';cust.textContent='✎  Custom path…';sel.appendChild(cust);
-  const mk=(label,items)=>{if(!items.length)return;const g=document.createElement('optgroup');g.label=label;
-    items.forEach(p=>{const o=document.createElement('option');o.value=p.path;o.textContent=p.path.split('/').slice(-2).join('/');o.title=p.path;g.appendChild(o);});sel.appendChild(g);};
-  const recent=(j.projects||[]);
-  mk('Recent',recent);
-  const first=recent[0];
-  sel.value=first?first.path:'__custom__';
-  $('#cwdwrap').classList.toggle('show',sel.value==='__custom__');
+/* Recent-folder defaults for dialogs; no repository scanning. */
+(async function(){try{const r=await fetch('api/projects');const j=await r.json();HOMEDIR=j.home||'';
+  recentFolders=(j.projects||[]).filter(p=>p.path).map(p=>p.path);
+  if(!selectedFolder)selectedFolder=recentFolders[0]||'';
   loadTree();
-  refreshImportHint();   /* HOMEDIR and the default project are only known now */
 }catch(e){}})();
 
 setInterval(()=>reqList(),8000);
@@ -7852,7 +8121,10 @@ loadVoiceCapabilities();
    bypassing the server's 1h cache — so a just-shipped model appears on click,
    no page reload. Spins while fetching; no automatic polling by design. */
 $('#mrefresh').onclick=()=>{const b=$('#mrefresh');if(b.classList.contains('busy'))return;
-  b.classList.add('busy');loadModels(true).finally(()=>b.classList.remove('busy'));};
+  b.classList.add('busy');b.disabled=true;
+  loadModels(true,'main').then(ok=>{if($('#newSessionDialog').open&&!newSessionRequest)
+    $('#newSessionError').textContent=ok?'':'Could not refresh model list. Try again.';})
+    .finally(()=>{b.classList.remove('busy');b.disabled=false;});};
 openWs();
 </script>
 </body>
@@ -7909,6 +8181,7 @@ def main():
         (r"/api/tree", TreeHandler),
         (r"/api/pinfolder", PinFolderHandler),
         (r"/api/dircomplete", DirCompleteHandler),
+        (r"/api/directories", DirectoriesHandler),
         (r"/api/diff", DiffHandler),
         (r"/api/usage", UsageHandler),
         (r"/api/models", ModelsHandler),
