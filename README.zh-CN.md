@@ -89,7 +89,8 @@
 
 - **交互式往返** —— 在 🔐 Approve 模式下逐操作审批，三个选项
   （**Approve** / **Approve & don't ask again this session** / **Deny**），
-  外加浏览器内的 **AskUserQuestion** 卡片；你的选择会回传给 agent。审批卡会显示 CLI
+  外加浏览器内的 **AskUserQuestion** 卡片；你的选择会回传给 agent。会话默认以
+  ⏩ Full auto 启动，除非选了别的模式；选中的模式就是实际生效的模式。审批卡会显示 CLI
   要求审批的原因；在通常不会询问的模式下它也询问时，这是唯一的解释。
 - **消息队列** —— agent 忙时照打，消息进入队列，当前 turn 结束后自动发出。点击排队
   的小条（或按 ↑）可把它撤回编辑器，或点它的 **⚡** 把它插进*正在运行*的 turn。
@@ -120,7 +121,7 @@
   深度，可随时切换，session 不重启。还有第六档 **ultracode**，以 xhigh 运行，并让每条
   消息都启用多代理编排。
 - **新建会话弹窗** —— 浏览或新建文件夹，再选择模型、思考深度和权限模式
-  （⚡ Auto-accept / 🔐 Approve / 📋 Plan / ⏩ Full auto）。模型列表可在弹窗内刷新，
+  （默认 ⏩ Full auto / ⚡ Auto-accept / 🔐 Approve / 📋 Plan）。模型列表可在弹窗内刷新，
   已有会话的设置入口保持可用。
 
 ### 其他

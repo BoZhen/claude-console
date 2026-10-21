@@ -111,8 +111,10 @@ which is the whole point.
 - **Interactive round-trips** — per-action approval with three choices
   (**Approve** / **Approve & don't ask again this session** / **Deny**) in 🔐
   Approve mode, plus in-browser **AskUserQuestion** cards; your pick is fed back
-  to the agent. An approval card shows the CLI's reason for asking, which is
-  the only explanation when it asks in a mode that normally does not.
+  to the agent. Sessions start in ⏩ Full auto unless another mode is chosen,
+  and the chosen mode is the one in effect. An approval card shows the CLI's
+  reason for asking, which is the only explanation when it asks in a mode that
+  normally does not.
 - **Message queue** — type while the agent is busy and the message queues, then
   sends when the turn ends. Click a queued chip (or press ↑) to withdraw it back
   into the editor, or hit its **⚡** to steer it into the *running* turn. Steering
@@ -155,7 +157,7 @@ which is the whole point.
   **ultracode**, runs at xhigh and opts every message into multi-agent
   orchestration.
 - **New session dialog** — browse or create a folder, then choose the model,
-  thinking effort and permission mode (⚡ Auto-accept / 🔐 Approve / 📋 Plan / ⏩ Full auto).
+  thinking effort and permission mode (⏩ Full auto, the default / ⚡ Auto-accept / 🔐 Approve / 📋 Plan).
   The model list can be refreshed inside the dialog. Active-session controls remain available.
 
 ### Everything else

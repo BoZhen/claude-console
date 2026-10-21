@@ -1165,6 +1165,39 @@ def _write_project_meta(meta):
 
 
 FAV_MIGRATION_KEY = "#migrated_session_favs"
+MODE_MIGRATION_KEY = "#migrated_modes_to_full_auto"
+DEFAULT_MODE = "bypassPermissions"     # Full auto
+
+
+def migrate_saved_modes():
+    """One-off, with the launch-flag fix. Until then every session ran in Full auto
+    whatever mode was saved for it, so a saved Auto-accept or Approve never took
+    effect. Resuming such a session under the fix would turn on approvals the user
+    never had; it reopens in Full auto instead, as it always ran. Modes chosen
+    after this point are real and are left alone. The marker lives with the
+    favorites migration's."""
+    meta = load_project_meta()
+    if meta.get(MODE_MIGRATION_KEY):
+        return 0
+    prefs = dict(load_prefs())
+    changed = 0
+    for cc, pf in list(prefs.items()):
+        if isinstance(pf, dict) and pf.get("mode") in ("acceptEdits", "default"):
+            prefs[cc] = dict(pf, mode=DEFAULT_MODE)
+            changed += 1
+    if changed:
+        try:
+            tmp = PREFS_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(prefs, f, ensure_ascii=False)
+            os.replace(tmp, PREFS_FILE)
+            _prefs_cache["mtime"] = -1.0
+        except Exception:
+            return 0                     # no marker: tried again on the next start
+    meta = dict(load_project_meta())
+    meta[MODE_MIGRATION_KEY] = True
+    _write_project_meta(meta)
+    return changed
 
 
 def migrate_session_favs_to_projects():
@@ -2990,7 +3023,7 @@ def safe_cwd(cwd):
 
 
 def _sanitize_mode(m):
-    return m if m in ("acceptEdits", "plan", "default", "bypassPermissions") else "acceptEdits"
+    return m if m in ("acceptEdits", "plan", "default", "bypassPermissions") else DEFAULT_MODE
 
 EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultracode")
 _ONCE_RE = re.compile(r"^@([\w.\-\[\]]+)[ \t]+(?=\S)")
@@ -3130,17 +3163,18 @@ class ChatSession:
     async def start(self):
         if not HAVE_SDK:
             raise RuntimeError("claude-agent-sdk not installed")
-        # Launch with --dangerously-skip-permissions so the user can switch to
-        # the "Full auto" (bypassPermissions) mode at runtime — the CLI refuses
-        # set_permission_mode('bypassPermissions') unless the session was started
-        # with that flag. It only UNLOCKS the capability: the session still starts
-        # in self.mode and can_use_tool still fires for approvals / AskUserQuestion
-        # in default & acceptEdits (verified) — it is not forced bypass.
+        # The CLI refuses set_permission_mode('bypassPermissions') in a session not
+        # launched with permission to bypass, so the switch to Full auto needs a
+        # launch flag. --allow-dangerously-skip-permissions grants that and nothing
+        # more: the session runs in self.mode. --dangerously-skip-permissions, used
+        # until 2026-10, switches bypass ON whatever --permission-mode says, so for
+        # four months every session ran in Full auto while the console showed
+        # Auto-accept or Approve (39 of 45 sessions with a saved mode).
         opts = ClaudeAgentOptions(
             cwd=self.cwd, permission_mode=self.mode, can_use_tool=self._can_use_tool,
             add_dirs=[self.cwd], cli_path=CLAUDE_BIN, include_partial_messages=True,
             max_buffer_size=MAX_BUFFER,
-            extra_args={"dangerously-skip-permissions": None})
+            extra_args={"allow-dangerously-skip-permissions": None})
         # the console's own plan tool and the two reminders that make it used (PLAN_TOOL)
         opts.mcp_servers = {"console": self._plan_server()}
         opts.allowed_tools = [PLAN_TOOL]
@@ -3932,8 +3966,10 @@ class ChatSession:
                 await client.set_permission_mode(mode)
                 self._notice("⚙ permission mode → %s (this session)" % mode)
                 if mode == "bypassPermissions":
-                    self._notice("⚠ Full auto: tools run without prompts; "
-                                 "AskUserQuestion won't be interactive in this mode.")
+                    # question cards still work here (AskUserQuestion still
+                    # reaches can_use_tool; checked with a real session 2026-10)
+                    self._notice("⚠ Full auto: tools run without asking. The CLI "
+                                 "still asks before a few commands it cannot check.")
             except Exception as ex:
                 self._notice("mode change failed: %r" % ex)
         tornado.ioloop.IOLoop.current().spawn_callback(_s)
@@ -5724,11 +5760,15 @@ let ws=null, running=false, ready=false, compacting=false, cwd='', tools={};
 let tokUp=0,tokOut=0,tokShow=false;   /* live streaming token counts shown in the pill */
 let sid=null, curCC=null, editCount=0, pendingStart=false, reconnectT=0;
 const EFFORTS=['low','medium','high','xhigh','max','ultracode'];
-const MODE_OPTIONS=[['acceptEdits','⚡ Auto-accept'],['default','🔐 Approve'],['plan','📋 Plan'],['bypassPermissions','⏩ Full auto']];
+const MODE_OPTIONS=[['bypassPermissions','⏩ Full auto'],['acceptEdits','⚡ Auto-accept'],['default','🔐 Approve'],['plan','📋 Plan']];
 let preferredModel=localStorage.getItem('al_model')||'opus';
 if(preferredModel==='default')preferredModel='opus';
-let preferredMode=localStorage.getItem('al_mode')||'acceptEdits';
-if(!MODE_OPTIONS.some(([id])=>id===preferredMode))preferredMode='acceptEdits';
+/* Full auto is the default. A mode remembered before 2026-10 never took effect
+   (every session ran in Full auto, see ChatSession.start), so it is dropped once
+   rather than turning on approvals this browser never had. */
+if(!localStorage.getItem('al_mode_real')){localStorage.removeItem('al_mode');localStorage.setItem('al_mode_real','1');}
+let preferredMode=localStorage.getItem('al_mode')||'bypassPermissions';
+if(!MODE_OPTIONS.some(([id])=>id===preferredMode))preferredMode='bypassPermissions';
 let curEffort=localStorage.getItem('al_effort')||'max';
 let curModel='default', modelOnce='';   /* the live session's model; the model a @prefix put one turn on */
 let showThink=false;
@@ -6679,7 +6719,7 @@ function openConfigure(s,anchor){const m=$('#cardMenu');m.innerHTML='';m._anchor
   row('Model',mkSel([['opus','opus'],['sonnet','sonnet'],['haiku','haiku'],
       ...acctModels(s.account).map(m=>[m.id,m.name])],s.model||'opus',
     v=>{wsSend({type:'configure',id:s.id,model:v});setTimeout(reqList,200);}));
-  row('Permission',mkSel([['acceptEdits','⚡ Auto-accept'],['default','🔐 Approve'],['plan','📋 Plan'],['bypassPermissions','⏩ Full auto']],s.mode||'default',
+  row('Permission',mkSel(MODE_OPTIONS,s.mode||'bypassPermissions',
     v=>{wsSend({type:'configure',id:s.id,mode:v});setTimeout(reqList,200);}));
   row('Effort',mkSel(EFFORTS.map(e=>[e,e]),curEffort,v=>{setEffort(v);closeCardMenu();}));
   /* only worth a row when this machine actually has a second login configured */
@@ -8192,6 +8232,7 @@ def _recap_tick():
 
 def main():
     moved = migrate_session_favs_to_projects()
+    remoded = migrate_saved_modes()
     app = tornado.web.Application([
         (r"/", ConsoleHandler),
         (r"/console", ConsoleHandler),
@@ -8237,6 +8278,8 @@ def main():
                                  else "off — " + _voice["reason"]))
     if moved:
         print("  migrated %d starred session(s) onto their project folders" % moved)
+    if remoded:
+        print("  %d session(s) saved as Auto-accept/Approve now reopen in Full auto, as they ran" % remoded)
     if not loopback and not AUTH:
         print("  ⚠️  EXPOSED on %s WITHOUT auth — this serves your agent"
               " transcripts and code diffs. Set CLAUDE_CONSOLE_AUTH=user:pass." % BIND)
