@@ -210,7 +210,11 @@ def model_change_error(ex):
                        "or open a new one, and the model is available there." % now)
     return head + "Run `claude update`, then end this session and resume it, or open a new one."
 
-CAP = 12000          # cap per long string field sent to the browser
+# Caps on what is sent to the browser, for tool inputs, tool results and thinking,
+# which can run to megabytes. Conversation text (the assistant's replies and the
+# user's messages) is never capped: it is what the user reads, and a reply cut at
+# 12000 characters lost its last paragraphs the moment it finished streaming.
+CAP = 12000          # cap per tool input field and thinking block
 RESULT_CAP = 6000    # cap per tool_result body
 POLL_MS = 800        # transcript tail interval
 
@@ -454,14 +458,14 @@ def parse_claude(rec, idx):
         content = msg.get("content")
         if isinstance(content, str):
             if content.strip():
-                evs.append({**base, "kind": "assistant_text", "role": "assistant", "text": _cap(content)})
+                evs.append({**base, "kind": "assistant_text", "role": "assistant", "text": content})
         elif isinstance(content, list):
             for b in content:
                 if not isinstance(b, dict):
                     continue
                 bt = b.get("type")
                 if bt == "text" and b.get("text", "").strip():
-                    evs.append({**base, "kind": "assistant_text", "role": "assistant", "text": _cap(b["text"])})
+                    evs.append({**base, "kind": "assistant_text", "role": "assistant", "text": b["text"]})
                 elif bt == "thinking":
                     th = b.get("thinking", "")
                     if th.strip():
@@ -478,7 +482,7 @@ def parse_claude(rec, idx):
         if isinstance(content, str):
             content = _strip_injected(content)
             if content.strip() and not _is_plumbing(content):
-                evs.append({**base, "kind": "user_text", "role": "user", "text": _cap(content)})
+                evs.append({**base, "kind": "user_text", "role": "user", "text": content})
         elif isinstance(content, list):
             for b in content:
                 if not isinstance(b, dict):
@@ -487,7 +491,7 @@ def parse_claude(rec, idx):
                 if bt == "text":
                     txt = _strip_injected(b.get("text", ""))
                     if txt.strip() and not _is_plumbing(txt):
-                        evs.append({**base, "kind": "user_text", "role": "user", "text": _cap(txt)})
+                        evs.append({**base, "kind": "user_text", "role": "user", "text": txt})
                 elif bt == "tool_result":
                     evs.append({**base, "kind": "tool_result", "toolId": b.get("tool_use_id", ""),
                                 "content": _cap(_txt(b.get("content")), RESULT_CAP),
@@ -507,7 +511,7 @@ def parse_codex(rec, idx):
         text = _txt(p.get("content"))
         if text.strip():
             kind = "user_text" if role == "user" else "assistant_text"
-            evs.append({**base, "kind": kind, "role": role, "text": _cap(text)})
+            evs.append({**base, "kind": kind, "role": role, "text": text})
     elif pt == "reasoning":
         text = _txt(p.get("summary") or p.get("content"))
         if text.strip():
@@ -561,7 +565,7 @@ def normalize_cc(rec):
                 continue
             bt = b.get("type")
             if bt == "text" and b.get("text", "").strip():
-                evs.append({"kind": "assistant_text", "text": _cap(b["text"])})
+                evs.append({"kind": "assistant_text", "text": b["text"]})
             elif bt == "thinking" and b.get("thinking", "").strip():
                 evs.append({"kind": "thinking", "text": _cap(b["thinking"])})
             elif bt == "tool_use":
@@ -2537,7 +2541,7 @@ def search_history(q, scope="all", cc="", cwd="", limit=200):
     return {"results": out, "more": more}
 
 
-THREAD_TXT_CAP = 20000    # one pathological message shouldn't blow up the viewer
+THREAD_TXT_CAP = 20000    # tool lines only: conversation text is shown in full, as in the chat
 
 
 def load_thread(mid, before=40, after=40):
@@ -2566,7 +2570,10 @@ def load_thread(mid, before=40, after=40):
     rows = list(reversed(pre)) + list(post)
     msgs = []
     for rid, ts, role, txt in rows:
-        cut = len(txt) > THREAD_TXT_CAP
+        cut = role == "tool" and len(txt) > THREAD_TXT_CAP
+        if not cut:
+            msgs.append({"mid": rid, "ts": ts, "role": role, "txt": txt})
+            continue
         msgs.append({"mid": rid, "ts": ts, "role": role,
                      "txt": txt[:THREAD_TXT_CAP] + ("\n…(truncated)" if cut else "")})
     return {"cc": cc, "cwd": cwd, "total": total, "messages": msgs,
@@ -3373,7 +3380,7 @@ class ChatSession:
                 self.cc_id = msg.session_id
             for b in msg.content:
                 if isinstance(b, TextBlock) and b.text.strip():
-                    evs.append({"kind": "assistant_text", "text": _cap(b.text)})
+                    evs.append({"kind": "assistant_text", "text": b.text})
                 elif isinstance(b, ThinkingBlock) and b.thinking.strip():
                     evs.append({"kind": "thinking", "text": _cap(b.thinking)})
                 elif isinstance(b, ToolUseBlock):
@@ -3532,7 +3539,7 @@ class ChatSession:
             # to disk for a message that might still be withdrawn
             self.queue.append({"qid": qid, "text": text, "images": images,
                                "files": files})
-            ev = {"kind": "queued", "qid": qid, "text": _cap(text)}
+            ev = {"kind": "queued", "qid": qid, "text": text}
             if images:
                 ev["images"] = len(images)
             if files:
@@ -3566,7 +3573,7 @@ class ChatSession:
             evs.append({"kind": "dequeued", "qid": qid})
         if start:                     # begins a fresh turn (vs mid-turn injection)
             evs.append({"kind": "turn_start", "word": self.turn_word})
-        ue = {"kind": "user_text", "text": _cap(text)}
+        ue = {"kind": "user_text", "text": text}
         if images:
             ue["images"] = len(images)
         if files:
