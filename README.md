@@ -125,6 +125,13 @@ which is the whole point.
   multimodal blocks; other files are **saved into the session's working
   directory** and named in the message, so Claude can read, edit and *run* them
   rather than only look at them. Works from a phone, which pasting did not.
+- **Images in the conversation** — each image you send is also kept as a file in
+  a private temporary folder (`/tmp/claude-console-<uid>/images`), and the message
+  tells Claude its path. The conversation shows it as a thumbnail, also after a
+  reload, with **Save** (into the session's working directory) and **Save as…**
+  (any folder in your home folder, with a name of your choice); a save never
+  replaces an existing file. The temporary copy does not survive a restart of
+  the computer, and the thumbnail then says so.
 - **Voice input** — a 🎙 button beside 📎 (or **Alt+M**) records, transcribes on
   *your* machine with [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
   or on another machine that keeps a speech model loaded,
@@ -231,6 +238,7 @@ HTTPS (a reverse proxy, or `tailscale serve`) unless you open it on `localhost`.
 | `CLAUDE_CONSOLE_PLAN_SUMMARY_MODEL` | `haiku` | model that writes the plan-history summaries |
 | `CLAUDE_CONSOLE_PLAN_LANG` | *(unset)* | language of plan step titles and history summaries, as a name for the prompts (`Chinese`); unset, both follow the language you write in |
 | `CLAUDE_CONSOLE_MAX_BUFFER_MB` | `64` | ceiling on one CLI message |
+| `CLAUDE_CONSOLE_IMAGE_DIR` | `/tmp/claude-console-<uid>/images` | where copies of sent images are kept for the conversation's thumbnails and Save / Save as |
 | `CLAUDE_CONSOLE_IMPORT_MAX_MB` | `1024` | ceiling on an imported transcript |
 | `CLAUDE_CONSOLE_TRANSCRIBE` | `0` | enable local voice input |
 | `CLAUDE_CONSOLE_TRANSCRIBE_PYTHON` | current python | interpreter that has `faster-whisper` |

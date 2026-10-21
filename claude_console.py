@@ -449,6 +449,159 @@ def uploads_note(saved):
     return "\n".join(lines)
 
 
+# Images reach the model as image blocks. Each is also kept as a file under
+# IMAGE_DIR, so the conversation can show it and offer Save / Save as, and so the
+# model can name the file if it is asked to do something with it. A temporary
+# directory on purpose: a photo sent from a phone is usually a one-off, and the
+# ones worth keeping are saved from the conversation to a folder of the user's
+# choosing. The directory is private (0700) and its files are never overwritten.
+IMAGE_DIR = os.path.expanduser(os.environ.get(
+    "CLAUDE_CONSOLE_IMAGE_DIR",
+    os.path.join(tempfile.gettempdir(), "claude-console-%d" % os.getuid(), "images")))
+IMAGE_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}
+_IMAGE_PREFIX_RE = re.compile(r"^\d{8}-\d{6}-\d+-")   # what save_images puts before the name
+
+
+def _private_dir(path):
+    """Create path (and its parent) as 0700 directories owned by this user, refusing
+    a symlink or another user's directory planted there in a shared /tmp."""
+    for d in (os.path.dirname(path), path):
+        try:
+            os.mkdir(d, 0o700)
+        except FileExistsError:
+            pass
+        st = os.lstat(d)
+        if not os.path.isdir(d) or os.path.islink(d) or st.st_uid != os.getuid():
+            raise OSError("%s is not a private directory of this user" % d)
+        if st.st_mode & 0o077:
+            os.chmod(d, 0o700)
+
+
+def save_images(images):
+    """Keep a copy of each attached image under IMAGE_DIR. Returns (saved, errors),
+    saved as [{"path", "name", "size"}]. A copy that fails costs only the copy: the
+    image still reaches the model."""
+    saved, errors = [], []
+    if not images:
+        return saved, errors
+    try:
+        _private_dir(IMAGE_DIR)
+    except OSError as ex:
+        return saved, ["image copies: %s" % ex]
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for n, im in enumerate(images, 1):
+        ext = IMAGE_EXT.get(str((im or {}).get("media_type") or ""), ".png")
+        stem = os.path.splitext(safe_upload_name((im or {}).get("name") or "image"))[0][:80] or "image"
+        name = "%s-%d-%s%s" % (stamp, n, stem, ext)
+        path = os.path.join(IMAGE_DIR, name)
+        try:
+            raw = base64.b64decode(((im or {}).get("data") or "").encode())
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(raw)
+        except Exception as ex:
+            errors.append("image copy %s: %s" % (name, ex))
+            continue
+        saved.append({"path": path, "name": name, "size": len(raw)})
+    return saved, errors
+
+
+def images_note(saved):
+    """Appended to the outgoing message after uploads_note: where the image copies
+    are. Viewers never see it — they see the thumbnails instead."""
+    if not saved:
+        return ""
+    many = len(saved) > 1
+    lines = ["", "(%d image%s also saved as temporary file%s, deleted when this computer restarts:"
+             % (len(saved), "s" if many else "", "s" if many else "")]
+    lines += ["    " + s["path"] for s in saved]
+    return "\n".join(lines) + ")"
+
+
+_IMAGES_NOTE_RE = re.compile(
+    r"\n\(\d+ images? also saved as temporary files?, deleted when this computer restarts:\n"
+    r"((?:    [^\n]*\n)*    [^\n]*)\)\Z")
+_UPLOADS_NOTE_RE = re.compile(
+    r"\n\(\d+ files? attached, saved under this session's working directory:\n"
+    r"((?:    [^\n]*\n)+)You can read, edit and run them in place\.\)\Z")
+
+
+def split_attachment_notes(text):
+    """Undo uploads_note and images_note on a message read back from a transcript:
+    (the text the user typed, file names, image copies). The live echo shows the
+    typed text with chips and thumbnails; a reloaded session shows the same."""
+    files, image_files = [], []
+    m = _IMAGES_NOTE_RE.search(text)
+    if m:
+        for line in m.group(1).split("\n"):
+            path = line[4:]
+            image_files.append({"path": path, "name": os.path.basename(path)})
+        text = text[:m.start()]
+    m = _UPLOADS_NOTE_RE.search(text)
+    if m:
+        for line in m.group(1).splitlines():
+            rel = line[4:].rsplit("  —  ", 1)[0]
+            files.append(rel.rsplit("/", 1)[-1])
+        text = text[:m.start()]
+    return text, files, image_files
+
+
+def image_copy_path(path):
+    """path if it is a file directly under IMAGE_DIR, else None."""
+    if not isinstance(path, str) or not path:
+        return None
+    real = os.path.realpath(path)
+    if os.path.dirname(real) != os.path.realpath(IMAGE_DIR) or not os.path.isfile(real):
+        return None
+    return real
+
+
+def save_image_copy(src, folder, name=""):
+    """Copy an image copy out of IMAGE_DIR into folder (inside HOME). The name
+    defaults to the one it was sent with; an existing file is never replaced, the
+    copy becomes name-2.jpg instead, as uploads do. Returns {"path", "shown"}."""
+    real = image_copy_path(src)
+    if not real:
+        raise FileNotFoundError("The temporary copy is gone; it does not survive a restart of the computer")
+    dest_dir = _directory_path(folder or "~")
+    ext = os.path.splitext(real)[1]
+    name = (name or "").strip() or _IMAGE_PREFIX_RE.sub("", os.path.basename(real))
+    if (name in (".", "..") or "/" in name or "\\" in name
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in name)):
+        raise ValueError("Enter a file name, without path separators")
+    if not os.path.splitext(name)[1]:
+        name += ext
+    if len(name.encode("utf-8", "replace")) > 255:
+        raise ValueError("File name is too long")
+    stem, suffix = os.path.splitext(name)
+    with open(real, "rb") as fh:
+        raw = fh.read()
+    for n in range(1, 1000):
+        dest = os.path.join(dest_dir, name if n == 1 else "%s-%d%s" % (stem, n, suffix))
+        try:
+            fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        except FileExistsError:
+            continue
+        with os.fdopen(fd, "wb") as out:
+            out.write(raw)
+        home = os.path.realpath(HOME)
+        shown = "~" + dest[len(home):] if dest.startswith(home + os.sep) else dest
+        return {"path": dest, "shown": shown}
+    raise ValueError("Too many files with that name in this folder")
+
+
+def _user_text_event(base, text):
+    """A user message from a transcript, its attachment notes turned back into the
+    chips and thumbnails the live view showed."""
+    text, files, image_files = split_attachment_notes(text)
+    ev = {**base, "kind": "user_text", "role": "user", "text": text}
+    if files:
+        ev["files"] = files
+    if image_files:
+        ev["image_files"] = image_files
+    return ev
+
+
 def parse_claude(rec, idx):
     t = rec.get("type")
     base = {"ts": rec.get("timestamp"), "id": rec.get("uuid") or ("L%d" % idx)}
@@ -482,7 +635,7 @@ def parse_claude(rec, idx):
         if isinstance(content, str):
             content = _strip_injected(content)
             if content.strip() and not _is_plumbing(content):
-                evs.append({**base, "kind": "user_text", "role": "user", "text": content})
+                evs.append(_user_text_event(base, content))
         elif isinstance(content, list):
             for b in content:
                 if not isinstance(b, dict):
@@ -491,7 +644,7 @@ def parse_claude(rec, idx):
                 if bt == "text":
                     txt = _strip_injected(b.get("text", ""))
                     if txt.strip() and not _is_plumbing(txt):
-                        evs.append({**base, "kind": "user_text", "role": "user", "text": txt})
+                        evs.append(_user_text_event(base, txt))
                 elif bt == "tool_result":
                     evs.append({**base, "kind": "tool_result", "toolId": b.get("tool_use_id", ""),
                                 "content": _cap(_txt(b.get("content")), RESULT_CAP),
@@ -2810,6 +2963,75 @@ class DirectoriesHandler(AuthMixin, tornado.web.RequestHandler):
             self.write(result)
 
 
+class ImageHandler(AuthMixin, tornado.web.RequestHandler):
+    """An image copy from IMAGE_DIR, for the conversation's thumbnails. Nothing
+    outside that directory is served, whatever path is asked for."""
+    def get(self):
+        if not self._ok_auth():
+            return
+        real = image_copy_path(self.get_argument("path", ""))
+        if not real:
+            self.set_status(404)
+            self.finish()
+            return
+        ctype = {".png": "image/png", ".jpg": "image/jpeg", ".gif": "image/gif",
+                 ".webp": "image/webp"}.get(os.path.splitext(real)[1], "application/octet-stream")
+        self.set_header("Content-Type", ctype)
+        self.set_header("Cache-Control", "private, max-age=86400")
+        self.set_header("X-Content-Type-Options", "nosniff")
+        with open(real, "rb") as fh:
+            self.write(fh.read())
+
+
+class ImageSaveHandler(AuthMixin, tornado.web.RequestHandler):
+    """Save / Save as for an image copy: {"path", "dir", "name"} → the file is
+    copied into dir (inside the home folder) and never replaces an existing one."""
+    async def post(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "application/json")
+        origin = self.request.headers.get("Origin")
+        if origin:
+            try:
+                parsed = urllib.parse.urlsplit(origin)
+                same_origin = parsed.scheme in ("http", "https") and parsed.netloc.lower() == self.request.host.lower()
+            except ValueError:
+                same_origin = False
+            if not same_origin:
+                self.set_status(403)
+                self.write({"error": "Cross-origin saves are not allowed"})
+                return
+        if self.request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+            self.set_status(415)
+            self.write({"error": "Expected a JSON request"})
+            return
+        if len(self.request.body) > 8192:
+            self.set_status(413)
+            self.write({"error": "Request is too large"})
+            return
+        try:
+            body = json.loads(self.request.body)
+            if not isinstance(body, dict):
+                raise ValueError("Invalid request")
+            result = await asyncio.get_running_loop().run_in_executor(
+                None, save_image_copy, body.get("path"), body.get("dir"), body.get("name") or "")
+        except FileNotFoundError as exc:
+            self.set_status(404)
+            self.write({"error": str(exc)})
+        except ValueError as exc:
+            self.set_status(400)
+            self.write({"error": str(exc)})
+        except PermissionError:
+            self.set_status(403)
+            self.write({"error": "No permission to write in that folder"})
+        except OSError:
+            self.set_status(500)
+            self.write({"error": "Could not save the image"})
+        else:
+            self.set_status(201)
+            self.write(result)
+
+
 class DiffHandler(AuthMixin, tornado.web.RequestHandler):
     def get(self):
         if not self._ok_auth():
@@ -3748,7 +3970,7 @@ class ChatSession:
                    "message": {"role": "user", "content": content}}
         return _gen()
 
-    def _echo_user(self, text, images, files=None, qid=None, start=False):
+    def _echo_user(self, text, images, files=None, qid=None, start=False, image_files=None):
         """Push the console events for one outgoing user message."""
         evs = []
         if qid:                       # came off the queue — drop its chip
@@ -3760,8 +3982,21 @@ class ChatSession:
             ue["images"] = len(images)
         if files:
             ue["files"] = list(files)    # names only: bodies never enter the log
+        if image_files:
+            ue["image_files"] = [{"path": s["path"], "name": s["name"]} for s in image_files]
         evs.append(ue)
         self._push(evs)
+
+    def _save_attachments(self, images, files):
+        """Write uploads and image copies before the echo, so the chips and
+        thumbnails show what actually landed. Returns (file names, image copies,
+        the notes for the model)."""
+        saved, errs = save_uploads(self.cwd, files)
+        image_files, img_errs = save_images(images)
+        for e in errs + img_errs:
+            self._push([{"kind": "notice", "text": "⚠ attachment — " + e}])
+        names = [rel.rsplit("/", 1)[-1] for rel, _ in saved]
+        return names, image_files, uploads_note(saved) + images_note(image_files)
 
     def _dispatch(self, text, images, files=None, qid=None, start=True):
         """Send one message to the live client. start=True begins a new turn;
@@ -3790,22 +4025,19 @@ class ChatSession:
             self._control_turn = (cmd0 == "/effort")
         # written before the echo so the chips show the names that actually landed
         # (a collision renames test.py to test-2.py, and the user should see that)
-        saved, up_errs = save_uploads(self.cwd, files)
-        self._echo_user(shown, images, files=[rel.rsplit("/", 1)[-1] for rel, _ in saved],
-                        qid=qid, start=start)
-        for e in up_errs:
-            self._push([{"kind": "notice", "text": "⚠ attachment — " + e}])
+        names, image_files, notes = self._save_attachments(images, files)
+        self._echo_user(shown, images, files=names, qid=qid, start=start, image_files=image_files)
         if start and self.compacting:   # surface the otherwise-silent long compaction
             self._push([{"kind": "compacting", "word": self.turn_word}])
         client = self.client
-        send_text = text + uploads_note(saved)
+        send_text = text + notes
         if (self.effort == "ultracode" and text.strip()
                 and not text.lstrip().startswith("/")
                 and "ultracode" not in text.lower()):
             # ultracode mode: opt every turn into Workflow orchestration via the
             # keyword trigger (viewers still see the clean original text above).
-            # The note naming the attached files has to stay on the message.
-            send_text = text.rstrip() + "\n\nultracode" + uploads_note(saved)
+            # The notes stay last, where a reloaded transcript looks for them.
+            send_text = text.rstrip() + "\n\nultracode" + notes
         payload = self._make_payload(send_text, images)
         async def _q():
             try:
@@ -3847,16 +4079,13 @@ class ChatSession:
             self._dispatch(it["text"], it["images"], it.get("files"),
                            qid=it["qid"], start=True)
             return
-        saved, up_errs = save_uploads(self.cwd, it.get("files"))
-        self._echo_user(it["text"], it["images"],
-                        files=[rel.rsplit("/", 1)[-1] for rel, _ in saved],
-                        qid=it["qid"], start=False)
-        for e in up_errs:
-            self._push([{"kind": "notice", "text": "⚠ attachment — " + e}])
+        names, image_files, notes = self._save_attachments(it["images"], it.get("files"))
+        self._echo_user(it["text"], it["images"], files=names,
+                        qid=it["qid"], start=False, image_files=image_files)
         self._push([{"kind": "notice",
                      "text": "⚡ steered into the running turn — Claude sees it at its "
                              "next step but may answer only after finishing current work"}])
-        payload = self._make_payload(it["text"] + uploads_note(saved), it["images"])
+        payload = self._make_payload(it["text"] + notes, it["images"])
         client = self.client
         async def _q():
             try:
@@ -4959,6 +5188,17 @@ li.mdl1{margin-left:1.4em} li.mdl2{margin-left:2.8em} li.mdl3{margin-left:4.2em}
   background:rgba(0,0,0,.6);color:#fff;cursor:pointer;font-size:12px;line-height:17px;text-align:center;padding:0}
 #attach .att .rm:hover{background:var(--del)}
 .msg.user .imgs{margin-top:5px;font-size:11.5px;color:var(--mut)}
+.msg.user .imgcopies{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px;justify-content:flex-end}
+.msg.user .imgcopy{margin:0;display:flex;flex-direction:column;gap:4px;align-items:stretch;min-width:136px}
+.msg.user .imgcopy a{align-self:center}
+.msg.user .imgcopy img{display:block;max-width:160px;max-height:120px;border-radius:6px;border:1px solid var(--line);object-fit:cover}
+.msg.user .imgcopy figcaption{display:flex;gap:4px}
+.msg.user .imgcopy button{flex:1;white-space:nowrap;font-size:11.5px;padding:3px 6px;border-radius:5px;border:1px solid var(--line);
+  background:var(--bg3);color:var(--fg);cursor:pointer}
+.msg.user .imgcopy button:hover:not(:disabled){border-color:var(--acc)}
+.msg.user .imgcopy button:disabled{opacity:.45;cursor:default}
+.msg.user .imgcopy .gonebox{width:160px;height:60px;display:flex;align-items:center;justify-content:center;
+  border:1px dashed var(--line);border-radius:6px;font-size:11.5px;color:var(--mut)}
 /* queued messages (typed while the agent is busy) */
 #queue{width:100%;display:none;flex-direction:column;gap:5px;padding:0 0 8px}
 #queue.on{display:flex}
@@ -5934,11 +6174,40 @@ function toolBody(ev){const i=ev.input||{},t=ev.tool;
   if(typeof i==='string')return '<pre><code>'+esc(i)+'</code></pre>';
   return '<pre><code>'+esc(JSON.stringify(i,null,2))+'</code></pre>';}
 
-function addUser(text,nImg,files){const s=atBottom();const d=document.createElement('div');d.className='msg user';
+function addUser(text,nImg,files,imgFiles){const s=atBottom();const d=document.createElement('div');d.className='msg user';
+  const shots=imgFiles&&imgFiles.length;
   d.innerHTML='<div class="b">'+esc(text)+'</div>'+
-    (nImg?'<div class="imgs">🖼 '+nImg+' image'+(nImg>1?'s':'')+' attached</div>':'')+
+    (shots?imageCopiesHtml(imgFiles):(nImg?'<div class="imgs">🖼 '+nImg+' image'+(nImg>1?'s':'')+' attached</div>':''))+
     ((files&&files.length)?'<div class="files">📎 '+files.map(esc).join(' · ')+'</div>':'');
+  if(shots)wireImageCopies(d,imgFiles);
   stream.appendChild(d);scroll();}
+/* Images sent with a message are also kept as files in a temporary folder on this
+   computer (the server's IMAGE_DIR). Each shows as a thumbnail that opens the full
+   image, with Save (into the session's working directory) and Save as… (any
+   folder in the home folder, and a name). After a restart the copy is gone. */
+function imageUrl(f){return 'api/image?path='+encodeURIComponent(f.path);}
+function imageSaveName(f){return (f.name||'image').replace(/^\d{8}-\d{6}-\d+-/,'');}
+function imageCopiesHtml(list){return '<div class="imgcopies">'+list.map((f,i)=>
+  '<figure class="imgcopy"><a href="'+escAttr(imageUrl(f))+'" target="_blank" rel="noopener">'+
+  '<img loading="lazy" src="'+escAttr(imageUrl(f))+'" alt="'+escAttr(imageSaveName(f))+'"></a>'+
+  '<figcaption><button type="button" class="imgsave" data-i="'+i+'" title="Save into this session\'s working directory">Save</button>'+
+  '<button type="button" class="imgsaveas" data-i="'+i+'" title="Choose a folder and a name">Save as…</button></figcaption></figure>').join('')+'</div>';}
+function wireImageCopies(d,list){d.querySelectorAll('.imgcopy').forEach((fig,i)=>{const f=list[i];
+  fig.querySelector('img').onerror=()=>{fig.classList.add('gone');
+    fig.querySelector('a').replaceWith(Object.assign(document.createElement('div'),
+      {className:'gonebox',textContent:'temporary copy gone'}));
+    fig.querySelectorAll('button').forEach(b=>b.disabled=true);};
+  fig.querySelector('.imgsave').onclick=()=>postImageSave(f,cwd||'~','');
+  fig.querySelector('.imgsaveas').onclick=()=>openFolderDialog(cwd||HOMEDIR,dir=>{
+    const name=prompt('Save the image as',imageSaveName(f));
+    if(name!==null)postImageSave(f,dir,name.trim());});});}
+async function postImageSave(f,dir,name){try{
+    const r=await fetch('api/image/save',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({path:f.path,dir:dir,name:name||''})});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok)throw new Error(j.error||('HTTP '+r.status));
+    addNotice('✓ image saved as '+j.shown);
+  }catch(e){addNotice('⚠ could not save the image — '+(e&&e.message||e));}}
 function addAsst(text){const s=atBottom();const d=document.createElement('div');d.className='msg asst';
   d.innerHTML='<div class="b bubble">'+md(text)+'</div>';typesetMath(d);sink.appendChild(d);if(s)scroll();}
 /* ── live streaming bubble ────────────────────────────────────────────────────
@@ -6465,7 +6734,7 @@ function route(ev){
      streaming bubble — drop it before rendering whatever really landed */
   if(ev.kind!=='stream_text')endStream();
   if(ev.kind==='stream_text')addStreamText(ev.text);
-  else if(ev.kind==='user_text')addUser(ev.text,ev.images,ev.files);
+  else if(ev.kind==='user_text')addUser(ev.text,ev.images,ev.files,ev.image_files);
   else if(ev.kind==='ready'){ready=true;cwd=ev.cwd||cwd;curCC=ev.session_id||curCC;if(ev.model)setResolvedModel(ev.model);addNotice('● session ready · '+(ev.model||'')+(ev.effort?' · '+ev.effort+' effort':'')+' · '+(ev.cwd||''));}
   else if(ev.kind==='assistant_text')addAsst(ev.text);
   else if(ev.kind==='thinking')addThink(ev.text);
@@ -7652,7 +7921,7 @@ function addImageFile(file){
   const r=new FileReader();imgsLoading++;
   r.onerror=()=>{imgsLoading--;addNotice('⚠ could not read '+file.name);};
   r.onload=()=>{imgsLoading--;const url=''+r.result;
-    pendingImages.push({media_type:file.type,data:url.split(',')[1]||'',url:url});renderAttach();};
+    pendingImages.push({media_type:file.type,data:url.split(',')[1]||'',url:url,name:file.name||''});renderAttach();};
   r.readAsDataURL(file);}
 function handlePaste(e){const cd=e.clipboardData;if(!cd)return;
   /* Word / rich-text copies put BOTH the text AND a rendered image on the clipboard.
@@ -7837,7 +8106,7 @@ function sendMsg(){const t=ta.value.trim();
   if((!t&&!pendingImages.length&&!pendingFiles.length)||!ready||!sid||!ws||ws.readyState!==1)return;
   if(filesLoading||imgsLoading){   /* sending now would silently drop the attachment */
     addNotice('⏳ still reading attachments — press send again in a moment');return;}
-  wsSend({type:'user',text:t,images:pendingImages.map(im=>({media_type:im.media_type,data:im.data})),
+  wsSend({type:'user',text:t,images:pendingImages.map(im=>({media_type:im.media_type,data:im.data,name:im.name||''})),
           files:pendingFiles.map(f=>({name:f.name,data:f.data}))});
   ta.value='';ta.style.height='auto';pendingImages=[];pendingFiles=[];renderAttach();dropDraft(sid);}
   /* busy state (and the thinking word/timer) is driven by the server's
@@ -8243,6 +8512,8 @@ def main():
         (r"/api/pinfolder", PinFolderHandler),
         (r"/api/dircomplete", DirCompleteHandler),
         (r"/api/directories", DirectoriesHandler),
+        (r"/api/image", ImageHandler),
+        (r"/api/image/save", ImageSaveHandler),
         (r"/api/diff", DiffHandler),
         (r"/api/usage", UsageHandler),
         (r"/api/models", ModelsHandler),

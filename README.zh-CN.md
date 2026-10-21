@@ -99,6 +99,11 @@
 - **附件** —— 输入框里的 📎，或拖放，或粘贴。图片作为多模态块发送；其他文件会
   **保存到该 session 的工作目录**并在消息中写明文件名，于是 Claude 可以读它、改它、
   *运行*它，而不只是看一眼。手机上也能用，而粘贴在手机上根本无从下手。
+- **对话里的图片** —— 发送的每张图片还会在一个私有临时目录
+  （`/tmp/claude-console-<uid>/images`）里留一份文件，消息里会告诉 Claude 它的路径。
+  对话中显示为缩略图（重新加载后也在），附 **Save**（存到该 session 的工作目录）和
+  **Save as…**（家目录下任选文件夹，可改文件名）；保存永不覆盖已有文件。临时副本在
+  电脑重启后就没有了，缩略图届时会注明。
 - **语音输入** —— 📎 旁边的 🎙 按钮（或 **Alt+M**）开始录音，在*你自己*的机器上用
   [faster-whisper](https://github.com/SYSTRAN/faster-whisper) 实时转写，也可以交给另一台
   常驻加载语音模型的机器。按下麦克风即
@@ -188,6 +193,7 @@ python claude_console.py
 | `CLAUDE_CONSOLE_PLAN_SUMMARY_MODEL` | `haiku` | 撰写 Plan 历史摘要的模型 |
 | `CLAUDE_CONSOLE_PLAN_LANG` | *(未设)* | 计划步骤标题和历史摘要使用的语言，写给提示词的语言名（如 `Chinese`）；未设时两者跟随你写的语言 |
 | `CLAUDE_CONSOLE_MAX_BUFFER_MB` | `64` | 单条 CLI 消息的上限 |
+| `CLAUDE_CONSOLE_IMAGE_DIR` | `/tmp/claude-console-<uid>/images` | 发送的图片副本存放处，供对话缩略图和 Save / Save as 使用 |
 | `CLAUDE_CONSOLE_IMPORT_MAX_MB` | `1024` | 导入 transcript 的大小上限 |
 | `CLAUDE_CONSOLE_TRANSCRIBE` | `0` | 启用本地语音输入 |
 | `CLAUDE_CONSOLE_TRANSCRIBE_PYTHON` | current python | 装有 `faster-whisper` 的解释器 |
