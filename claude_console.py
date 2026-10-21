@@ -2963,6 +2963,190 @@ class DirectoriesHandler(AuthMixin, tornado.web.RequestHandler):
             self.write(result)
 
 
+def _approval_summary(tool, inp):
+    """What an approval is for, in a line or two: the command, the file, the URL."""
+    if isinstance(inp, dict):
+        for key in ("command", "file_path", "notebook_path", "path", "url", "pattern", "description", "prompt"):
+            val = inp.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()[:300]
+        try:
+            return json.dumps(inp, ensure_ascii=False)[:300]
+        except (TypeError, ValueError):
+            return ""
+    return str(inp or "")[:300]
+
+
+class NotifyHub:
+    """What the phone app's notifications need, across every live session: approvals
+    and questions waiting for an answer, and turns that just finished. Fed by
+    ChatSession._push and _release; read by NotifyStreamHandler.
+
+    Messages, one JSON object per server-sent event:
+      {"type": "snapshot", "waiting": [item…], "sessions": [{id, title, busy}…]}
+      {"type": "waiting", **item}         item = {session, title, aid, kind, …}
+      {"type": "resolved", "session", "aid"}
+      {"type": "finished", "session", "title", "text", "error"}
+      {"type": "ended", "session"}
+    Subagent events (those with a "parent") are left out: their approvals still
+    reach the main session's card, but their turns are not the user's turns."""
+
+    def __init__(self):
+        self.streams = set()
+        self.waiting = {}         # (session id, aid) -> item
+        self.last_text = {}       # session id -> the main agent's latest reply
+
+    @staticmethod
+    def _title(session):
+        return session.title() or os.path.basename(session.cwd.rstrip("/")) or "session"
+
+    def on_events(self, session, evs):
+        for ev in evs:
+            if ev.get("parent"):
+                if ev.get("kind") not in ("approval", "approval_resolved", "question", "question_resolved"):
+                    continue
+            kind = ev.get("kind")
+            if kind == "assistant_text":
+                self.last_text[session.id] = ev.get("text") or ""
+            elif kind in ("approval", "question"):
+                item = {"session": session.id, "title": self._title(session), "aid": ev.get("aid"), "kind": kind}
+                if kind == "approval":
+                    item.update(tool=ev.get("tool") or "", detail=_approval_summary(ev.get("tool"), ev.get("input")),
+                                reason=ev.get("reason") or "", always=bool(ev.get("always")))
+                else:
+                    qs = ev.get("questions") or []
+                    first = qs[0] if qs and isinstance(qs[0], dict) else {}
+                    item.update(question=first.get("question") or first.get("header") or "",
+                                options=[o.get("label", "") for o in first.get("options") or [] if isinstance(o, dict)],
+                                count=len(qs))
+                self.waiting[(session.id, item["aid"])] = item
+                self.broadcast(dict(item, type="waiting"))
+            elif kind in ("approval_resolved", "question_resolved"):
+                if self.waiting.pop((session.id, ev.get("aid")), None) is not None:
+                    self.broadcast({"type": "resolved", "session": session.id, "aid": ev.get("aid")})
+            elif kind == "turn_done" and not ev.get("parent"):
+                self.broadcast({"type": "finished", "session": session.id, "title": self._title(session),
+                                "text": (self.last_text.pop(session.id, "") or "").strip()[:400],
+                                "error": bool(ev.get("isError"))})
+
+    def session_gone(self, session):
+        for key in [k for k in self.waiting if k[0] == session.id]:
+            self.waiting.pop(key, None)
+        self.last_text.pop(session.id, None)
+        self.broadcast({"type": "ended", "session": session.id})
+
+    def snapshot(self):
+        return {"type": "snapshot", "waiting": list(self.waiting.values()),
+                "sessions": [{"id": s.id, "title": self._title(s), "busy": bool(s.busy)}
+                             for s in CHAT_SESSIONS.values() if not s.ended]}
+
+    def broadcast(self, msg):
+        for stream in list(self.streams):
+            stream.send(msg)
+
+
+NOTIFY = NotifyHub()
+
+
+def _read_json_post(handler, limit=8192):
+    """The JSON body of a same-origin POST, or None after writing the refusal.
+    A request without an Origin header (the phone app) is not a browser's
+    cross-site request, which is what the check is for."""
+    origin = handler.request.headers.get("Origin")
+    if origin:
+        try:
+            parsed = urllib.parse.urlsplit(origin)
+            same_origin = parsed.scheme in ("http", "https") and parsed.netloc.lower() == handler.request.host.lower()
+        except ValueError:
+            same_origin = False
+        if not same_origin:
+            handler.set_status(403)
+            handler.write({"error": "Cross-origin requests are not allowed"})
+            return None
+    if handler.request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+        handler.set_status(415)
+        handler.write({"error": "Expected a JSON request"})
+        return None
+    if len(handler.request.body) > limit:
+        handler.set_status(413)
+        handler.write({"error": "Request is too large"})
+        return None
+    try:
+        body = json.loads(handler.request.body)
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        handler.set_status(400)
+        handler.write({"error": "Invalid request"})
+        return None
+    return body
+
+
+class NotifyStreamHandler(AuthMixin, tornado.web.RequestHandler):
+    """Server-sent events for the phone app's notifications: a snapshot on connect,
+    then every change, and a comment every 25 s so idle links stay open."""
+    KEEPALIVE = 25
+
+    async def get(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.set_header("Cache-Control", "no-store")
+        self.set_header("X-Accel-Buffering", "no")
+        self._queue = asyncio.Queue()
+        self._closed = False
+        NOTIFY.streams.add(self)
+        try:
+            self._write_event(NOTIFY.snapshot())
+            await self.flush()
+            while not self._closed:
+                try:
+                    msg = await asyncio.wait_for(self._queue.get(), self.KEEPALIVE)
+                except asyncio.TimeoutError:
+                    self.write(": keep-alive\n\n")
+                else:
+                    if msg is None:
+                        break
+                    self._write_event(msg)
+                await self.flush()
+        except tornado.iostream.StreamClosedError:
+            pass
+        finally:
+            NOTIFY.streams.discard(self)
+
+    def _write_event(self, msg):
+        self.write("data: " + json.dumps(msg, ensure_ascii=False) + "\n\n")
+
+    def send(self, msg):
+        if not self._closed:
+            self._queue.put_nowait(msg)
+
+    def on_connection_close(self):
+        self._closed = True
+        self._queue.put_nowait(None)
+
+
+class NotifyApproveHandler(AuthMixin, tornado.web.RequestHandler):
+    """Approve or deny from a notification: {"session", "aid", "allow", "always"}.
+    404 when the approval is no longer waiting (answered elsewhere, session gone)."""
+    def post(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "application/json")
+        body = _read_json_post(self)
+        if body is None:
+            return
+        session = CHAT_SESSIONS.get(body.get("session"))
+        aid = body.get("aid")
+        item = NOTIFY.waiting.get((getattr(session, "id", None), aid))
+        if not session or session.ended or not item or item.get("kind") != "approval" or aid not in session._pending:
+            self.set_status(404)
+            self.write({"error": "This approval is no longer waiting"})
+            return
+        session.resolve_approval(aid, bool(body.get("allow")), bool(body.get("always")))
+        self.write({"ok": True})
+
+
 class ImageHandler(AuthMixin, tornado.web.RequestHandler):
     """An image copy from IMAGE_DIR, for the conversation's thumbnails. Nothing
     outside that directory is served, whatever path is asked for."""
@@ -4507,6 +4691,7 @@ class ChatSession:
         if len(self.log) > 1500:
             self.log = self.log[-1500:]
         self._emit({"type": "events", "events": evs})
+        NOTIFY.on_events(self, evs)
 
     def events_since(self, after_seq=None):
         """What a viewer has not seen yet, when the window still reaches back that far.
@@ -4537,6 +4722,7 @@ class ChatSession:
             if not fut.done():
                 fut.set_result(False)
         self._pending.clear()
+        NOTIFY.session_gone(self)
         client = self.client
         self.client = None
         return client
@@ -8514,6 +8700,8 @@ def main():
         (r"/api/directories", DirectoriesHandler),
         (r"/api/image", ImageHandler),
         (r"/api/image/save", ImageSaveHandler),
+        (r"/api/notify/stream", NotifyStreamHandler),
+        (r"/api/notify/approve", NotifyApproveHandler),
         (r"/api/diff", DiffHandler),
         (r"/api/usage", UsageHandler),
         (r"/api/models", ModelsHandler),

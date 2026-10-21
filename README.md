@@ -132,6 +132,13 @@ which is the whole point.
   (any folder in your home folder, with a name of your choice); a save never
   replaces an existing file. The temporary copy does not survive a restart of
   the computer, and the thumbnail then says so.
+- **Notifications for a phone** — `GET /api/notify/stream` is a server-sent
+  event stream across all live sessions: a snapshot on connect, then each
+  approval or question that starts waiting, each that is answered (anywhere),
+  each finished turn with the start of the reply, and each session that ends.
+  `POST /api/notify/approve` (`{"session", "aid", "allow", "always"}`) answers an
+  approval without opening the session. The Android app turns these into
+  notifications with Approve / Deny buttons.
 - **Voice input** — a 🎙 button beside 📎 (or **Alt+M**) records, transcribes on
   *your* machine with [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
   or on another machine that keeps a speech model loaded,

@@ -104,6 +104,11 @@
   对话中显示为缩略图（重新加载后也在），附 **Save**（存到该 session 的工作目录）和
   **Save as…**（家目录下任选文件夹，可改文件名）；保存永不覆盖已有文件。临时副本在
   电脑重启后就没有了，缩略图届时会注明。
+- **给手机的通知** —— `GET /api/notify/stream` 是覆盖所有在跑 session 的服务器推送
+  事件流（server-sent events）：连上时给一份当前状态，之后推送每个开始等待的批准或提问、
+  每个已被回答的（无论在哪儿回答）、每个结束的回合（附回复开头）和每个结束的 session。
+  `POST /api/notify/approve`（`{"session", "aid", "allow", "always"}`）不用打开 session
+  就能批准或拒绝。Android app 把这些变成带 Approve / Deny 按钮的通知。
 - **语音输入** —— 📎 旁边的 🎙 按钮（或 **Alt+M**）开始录音，在*你自己*的机器上用
   [faster-whisper](https://github.com/SYSTRAN/faster-whisper) 实时转写，也可以交给另一台
   常驻加载语音模型的机器。按下麦克风即
