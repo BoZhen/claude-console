@@ -3215,6 +3215,21 @@ class ChatSession:
                 "mcp__console__plan now with the full list of steps. A question, an explanation "
                 "or a small edit needs none."}}
 
+    @staticmethod
+    def _permission_reason(context):
+        """Why the CLI is asking, in its own words. It sends a reason with each
+        request, and that is the only explanation when it asks in a mode that
+        normally does not (bypassPermissions still asks before a shell -c script
+        that deletes files and that it could not parse)."""
+        r = getattr(context, "decision_reason", None)
+        if isinstance(r, dict):
+            r = r.get("reason") or r.get("message") or r.get("type") or ""
+        r = " ".join(str(r or "").split())
+        path = getattr(context, "blocked_path", None)
+        if path:
+            r = (r + " · " if r else "") + "path: %s" % path
+        return _cap(r, 500)
+
     async def _can_use_tool(self, tool_name, tool_input, context):
         """SDK permission hook. AskUserQuestion is answered in-band: we surface the
         choices, collect the user's picks, and feed them back via
@@ -3255,6 +3270,7 @@ class ChatSession:
         self._push([{"kind": "approval", "aid": aid, "tool": tool_name,
                      "input": _cap_input(tool_input),
                      "toolId": getattr(context, "tool_use_id", None),
+                     "reason": self._permission_reason(context),
                      "always": bool(sugg)}])
         try:
             res = await fut
@@ -4999,6 +5015,8 @@ li.mdl1{margin-left:1.4em} li.mdl2{margin-left:2.8em} li.mdl3{margin-left:4.2em}
 .approval{border:1px solid var(--toolln);border-radius:8px;margin:6px 0 14px;background:var(--toolbg);overflow:hidden}
 .approval .ah{padding:8px 10px;color:var(--tool);font-weight:600;display:flex;gap:7px;align-items:center}
 .approval .ah .tp{color:var(--mut);font-family:var(--fmono);font-weight:400;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.approval .areason{padding:0 10px 8px;font-size:12.5px;line-height:1.45;color:var(--fg);overflow-wrap:anywhere}
+.approval .areason b{color:var(--mut);font-weight:600;margin-right:4px}
 .approval .abody{max-height:240px;overflow:auto;padding:4px 10px;border-top:1px solid var(--toolln)}
 .approval .abtns{display:flex;gap:8px;padding:8px 10px;border-top:1px solid var(--toolln)}
 .approval .abtns button{flex:1;padding:9px;border-radius:6px;cursor:pointer;font-size:14px;font-weight:700}
@@ -6331,6 +6349,7 @@ function addMarker(ev){const s=atBottom();const cn=counts(ev);const m=document.c
 
 function addApproval(ev){const c=document.createElement('div');c.className='approval';c.dataset.aid=ev.aid;
   c.innerHTML='<div class="ah">🔐 Approve <b>'+esc(ev.tool)+'</b> <span class="tp">'+esc(primaryArg(ev.input)||'')+'</span></div>'+
+    (ev.reason?'<div class="areason"><b>Why:</b>'+esc(ev.reason)+'</div>':'')+
     '<div class="abody">'+toolBody(ev)+'</div>'+
     '<div class="abtns"><button class="appr">✓ Approve</button>'+
     (ev.always?'<button class="apprall" title="approve and don\'t ask again this session">✓✓ Always</button>':'')+

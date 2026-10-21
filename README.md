@@ -111,7 +111,8 @@ which is the whole point.
 - **Interactive round-trips** — per-action approval with three choices
   (**Approve** / **Approve & don't ask again this session** / **Deny**) in 🔐
   Approve mode, plus in-browser **AskUserQuestion** cards; your pick is fed back
-  to the agent.
+  to the agent. An approval card shows the CLI's reason for asking, which is
+  the only explanation when it asks in a mode that normally does not.
 - **Message queue** — type while the agent is busy and the message queues, then
   sends when the turn ends. Click a queued chip (or press ↑) to withdraw it back
   into the editor, or hit its **⚡** to steer it into the *running* turn. Steering
