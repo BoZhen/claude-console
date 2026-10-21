@@ -3803,8 +3803,9 @@ class ChatSession:
                 and not text.lstrip().startswith("/")
                 and "ultracode" not in text.lower()):
             # ultracode mode: opt every turn into Workflow orchestration via the
-            # keyword trigger (viewers still see the clean original text above)
-            send_text = text.rstrip() + "\n\nultracode"
+            # keyword trigger (viewers still see the clean original text above).
+            # The note naming the attached files has to stay on the message.
+            send_text = text.rstrip() + "\n\nultracode" + uploads_note(saved)
         payload = self._make_payload(send_text, images)
         async def _q():
             try:
