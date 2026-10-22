@@ -5642,6 +5642,26 @@ li.mdl1{margin-left:1.4em} li.mdl2{margin-left:2.8em} li.mdl3{margin-left:4.2em}
 #drawer{position:fixed;top:0;right:0;width:var(--drw,min(560px,92vw));height:100%;background:var(--bg);border-left:1px solid var(--line);
   transform:translateX(100%);transition:transform .34s cubic-bezier(.32,.72,0,1);z-index:20;display:flex;flex-direction:column}
 #drawer.open{transform:none}
+/* an open drawer takes its own room (see drawerLayout): the page ends where it begins */
+body.drawer-push{padding-right:calc(var(--drw,min(560px,92vw)) + var(--railw))}
+/* The right rail, from 600 px (not in the desktop app, which has its own): it opens
+   the drawer on a tab, and the drawer docks between the chat and the rail. */
+:root{--railw:0px}
+#prail{display:none;position:fixed;top:0;right:0;bottom:0;width:var(--railw);z-index:22;background:var(--bg2);
+  border-left:1px solid var(--line);flex-direction:column;align-items:center;gap:4px;padding-top:8px}
+#prail .prb{width:32px;height:32px;border:0;border-radius:7px;background:transparent;color:var(--mut);
+  display:grid;place-items:center;cursor:pointer;padding:0}
+#prail .prb:hover{background:var(--bg3);color:var(--fg)}
+#prail .prb.on{background:var(--sel);color:var(--acc)}
+@media(min-width:600px){
+  :root{--railw:40px}
+  #prail{display:flex}
+  body{padding-right:var(--railw)}
+  #drawer{right:var(--railw)}
+  #drawer:not(.open){transform:translateX(calc(100% + var(--railw)))}
+}
+html.in-desktop-app{--railw:0px}
+html.in-desktop-app #prail{display:none!important}
 #drresize{position:absolute;left:0;top:0;width:6px;height:100%;cursor:col-resize;background:transparent;transition:background .12s;z-index:30}
 #drresize:hover,#drresize.drag{background:var(--acc)}
 #drawer .dh{padding:8px 12px;background:var(--bg2);border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center}
@@ -6245,6 +6265,12 @@ body.tabdrag,body.tabdrag .stab{cursor:grabbing}
   #sb-backdrop.show{display:block;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:35}
   #sbresize,#drresize{display:none}
 }
+/* Medium widths (an unfolded foldable, a tablet, a half-width window): an open
+   drawer docks at 45% of the width and the chat keeps the rest (see drawerLayout). */
+@media(min-width:600px) and (max-width:860px){
+  #drawer{width:calc((100vw - var(--railw)) * .45)}
+  body.drawer-push{padding-right:calc((100vw - var(--railw)) * .45 + var(--railw))}
+}
 .bubble .math.display{display:block;margin:6px 0;overflow-x:auto;overflow-y:hidden;max-width:100%}
 .katex-display{margin:.35em 0!important}
 
@@ -6368,6 +6394,11 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
     </div>
   </div>
 </div>
+<nav id="prail" aria-label="Side panel">
+  <button class="prb" id="prSide" title="Side chats"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M4 6.5A1.5 1.5 0 0 1 5.5 5h13A1.5 1.5 0 0 1 20 6.5v8a1.5 1.5 0 0 1-1.5 1.5H11l-4 3.5V16H5.5A1.5 1.5 0 0 1 4 14.5z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></button>
+  <button class="prb" id="prEdits" title="Edits"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M14.5 5.5l4 4L9 19H5v-4z M12.5 7.5l4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg></button>
+  <button class="prb" id="prGit" title="Git diff"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="7" cy="6" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="7" cy="18" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="17" cy="9" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M7 8v8 M17 11c0 3-4 3-8.5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
+</nav>
 <div id="selpop" hidden><span class="sp-ask" id="spAsk">在辅助对话中提问</span></div>
 <div id="pman" hidden>
   <div id="pmanpanel">
@@ -6507,6 +6538,8 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
 
 <script>
 const $=s=>document.querySelector(s);
+/* the desktop app has its own right rail: the page's stays hidden there */
+if(/\bElectron\//.test(navigator.userAgent))document.documentElement.classList.add('in-desktop-app');
 const PAGE_STAMP='__CLAUDE_CONSOLE_STAMP__';   /* hash of the page as served; see the server's PAGE_STAMP */
 const stream=$('#stream'), ta=$('#ta'), sendBtn=$('#send'), voiceBtn=$('#voiceBtn');
 let sink=stream;   /* where conversation builders append: the stream, or an Agent card's fold while its subagent's events render */
@@ -8678,7 +8711,8 @@ function showTab(w){
   $('#grefresh').style.display=(w==='side')?'none':'';
   if(w==='edits'){buildPendingEdits();showAllEdits();}
   else if(w==='git')refreshGit();
-  else if(w==='side')sideOnShow();}
+  else if(w==='side')sideOnShow();
+  if(typeof drawerLayout==='function')drawerLayout();}
 /* clicking "see Changes" focuses the drawer on just that one file's edit;
    the Edits tab header (or "show all") brings the full list back */
 function showAllEdits(){const ed=$('#edits');const fb=ed.querySelector('.efocus');if(fb)fb.remove();
@@ -8694,6 +8728,50 @@ function focusEdit(toolId){const ed=$('#edits'),target=toolId&&tools[toolId];
   fb.querySelector('.showall').onclick=showAllEdits;
   target.classList.add('flash');target.scrollIntoView({block:'start'});setTimeout(()=>target.classList.remove('flash'),1200);}
 function openDrawer(w){$('#drawer').classList.add('open');showTab(w||'edits');}
+/* An open drawer takes its own room, the way the desktop file pane does: the
+   header and the chat column end where the drawer begins, so nothing is covered.
+   Only on a wide window, and only while the chat column keeps DRAWER_PUSH_MIN px;
+   on phones and narrow windows the drawer stays an overlay. The drawer opens and
+   closes from many places (the desktop app's rail button among them), so its
+   class is watched rather than every caller patched. */
+const DRAWER_PUSH_MIN=440, DRAWER_DOCK_FROM=600, DRAWER_KEY='al_drawer';
+let drawerWide=null;
+function railW(){return parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--railw'))||0;}
+function drawerTab(){return drawerOpen()?(sideTab()?'side':gitTab()?'git':'edits'):'';}
+function drawerLayout(){const d=$('#drawer'),sb=$('#sidebar'),W=window.innerWidth,wide=W>=DRAWER_DOCK_FROM;
+  /* Folding below 600 px puts the drawer away (it would cover the chat there);
+     unfolding brings back the tab that was open. */
+  if(drawerWide!==null&&wide!==drawerWide){
+    drawerWide=wide;
+    if(!wide&&d.classList.contains('open')){d.classList.remove('open');return;}   /* the observer runs this again */
+    if(wide){const t=localStorage.getItem(DRAWER_KEY);if(t&&!d.classList.contains('open')){openDrawer(t);return;}}}
+  drawerWide=wide;
+  let push=false;
+  if(d.classList.contains('open')&&W>860){
+    const sbw=sb&&!sb.classList.contains('collapsed')?sb.getBoundingClientRect().width:0;
+    push=W-d.getBoundingClientRect().width-sbw-railW()>=DRAWER_PUSH_MIN;}
+  /* 600-860 px: the session list is an overlay there, and the drawer is 45% of
+     what the rail leaves (CSS), so the chat keeps at least 300 px: always dock */
+  else if(d.classList.contains('open')&&wide)push=true;
+  document.body.classList.toggle('drawer-push',push);
+  /* on a wide screen the drawer is a sidebar: remember it open or closed */
+  if(wide)localStorage.setItem(DRAWER_KEY,drawerTab());
+  railSync();}
+function railSync(){const t=drawerTab();
+  $('#prSide').classList.toggle('on',t==='side');$('#prEdits').classList.toggle('on',t==='edits');$('#prGit').classList.toggle('on',t==='git');}
+/* a rail button opens its tab; the open tab's button closes the drawer */
+function railTap(w){if(drawerTab()===w)$('#drawer').classList.remove('open');else openDrawer(w);}
+(function(){const mo=new MutationObserver(drawerLayout);
+  mo.observe($('#drawer'),{attributes:true,attributeFilter:['class']});
+  mo.observe($('#sidebar'),{attributes:true,attributeFilter:['class']});
+  mo.observe(document.documentElement,{attributes:true,attributeFilter:['style']});   /* --drw / --sbw drags */
+  window.addEventListener('resize',drawerLayout);
+  $('#prSide').onclick=()=>railTap('side');$('#prEdits').onclick=()=>railTap('edits');$('#prGit').onclick=()=>railTap('git');
+  /* A sidebar left open on a wide screen is open again after a reload. Read now
+     (layout passes save over it), reopened once the whole script has run: the
+     side-chat code further down must exist before the drawer shows its tab. */
+  const t=localStorage.getItem(DRAWER_KEY);
+  setTimeout(()=>{if(t&&window.innerWidth>=DRAWER_DOCK_FROM)openDrawer(t);else drawerLayout();},0);})();
 async function refreshGit(){if(!cwd){$('#gitc').innerHTML='<div class="empty">no session</div>';return;}
   try{const r=await fetch('api/diff?cwd='+encodeURIComponent(cwd));const j=await r.json();
     if(!j.ok){$('#gitc').innerHTML='<div class="empty">'+esc(j.error||'n/a')+'</div>';return;}
@@ -9132,7 +9210,11 @@ $('#sideModelSel').onchange=()=>{const v=$('#sideModelSel').value||'sonnet';side
 $('#sideTa').addEventListener('input',()=>{const t=$('#sideTa');t.style.height='auto';t.style.height=Math.min(t.scrollHeight,140)+'px';});
 $('#sideTa').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sideComposerSend();}});
 /* selection → "在辅助对话中提问" popup over the conversation */
+/* selPopData keeps what was selected when the popup appeared: on a touch screen the
+   tap on the popup can clear the selection before its click arrives. */
+let selTouch=false, selPopData=null, selAsking=false, selT=0;
 function updateSelPop(){
+  if(selAsking)return;
   const pop=$('#selpop'),sel=window.getSelection();
   if(!sel||sel.isCollapsed){pop.hidden=true;return;}
   const text=sel.toString();if(!text.trim()){pop.hidden=true;return;}
@@ -9140,22 +9222,35 @@ function updateSelPop(){
   if(!n||!stream.contains(n)){pop.hidden=true;return;}
   let r;try{r=sel.getRangeAt(0).getBoundingClientRect();}catch(_){pop.hidden=true;return;}
   if(!r||(!r.width&&!r.height)){pop.hidden=true;return;}
+  const msg=n.closest?n.closest('.msg'):null;
+  selPopData={text:text.trim(),context:((msg?msg.innerText:text)||'').trim()};
   pop.hidden=false;const pw=pop.offsetWidth||130,ph=pop.offsetHeight||30;
-  let left=Math.max(6,Math.min(r.left+r.width/2-pw/2,innerWidth-pw-6)),top=r.top-ph-6;
-  if(top<4)top=r.bottom+6;pop.style.left=left+'px';pop.style.top=top+'px';}
+  let left=Math.max(6,Math.min(r.left+r.width/2-pw/2,innerWidth-pw-6)),top;
+  /* touch: below the selection, clear of its handles; Android puts its own
+     Copy/Share bar above the selection */
+  if(selTouch){top=r.bottom+30;if(top+ph>innerHeight-4)top=Math.max(4,r.top-ph-52);}
+  else{top=r.top-ph-6;if(top<4)top=r.bottom+6;}
+  pop.style.left=left+'px';pop.style.top=top+'px';}
 stream.addEventListener('mouseup',()=>setTimeout(updateSelPop,0));
+/* A long-press selection, and dragging its handles, fire no mouseup: follow
+   selectionchange while the last pointer was a finger. */
+document.addEventListener('pointerdown',e=>{selTouch=e.pointerType==='touch';},true);
+document.addEventListener('selectionchange',()=>{if(!selTouch)return;clearTimeout(selT);selT=setTimeout(updateSelPop,250);});
 stream.addEventListener('scroll',()=>{$('#selpop').hidden=true;});
 document.addEventListener('mousedown',e=>{if(!e.target.closest('#selpop')&&!e.target.closest('#stream'))$('#selpop').hidden=true;});
 /* mousedown only keeps the selection; the work happens on click. Hiding the popup
    on mousedown sent the click to the message underneath, and the drawer's
    outside-click rule closed it again straight after it opened. */
 $('#spAsk').addEventListener('mousedown',e=>e.preventDefault());
-$('#spAsk').addEventListener('click',e=>{e.preventDefault();e.stopPropagation();
-  const sel=window.getSelection();const text=sel?sel.toString().trim():'';
+$('#spAsk').addEventListener('pointerdown',()=>{selAsking=true;setTimeout(()=>{selAsking=false;},800);});   /* a press that slides away sends no click */
+$('#spAsk').addEventListener('click',e=>{e.preventDefault();e.stopPropagation();selAsking=false;
+  const sel=window.getSelection();let text=sel?sel.toString().trim():'',context='';
+  if(text){let n=sel.anchorNode;n=n&&(n.nodeType===1?n:n.parentNode);
+    const msg=n&&n.closest?n.closest('.msg'):null;
+    context=((msg?msg.innerText:text)||'').trim();}
+  else if(selPopData){text=selPopData.text;context=selPopData.context;}   /* the tap cleared it */
+  selPopData=null;
   if(!text){$('#selpop').hidden=true;return;}
-  let n=sel.anchorNode;n=n&&(n.nodeType===1?n:n.parentNode);
-  const msg=n&&n.closest?n.closest('.msg'):null;
-  const context=((msg?msg.innerText:text)||'').trim();
   $('#selpop').hidden=true;try{sel.removeAllRanges();}catch(_){}
   askInSide(text,context);});
 $('#dclose').onclick=()=>$('#drawer').classList.remove('open');
@@ -9165,7 +9260,7 @@ $('#dclose').onclick=()=>$('#drawer').classList.remove('open');
 document.addEventListener('click',e=>{
   /* a side chat stays open beside the main conversation: clicking, selecting or
      typing there must not close it (✕ and Escape still do) */
-  if(drawerOpen()&&!sideTab()&&!e.target.closest('#drawer')&&!e.target.closest('.emark')&&!e.target.closest('#selpop'))$('#drawer').classList.remove('open');});
+  if(drawerOpen()&&!sideTab()&&!document.body.classList.contains('drawer-push')&&!e.target.closest('#drawer')&&!e.target.closest('#prail')&&!e.target.closest('.emark')&&!e.target.closest('#selpop'))$('#drawer').classList.remove('open');});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&drawerOpen())$('#drawer').classList.remove('open');});
 $('#grefresh').onclick=refreshGit;
 
