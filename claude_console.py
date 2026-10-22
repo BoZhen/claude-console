@@ -3247,6 +3247,75 @@ class NotifyApproveHandler(AuthMixin, tornado.web.RequestHandler):
         self.write({"ok": True})
 
 
+# ───────────────────── Android app updates ─────────────────────
+#
+# The Android app asks GET api/android/latest for the newest published build and
+# downloads it from GET api/android/apk/<versionCode> (or api/android/apk/latest,
+# a link to open in a phone's browser for a first install). The files come from
+# ~/Git/claude-console-android/scripts/publish.sh, which builds the APK and puts it
+# here as claude-console-<versionCode>.apk, with latest.json beside it:
+#   {"versionCode", "versionName", "size", "sha256", "published", "notes"}
+ANDROID_DIR = os.path.join(HOME, ".local", "share", "claude-console", "android")
+
+
+def android_latest():
+    """The newest published Android build, or None. Its APK must be present at the
+    recorded size, so a half-copied file is never offered."""
+    try:
+        with open(os.path.join(ANDROID_DIR, "latest.json"), encoding="utf-8") as fh:
+            info = json.load(fh)
+        code = int(info["versionCode"])
+        name = "claude-console-%d.apk" % code
+        path = os.path.join(ANDROID_DIR, name)
+        size = os.path.getsize(path)
+        if size != int(info.get("size", -1)):
+            return None
+        return {"versionCode": code, "versionName": str(info.get("versionName") or code),
+                "size": size, "sha256": str(info.get("sha256") or ""),
+                "published": str(info.get("published") or ""), "notes": str(info.get("notes") or ""),
+                "url": "api/android/apk/%d" % code, "_path": path, "_file": name}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+class AndroidLatestHandler(AuthMixin, tornado.web.RequestHandler):
+    def get(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "application/json")
+        self.set_header("Cache-Control", "no-store")
+        info = android_latest()
+        if not info:
+            self.set_status(404)
+            self.write(json.dumps({"error": "no app published"}))
+            return
+        self.write(json.dumps({k: v for k, v in info.items() if not k.startswith("_")}))
+
+
+class AndroidApkHandler(AuthMixin, tornado.web.RequestHandler):
+    """The newest build's APK. Only the newest is kept, so a request for any other
+    version is a 404, and the app checks again."""
+    async def get(self, which):
+        if not self._ok_auth():
+            return
+        info = android_latest()
+        if not info or which not in ("latest", str(info["versionCode"])):
+            self.set_status(404)
+            self.finish()
+            return
+        self.set_header("Content-Type", "application/vnd.android.package-archive")
+        self.set_header("Content-Length", str(info["size"]))
+        self.set_header("Content-Disposition", 'attachment; filename="%s"' % info["_file"])
+        self.set_header("Cache-Control", "no-store")
+        with open(info["_path"], "rb") as fh:
+            while True:
+                chunk = fh.read(256 * 1024)
+                if not chunk:
+                    break
+                self.write(chunk)
+                await self.flush()
+
+
 class ImageHandler(AuthMixin, tornado.web.RequestHandler):
     """An image copy from IMAGE_DIR, for the conversation's thumbnails. Nothing
     outside that directory is served, whatever path is asked for."""
@@ -9398,6 +9467,8 @@ def main():
         (r"/api/image/save", ImageSaveHandler),
         (r"/api/notify/stream", NotifyStreamHandler),
         (r"/api/notify/approve", NotifyApproveHandler),
+        (r"/api/android/latest", AndroidLatestHandler),
+        (r"/api/android/apk/(latest|\d+)", AndroidApkHandler),
         (r"/api/diff", DiffHandler),
         (r"/api/usage", UsageHandler),
         (r"/api/models", ModelsHandler),
