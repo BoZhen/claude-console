@@ -1110,6 +1110,94 @@ def save_pref(cc, mode=None, model=None, effort=None, fav=None):
         pass
 
 
+# ── side chats ───────────────────────────────────────────────────────────────
+# A "side chat" is a hidden, resumable thread started from a text selection in a
+# main session. It is seeded with the selection and its surrounding message, runs
+# in a context entirely separate from the main agent, and is kept out of the left
+# session list. The registry maps a main session's claude id to its side chats.
+SIDECHATS_FILE = os.path.join(HOME, ".claude", "console-sidechats.json")
+_sidechats_cache = {"mtime": -1.0, "v": {}}
+
+
+def load_sidechats():
+    """{parent_cc: [ {cc, cwd, selection, title, model, created}, ... ] }."""
+    try:
+        m = os.path.getmtime(SIDECHATS_FILE)
+    except OSError:
+        return {}
+    c = _sidechats_cache
+    if c["mtime"] == m:
+        return c["v"]
+    try:
+        with open(SIDECHATS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    c["v"], c["mtime"] = data, m
+    return data
+
+
+def _save_sidechats(data):
+    try:
+        os.makedirs(os.path.dirname(SIDECHATS_FILE), exist_ok=True)
+        tmp = SIDECHATS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, SIDECHATS_FILE)
+        _sidechats_cache["mtime"] = -1.0
+    except Exception:
+        pass
+
+
+def register_sidechat(parent_cc, cc, cwd, selection, model):
+    """Record a side chat under its parent, de-duplicating by its own claude id.
+    A side chat with no parent yet is filed under "_orphan" so it is still kept
+    out of the left list; it simply has no parent to be listed under."""
+    if not cc:
+        return
+    parent_cc = parent_cc or "_orphan"
+    data = dict(load_sidechats())
+    kids = [k for k in list(data.get(parent_cc, []))
+            if isinstance(k, dict) and k.get("cc") and k.get("cc") != cc]
+    snip = " ".join((selection or "").split())[:120]
+    kids.append({"cc": cc, "cwd": cwd, "selection": (selection or "")[:400],
+                 "title": snip, "model": model or "", "created": time.time()})
+    data[parent_cc] = kids
+    _save_sidechats(data)
+
+
+def sidechat_items(parent_cc):
+    """A parent's side chats, newest first."""
+    items = [dict(k) for k in load_sidechats().get(parent_cc, [])
+             if isinstance(k, dict) and k.get("cc")]
+    items.sort(key=lambda k: k.get("created", 0), reverse=True)
+    return items
+
+
+def sidechat_child_ccs():
+    """Every side chat's claude id, to exclude from the main session lists."""
+    out = set()
+    for kids in load_sidechats().values():
+        for k in (kids or []):
+            if isinstance(k, dict) and k.get("cc"):
+                out.add(k["cc"])
+    return out
+
+
+def sidechat_entry(cc):
+    """(parent claude id, registry entry) for a side chat's own claude id, or
+    (None, None) when cc is not a side chat. Orphans report parent "_orphan"."""
+    if not cc:
+        return None, None
+    for parent, kids in load_sidechats().items():
+        for k in (kids or []):
+            if isinstance(k, dict) and k.get("cc") == cc:
+                return parent, k
+    return None, None
+
+
 def _trim_plans(items):
     """The newest PLAN_HIST_MAX entries, plus as many markers of deleted ones
     (see ChatSession.delete_plans), in their original order."""
@@ -1411,6 +1499,7 @@ def _sessions_by_folder(force=False):
     if not force and _scan_cache["v"] and now - _scan_cache["t"] < 6:
         return _scan_cache["v"]
     names = load_names()
+    sides = sidechat_child_ccs()
     out = {}
     for s in list_sessions(2000):
         if s.get("source") != "claude":
@@ -1419,7 +1508,7 @@ def _sessions_by_folder(force=False):
         if not folder or _is_junk(folder):
             continue
         cc = os.path.splitext(os.path.basename(s["id"]))[0]
-        if not cc:
+        if not cc or cc in sides:   # side chats never appear in the left list
             continue
         out.setdefault(folder, []).append({
             "cc": cc, "cwd": s.get("cwd") or folder,
@@ -1614,6 +1703,7 @@ def list_resumable(cwd=None, limit=20):
     given, restrict to sessions whose working dir is exactly that folder
     (scan deeper, since one folder's sessions may be far down the global list)."""
     target = os.path.realpath(cwd) if cwd else None
+    sides = sidechat_child_ccs()
     out = []
     for s in list_sessions(500 if target else 60):
         if s.get("source") != "claude":
@@ -1621,6 +1711,8 @@ def list_resumable(cwd=None, limit=20):
         scwd = s.get("cwd")
         if not scwd or not os.path.isdir(scwd) or _is_junk(scwd):
             continue
+        if os.path.splitext(os.path.basename(s["id"]))[0] in sides:
+            continue   # side chats never appear in "Resume from disk"
         # match the folder AND everything under it (sessions usually live in a
         # project subdir, not the container folder itself)
         rscwd = os.path.realpath(scwd)
@@ -2989,7 +3081,10 @@ class NotifyHub:
       {"type": "finished", "session", "title", "text", "error"}
       {"type": "ended", "session"}
     Subagent events (those with a "parent") are left out: their approvals still
-    reach the main session's card, but their turns are not the user's turns."""
+    reach the main session's card, but their turns are not the user's turns.
+    Side chats are treated the same way: only an approval or a question, which
+    blocks the side chat until answered, reaches the phone. Their finished turns
+    stay silent and they are not counted among the live sessions."""
 
     def __init__(self):
         self.streams = set()
@@ -2998,11 +3093,15 @@ class NotifyHub:
 
     @staticmethod
     def _title(session):
+        if getattr(session, "is_side", False):
+            snip = " ".join((getattr(session, "selection", "") or "").split())[:60]
+            return "Side chat" + (": " + snip if snip else "")
         return session.title() or os.path.basename(session.cwd.rstrip("/")) or "session"
 
     def on_events(self, session, evs):
+        side = getattr(session, "is_side", False)
         for ev in evs:
-            if ev.get("parent"):
+            if ev.get("parent") or side:
                 if ev.get("kind") not in ("approval", "approval_resolved", "question", "question_resolved"):
                     continue
             kind = ev.get("kind")
@@ -3038,7 +3137,8 @@ class NotifyHub:
     def snapshot(self):
         return {"type": "snapshot", "waiting": list(self.waiting.values()),
                 "sessions": [{"id": s.id, "title": self._title(s), "busy": bool(s.busy)}
-                             for s in CHAT_SESSIONS.values() if not s.ended]}
+                             for s in CHAT_SESSIONS.values()
+                             if not s.ended and not getattr(s, "is_side", False)]}
 
     def broadcast(self, msg):
         for stream in list(self.streams):
@@ -3491,9 +3591,14 @@ class ChatSession:
     Provides per-action approval (can_use_tool) and interrupt()."""
 
     def __init__(self, sid, cwd, model, mode, resume_cc=None, effort="max",
-                 account="main"):
+                 account="main", is_side=False, parent_cc=None, selection=""):
         self.id = sid
         self.cwd = cwd
+        # side chat: a hidden thread started from a selection (see register_sidechat)
+        self.is_side = bool(is_side)
+        self.parent_cc = parent_cc or None
+        self.selection = selection or ""
+        self._side_registered = False
         # Which login runs this session. Resumed sessions inherit it from the tree
         # their transcript sits in, so the answer survives a console restart
         # without being written down anywhere.
@@ -3767,6 +3872,10 @@ class ChatSession:
                         self.cc_id = e.get("session_id") or self.cc_id
                         if self.cc_id:   # record this session's mode/model once
                             save_pref(self.cc_id, mode=self.mode, model=self.model, effort=self.effort)
+                            if self.is_side and not self._side_registered:
+                                self._side_registered = True   # link it to its parent, once it has reached disk
+                                register_sidechat(self.parent_cc, self.cc_id, self.cwd,
+                                                  self.selection, self.model)
                 if evs:
                     self._push(evs)
                 # refresh context-window usage after a turn settles, on init, or
@@ -3843,7 +3952,7 @@ class ChatSession:
         """Generate a one-line 'away summary' and push it to viewers (logged, so it
         also replays when you return). Isolated Haiku call: no tools, no settings /
         CLAUDE.md, single turn — cheap and side-effect-free."""
-        if (not RECAP_ENABLED or self.busy or self.ended or self.compacting
+        if (not RECAP_ENABLED or self.is_side or self.busy or self.ended or self.compacting
                 or self.recap_busy or not self.client
                 or self.recap_for == self.last_activity):
             return
@@ -4756,6 +4865,34 @@ class ChatSession:
                 pass
 
 
+def build_side_seed(selection, context, question):
+    """The first turn of a side chat: the selected text in the context of its
+    message, then the user's question. The model is told plainly that this is a
+    quote from another conversation, so it answers the question, not the quote."""
+    selection = (selection or "").strip()
+    context = (context or "").strip()
+    question = (question or "").strip()
+    base = context or selection
+    if context and selection and selection in context:
+        base = context.replace(selection, "【" + selection + "】", 1)
+        marked = True
+    else:
+        marked = False
+    quote = "\n".join("> " + ln for ln in base.splitlines()) if base else ""
+    parts = []
+    if quote:
+        if marked:
+            parts.append("From the conversation (I selected the text marked 【 】):")
+        else:
+            parts.append("From the conversation, I selected:")
+        parts.append(quote)
+    if question:
+        parts.append(question)
+    elif quote:
+        parts.append("Tell me about the selected text.")
+    return "\n\n".join(parts)
+
+
 class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
     """Thin attach/detach controller over persistent ChatSessions.
     Closing the socket only DETACHES — it never kills the claude process."""
@@ -4826,6 +4963,49 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "name": os.path.basename(cwd) or cwd,
                        "model": sess.model or "default", "mode": sess.mode, "effort": sess.effort,
                        "account": sess.account})
+        elif mt == "side_new":
+            # Start a side chat: a hidden thread seeded with a selection and its
+            # message, on its own socket, kept out of the left list. Replies with
+            # a normal "started" so the drawer client shares the attach machinery.
+            request_id = msg.get("requestId")
+            reply = {"requestId": request_id} if isinstance(request_id, str) and len(request_id) <= 80 else {}
+            if not CLAUDE_BIN or not os.path.exists(CLAUDE_BIN):
+                self._say({"type": "error", "error": "claude CLI not found", **reply})
+                return
+            cwd = safe_cwd(msg.get("cwd") or HOME)
+            if not cwd:
+                self._say({"type": "error", "error": "invalid working directory", **reply})
+                return
+            parent_cc = msg.get("parent_cc") if _valid_cc(msg.get("parent_cc")) else None
+            selection = (msg.get("selection") or "")[:4000]
+            context = (msg.get("context") or "")[:8000]
+            question = (msg.get("text") or "")[:8000]
+            sid = secrets.token_hex(6)
+            sess = ChatSession(sid, cwd, msg.get("model") or "", _sanitize_mode(msg.get("mode")),
+                               effort=_sanitize_effort(msg.get("effort")), is_side=True,
+                               parent_cc=parent_cc, selection=selection)
+            try:
+                await sess.start()
+            except Exception as e:
+                self._say({"type": "error", "error": "spawn failed: %s" % e, **reply})
+                return
+            CHAT_SESSIONS[sid] = sess
+            if self.session and self.session is not sess:
+                self.session.detach(self)
+            self.session = sess
+            sess.attach(self)
+            self._say({"type": "started", "id": sid, "cwd": cwd, **reply,
+                       "name": os.path.basename(cwd) or cwd, "side": True, "selection": selection,
+                       "model": sess.model or "default", "mode": sess.mode, "effort": sess.effort,
+                       "account": sess.account})
+            sess.send_user(build_side_seed(selection, context, question))
+        elif mt == "side_list":
+            parent = msg.get("parent_cc")
+            items = sidechat_items(parent) if _valid_cc(parent) else []
+            live = {s.cc_id for s in CHAT_SESSIONS.values() if not s.ended and s.cc_id}
+            for it in items:
+                it["live"] = it.get("cc") in live
+            self._say({"type": "side_list", "parent": parent, "items": items})
         elif mt == "attach":
             sess = CHAT_SESSIONS.get(msg.get("id"))
             if not sess:
@@ -4866,12 +5046,18 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                 sess = live
             else:
                 pf = load_prefs().get(cc) or {}   # restore this session's own
+                side_parent, side_entry = sidechat_entry(cc)
                 r_mode = _sanitize_mode(pf.get("mode") or msg.get("mode"))
-                r_model = pf.get("model") or msg.get("model") or ""
+                r_model = pf.get("model") or (side_entry or {}).get("model") or msg.get("model") or ""
                 r_effort = _sanitize_effort(pf.get("effort") or msg.get("effort"))
                 sess = ChatSession(secrets.token_hex(6), cwd, r_model,
                                    r_mode, resume_cc=cc, effort=r_effort,
-                                   account=transcript_account(cc))
+                                   account=transcript_account(cc),
+                                   is_side=side_entry is not None,
+                                   parent_cc=None if side_parent == "_orphan" else side_parent,
+                                   selection=(side_entry or {}).get("selection") or "")
+                if side_entry is not None:
+                    sess._side_registered = True   # already filed: keep its place in the drawer list
                 sess.preload()
                 try:
                     await sess.start()
@@ -5070,13 +5256,15 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                 self.session = None
                 self._say({"type": "ended", "id": cur.id})
         elif mt == "list":
+            sides = sidechat_child_ccs()   # side chats never appear in the left list
             self._say({"type": "sessions", "sessions": [
                 {"id": s.id, "cwd": s.cwd, "root": _norm_dir(s.cwd) or s.cwd,
                  "name": os.path.basename(s.cwd) or s.cwd,
                  "cc": s.cc_id, "model": s.model or "default", "mode": s.mode,
                  "account": s.account, "effort": s.effort, "title": s.title(),
                  "busy": s.busy, "ended": s.ended, "event_seq": s.event_seq}
-                for s in CHAT_SESSIONS.values()]})
+                for s in CHAT_SESSIONS.values()
+                if not s.is_side and s.cc_id not in sides]})
 
     def on_close(self):
         if self.session:
@@ -5461,6 +5649,56 @@ li.mdl1{margin-left:1.4em} li.mdl2{margin-left:2.8em} li.mdl3{margin-left:4.2em}
 #drawer .dc{flex:1;overflow:auto;padding:10px}
 .gfile{font-family:var(--fmono);font-size:12px;padding:1px 0}.gfile .st{display:inline-block;width:24px;color:var(--tool);font-weight:700}
 .empty{color:var(--mut);padding:18px;text-align:center}
+/* ── side chats (辅助对话): a hidden thread per selection, in the drawer ── */
+#sidec{padding:0;display:flex;flex-direction:column;overflow:hidden}
+#sidec.on-chat{display:flex;flex-direction:column;overflow:hidden}
+#sideList{overflow:auto;flex:1;min-height:0}
+#sideNewRow{padding:8px 10px;border-bottom:1px solid var(--line);flex-shrink:0}
+#sidec.on-chat #sideNewRow{display:none}
+#sideNewBtn{display:inline-block;padding:5px 10px;font-size:12px;border:1px solid var(--acc);border-radius:7px;color:var(--acc);cursor:pointer}
+#sideNewBtn:hover{background:var(--acc);color:#fff}
+#sideBar .smodel{flex-shrink:0;max-width:42%;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:6px;font-size:11px;padding:2px 4px;height:24px;cursor:pointer}
+#sideList .srow{padding:9px 12px;border-bottom:1px solid var(--line);cursor:pointer}
+#sideList .srow:hover{background:var(--bg2)}
+#sideList .srow .ssel{font-size:12.5px;color:var(--fg);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+#sideList .srow .smeta{font-size:11px;color:var(--mut);margin-top:3px}
+#sideList .srow .smeta .dot-live{color:var(--ok,#3fb950)}
+#sideChat{flex:1;min-height:0;display:flex;flex-direction:column}
+#sideChat[hidden]{display:none}   /* its display:flex would beat the hidden attribute */
+#sideBar{display:flex;gap:8px;align-items:center;padding:6px 10px;border-bottom:1px solid var(--line);background:var(--bg2);flex-shrink:0}
+#sideBar .sback{color:var(--acc);cursor:pointer;font-size:12px;white-space:nowrap}
+#sideBar .stitle{flex:1;min-width:0;color:var(--mut);font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#sideCtx{flex-shrink:0;margin:8px 10px 0;padding:6px 9px;border-left:3px solid var(--acc);background:var(--bg2);border-radius:0 6px 6px 0;
+  font-size:12px;color:var(--mut);max-height:84px;overflow:auto;white-space:pre-wrap}
+#sideStream{flex:1;min-height:0;overflow:auto;padding:10px}
+#sideStream .sm{margin:0 0 12px;font-size:13px;line-height:1.5}
+#sideStream .sm.u{background:var(--bg2);border-radius:10px;padding:8px 10px}
+#sideStream .sm.u .who{color:var(--acc)}
+#sideStream .sm.u .squote{border-left:2px solid var(--acc);padding-left:8px;margin:2px 0;color:var(--mut)}
+#sideStream .sm.a .who{color:var(--tool)}
+#sideStream .sm .who{font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:3px;opacity:.8}
+#sideStream .sm.a .body{overflow-wrap:anywhere}
+#sideStream .sm.a pre{background:var(--bg3);padding:8px;border-radius:6px;overflow:auto}
+#sideStream .sm.a code{background:var(--bg3);padding:1px 4px;border-radius:4px}
+#sideStream .stool{font-family:var(--fmono);font-size:11.5px;color:var(--tool);margin:0 0 8px;white-space:pre-wrap;overflow-wrap:anywhere}
+#sideStream .stool.res{color:var(--mut)}
+#sideStream .snotice{font-size:11.5px;color:var(--mut);margin:0 0 8px;font-style:italic}
+#sideStream .sappr{border:1px solid var(--acc);border-radius:8px;padding:8px;margin:0 0 10px}
+#sideStream .sappr .q{font-family:var(--fmono);font-size:12px;margin-bottom:6px;white-space:pre-wrap;overflow-wrap:anywhere}
+#sideStream .sappr button{margin-right:6px;margin-top:4px;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px}
+#sideStream .sappr button.ok{border-color:var(--acc)}
+#sideStream .sappr.done{opacity:.6}
+#sideStream .sbusy{font-size:12px;color:var(--mut)}
+#sideCompose{flex-shrink:0;display:flex;gap:6px;align-items:flex-end;padding:8px;border-top:1px solid var(--line);background:var(--bg2)}
+#sideTa{flex:1;min-width:0;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:7px 9px;
+  font:inherit;font-size:13px;resize:none;max-height:140px}
+#sideTa:focus{outline:1px solid var(--acc)}
+#sideSend{background:var(--acc);color:#fff;border:none;border-radius:8px;padding:7px 11px;cursor:pointer}
+#sideSend:disabled{opacity:.5;cursor:default}
+#selpop{position:fixed;z-index:60;background:var(--bg2);border:1px solid var(--line);border-radius:8px;
+  box-shadow:0 4px 14px rgba(0,0,0,.4);padding:3px}
+#selpop .sp-ask{display:inline-block;padding:5px 10px;font-size:12px;color:var(--fg);cursor:pointer;border-radius:6px;white-space:nowrap}
+#selpop .sp-ask:hover{background:var(--acc);color:#fff}
 /* edits-out-of-chat */
 .dh .tab{cursor:pointer;padding:3px 9px;border-radius:5px;color:var(--mut);font-size:12.5px;user-select:none}
 .dh .tab.on{background:var(--bg3);color:var(--fg)}
@@ -6113,10 +6351,24 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
 
 <div id="drawer">
   <div id="drresize"></div>
-  <div class="dh"><span class="tab on" id="tabEdits">Edits <span id="editN">0</span></span><span class="tab" id="tabGit">Git diff</span><span class="grow"></span><span class="btn" id="grefresh">↻</span><span class="btn" id="dclose">✕</span></div>
+  <div class="dh"><span class="tab on" id="tabEdits">Edits <span id="editN">0</span></span><span class="tab" id="tabGit">Git diff</span><span class="tab" id="tabSide">Side chats <span id="sideN">0</span></span><span class="grow"></span><span class="btn" id="grefresh">↻</span><span class="btn" id="dclose">✕</span></div>
   <div class="dc" id="edits"><div class="empty">no file changes yet</div></div>
   <div class="dc" id="gitc" style="display:none"><div class="empty">—</div></div>
+  <div class="dc" id="sidec" style="display:none">
+    <div id="sideNewRow"><span class="btn" id="sideNewBtn">+ New side chat</span></div>
+    <div id="sideList"><div class="empty">No side chats yet. Start one above, or select text in a message and choose “在辅助对话中提问”.</div></div>
+    <div id="sideChat" hidden>
+      <div id="sideBar"><span class="sback" id="sideBack">‹ All</span><span class="stitle" id="sideTitle"></span><select id="sideModelSel" class="smodel" title="model for this side chat"></select></div>
+      <div id="sideCtx" hidden></div>
+      <div id="sideStream"></div>
+      <div id="sideCompose">
+        <textarea id="sideTa" rows="1" placeholder="Ask about the selection…"></textarea>
+        <button id="sideSend" title="send">➤</button>
+      </div>
+    </div>
+  </div>
 </div>
+<div id="selpop" hidden><span class="sp-ask" id="spAsk">在辅助对话中提问</span></div>
 <div id="pman" hidden>
   <div id="pmanpanel">
     <div class="fh"><span class="ft">☑ Manage</span><span id="pmansub" class="pmsub"></span>
@@ -6996,7 +7248,7 @@ function route(ev){
   if(ev.kind!=='stream_text')endStream();
   if(ev.kind==='stream_text')addStreamText(ev.text);
   else if(ev.kind==='user_text')addUser(ev.text,ev.images,ev.files,ev.image_files);
-  else if(ev.kind==='ready'){ready=true;cwd=ev.cwd||cwd;curCC=ev.session_id||curCC;if(ev.model)setResolvedModel(ev.model);addNotice('● session ready · '+(ev.model||'')+(ev.effort?' · '+ev.effort+' effort':'')+' · '+(ev.cwd||''));}
+  else if(ev.kind==='ready'){ready=true;cwd=ev.cwd||cwd;curCC=ev.session_id||curCC;sideSync();if(ev.model)setResolvedModel(ev.model);addNotice('● session ready · '+(ev.model||'')+(ev.effort?' · '+ev.effort+' effort':'')+' · '+(ev.cwd||''));}
   else if(ev.kind==='assistant_text')addAsst(ev.text);
   else if(ev.kind==='thinking')addThink(ev.text);
   else if(ev.kind==='tool_use'){if(EDIT_TOOLS.has(ev.tool)){addEditCard(ev);addMarker(ev);}else addTool(ev);}
@@ -7029,6 +7281,7 @@ function markEnded(msg){ready=false;ta.disabled=true;sendBtn.disabled=true;attac
 function onMsg(e){const m=JSON.parse(e.data);
   if(m.type==='hello'){if(m.stamp&&m.stamp!==PAGE_STAMP){try{saveDraft();}catch(_){}location.reload();}return;}   /* served under older code: pick up the new page */
   if(handleNewSessionReply(m))return;
+  if(m.type==='side_list'){if(m.parent===curCC)sideRenderList(m.items||[]);return;}
   if(m.type==='started'){pendingStart=false;sid=m.id;cwd=m.cwd;bindProject(m.cwd);localStorage.setItem(SKEY,sid);loadDraft(sid);
     const account=m.account||'main';if(curAccount!==account){curAccount=account;MODELS=MODELS_BY_ACCT[account]||[];loadModels(false,account);loadUsage();}
     ready=true;setBusy(false);ta.focus();setCurname(m.name||'session');setModelPill(m.model,false);setEffortPill(m.effort);renderCtx(null);statset('ready');
@@ -7062,6 +7315,7 @@ function onMsg(e){const m=JSON.parse(e.data);
     restoredViewId=m.id;
     if(incremental){if(stick){scroll();requestAnimationFrame(scroll);}}
     else{scroll();requestAnimationFrame(scroll);}
+    sideSync();   /* side chats follow the session in view */
     reqList();loadTree();}
   else if(m.type==='detached'){if(!sid){ready=false;ta.disabled=true;sendBtn.disabled=true;attachOff(true);statset('idle');}}
   else if(m.type==='no_session'){localStorage.removeItem(SKEY);sid=null;renderPlanHistPill();restoredViewId='';ready=false;setBusy(false);setCurname('');renderCtx(null);statset('idle');
@@ -7919,7 +8173,7 @@ function restoreView(id){
   restoreChildren($('#edits'),v.edits);restoreChildren($('#gitc'),v.git);
   tools=v.tools||{};editCount=v.editCount||0;queued=v.queued||{};
   planTasks=v.planTasks||[];planCollapsed=!!v.planCollapsed;planHist=v.planHist||[];renderPlanHistPill();trimHidden=Number(v.trimHidden||0);
-  cwd=v.cwd||'';curCC=v.cc||null;compacting=!!v.compacting;
+  cwd=v.cwd||'';curCC=v.cc||null;sideSync();compacting=!!v.compacting;
   tokUp=v.tokUp||0;tokOut=v.tokOut||0;tokShow=!!v.tokShow;
   ready=!!v.ready;                       /* before setBusy: it gates the composer on it */
   bindProject(cwd);setCurname(v.title);renderCtx(v.ctx);curModel=v.model||'default';modelOnce=v.modelOnce||'';setModelPill();setEffortPill(v.effort);
@@ -8047,7 +8301,7 @@ function handleNewSessionReply(m){const request=newSessionRequest;
   if(m.type==='error'){resetNewSessionRequest();$('#newSessionError').textContent=m.error||'Could not start session';return true;}
   if(m.type!=='started')return false;
   // Keep the current view and draft intact until the new process actually exists.
-  stashView(sid);saveDraft();clearUI();restoredViewId='';curCC=null;
+  stashView(sid);saveDraft();clearUI();restoredViewId='';curCC=null;sideSync();
   preferredModel=request.model;preferredMode=request.mode;
   localStorage.setItem('al_model',request.model);localStorage.setItem('al_mode',request.mode);localStorage.setItem('al_effort',request.effort);
   resetNewSessionRequest();$('#newSessionDialog').close();if(window.innerWidth<=860)closeSidebar();return false;}
@@ -8415,8 +8669,16 @@ function toggleSidebar(){const sb=$('#sidebar');
 /* changes drawer (Edits | Git) */
 function drawerOpen(){return $('#drawer').classList.contains('open');}
 function gitTab(){return $('#tabGit').classList.contains('on');}
-function showTab(w){const e=w==='edits';$('#tabEdits').classList.toggle('on',e);$('#tabGit').classList.toggle('on',!e);
-  $('#edits').style.display=e?'':'none';$('#gitc').style.display=e?'none':'';if(e){buildPendingEdits();showAllEdits();}else refreshGit();}
+function sideTab(){return $('#tabSide').classList.contains('on');}
+function showTab(w){
+  const tabs={edits:'#tabEdits',git:'#tabGit',side:'#tabSide'},panes={edits:'#edits',git:'#gitc',side:'#sidec'};
+  if(!(w in panes))w='edits';
+  for(const k in tabs)$(tabs[k]).classList.toggle('on',k===w);
+  for(const k in panes)$(panes[k]).style.display=(k===w)?'':'none';
+  $('#grefresh').style.display=(w==='side')?'none':'';
+  if(w==='edits'){buildPendingEdits();showAllEdits();}
+  else if(w==='git')refreshGit();
+  else if(w==='side')sideOnShow();}
 /* clicking "see Changes" focuses the drawer on just that one file's edit;
    the Edits tab header (or "show all") brings the full list back */
 function showAllEdits(){const ed=$('#edits');const fb=ed.querySelector('.efocus');if(fb)fb.remove();
@@ -8438,6 +8700,166 @@ async function refreshGit(){if(!cwd){$('#gitc').innerHTML='<div class="empty">no
     let h='';if(j.files&&j.files.length)h+=j.files.map(f=>'<div class="gfile"><span class="st">'+esc(f.status)+'</span>'+esc(f.path)+'</div>').join('')+'<hr style="border-color:#333;margin:6px 0">';
     h+=j.diff&&j.diff.trim()?diffHtml(j.diff):'<div class="empty">clean ✓</div>';$('#gitc').innerHTML=h;
   }catch(e){}}
+
+/* ── side chats (辅助对话) ───────────────────────────────────────────────────
+   A hidden, resumable thread started from a text selection in a message. It runs
+   on its OWN WebSocket (each socket binds one session server-side), seeded with
+   the selection and its message, kept out of the left list and off the main
+   agent's context. Rendered compactly in the right drawer, side by side. */
+let sideWs=null, sideWsReady=false, sidePending=null, sideActiveCC=null, sideSid=null, sideBusy=false;
+let sideModel=localStorage.getItem('al_sidemodel')||'sonnet';if(!sideModel||typeof sideModel!=='string')sideModel='sonnet';
+function sideFillModel(val){const sel=$('#sideModelSel');if(!sel)return;const v=val||sideModel||'sonnet';fillSelect(sel,modelOptionsFor(v),v);}
+const sideStream=()=>$('#sideStream');
+function sideWsEnsure(cb){
+  if(sideWs&&sideWs.readyState===1){if(cb)cb();return;}
+  if(sideWs&&sideWs.readyState===0){if(cb)sideWs.addEventListener('open',cb,{once:true});return;}
+  const proto=location.protocol==='https:'?'wss:':'ws:';
+  const sock=new WebSocket(proto+'//'+location.host+'/ws/chat');sideWs=sock;
+  sock.onopen=()=>{if(sideWs!==sock)return;sideWsReady=true;if(cb)cb();};
+  sock.onmessage=e=>{if(sideWs===sock)sideOnMsg(e);};
+  sock.onclose=()=>{if(sideWs===sock){sideWsReady=false;sideWs=null;}};
+  sock.onerror=()=>{try{sock.close();}catch(e){}};
+}
+/* Leaving a side chat closes the drawer's socket to it. The side chat keeps
+   running on the server, but its later events can no longer land in whatever
+   the drawer shows next. Opening or resuming one makes a fresh socket. */
+function sideWsDrop(){const s=sideWs;sideWs=null;sideWsReady=false;sideSid=null;
+  if(s){try{s.close();}catch(e){}}}
+function sideSend(o){if(sideWs&&sideWs.readyState===1)sideWs.send(JSON.stringify(o));}
+function sideOnShow(){if(sideActiveCC||sidePending)return;sideReqList();}
+function sideReqList(){const o={type:'side_list',parent_cc:curCC};
+  if(!curCC)sideRenderList([]);
+  else if(ws&&ws.readyState===1)wsSend(o);
+  else sideWsEnsure(()=>sideSend(o));}
+/* The drawer's side chats belong to the main session in view. When that session
+   changes (switching, a new session, a new session getting its id), leave the
+   old session's side chat or draft and show the new session's list. */
+let sideParent=null;
+function sideSync(){const cc=curCC||null;if(sideParent===cc)return;sideParent=cc;
+  if(!$('#sideChat').hidden||sideActiveCC||sidePending||sideSid)sideShowList();else sideReqList();}
+function sideRenderList(items){
+  const box=$('#sideList');
+  if(!items||!items.length){box.innerHTML='<div class="empty">No side chats yet. Start one above, or select text in a message and choose “在辅助对话中提问”.</div>';$('#sideN').textContent='0';return;}
+  $('#sideN').textContent=''+items.length;
+  box.innerHTML=items.map(it=>'<div class="srow" data-cc="'+esc(it.cc)+'" data-cwd="'+esc(it.cwd||'')+'">'+
+    '<div class="ssel">'+esc(it.title||it.selection||'(side chat)')+'</div>'+
+    '<div class="smeta">'+(it.live?'<span class="dot-live">● live</span> · ':'')+reltime(it.created||0)+' ago'+
+    (it.model?' · '+esc(it.model):'')+'</div></div>').join('');
+  box.querySelectorAll('.srow').forEach(r=>r.onclick=()=>sideOpenExisting(r.dataset.cc,r.dataset.cwd,r.querySelector('.ssel').textContent));
+}
+function sideShowList(){$('#sidec').classList.remove('on-chat');$('#sideList').style.display='';$('#sideChat').hidden=true;
+  sideWsDrop();sideActiveCC=null;sidePending=null;sideBusy=false;sideReqList();}
+function sideShowChat(){$('#sidec').classList.add('on-chat');$('#sideList').style.display='none';$('#sideChat').hidden=false;}
+function sideClearStream(){sideStream().innerHTML='';}
+function askInSide(selection,context){openDrawer('side');sideOpenNew(selection,context);}
+function sideOpenNew(selection,context){
+  sideWsDrop();sideParent=curCC||null;
+  sidePending={selection:selection,context:context};sideActiveCC=null;sideSid=null;sideBusy=false;
+  sideClearStream();sideShowChat();sideFillModel(sideModel);
+  $('#sideTitle').textContent='New side chat';
+  const ctx=$('#sideCtx');if(selection){ctx.hidden=false;ctx.textContent=selection;}else ctx.hidden=true;
+  $('#sideTa').placeholder=selection?'Ask about the selection…':'Ask anything about this project…';
+  $('#sideTa').value='';sideSetBusy(false);setTimeout(()=>$('#sideTa').focus(),30);
+}
+function sideOpenExisting(cc,cwd,title){
+  sideWsDrop();sideParent=curCC||null;
+  sidePending=null;sideActiveCC=cc;sideSid=null;sideBusy=false;
+  sideClearStream();sideShowChat();sideFillModel(sideModel);$('#sideCtx').hidden=true;
+  $('#sideTitle').textContent=title||'side chat';
+  sideAddNotice('loading…');
+  sideWsEnsure(()=>sideSend({type:'resume',cc:cc,cwd:cwd||cwd}));
+}
+function sideComposerSend(){
+  const ta=$('#sideTa');const text=ta.value.trim();if(!text)return;
+  if(sidePending){
+    const p=sidePending;sidePending=null;$('#sideCtx').hidden=true;
+    sideWsEnsure(()=>sideSend({type:'side_new',parent_cc:curCC||null,cwd:cwd,
+      selection:p.selection,context:p.context,text:text,
+      model:sideModel,mode:preferredMode}));
+    sideSetBusy(true);
+  } else if(sideSid){
+    sideSend({type:'user',text:text});
+  } else return;
+  ta.value='';ta.style.height='auto';
+}
+function sideSetBusy(b){sideBusy=b;$('#sideSend').disabled=b;
+  let el=sideStream().querySelector('.sbusy');
+  if(b){if(!el){el=document.createElement('div');el.className='sbusy';el.textContent='…working';sideStream().appendChild(el);sideScroll();}}
+  else if(el)el.remove();}
+function sideScroll(){const s=sideStream();s.scrollTop=s.scrollHeight;}
+function sideNearBottom(){const s=sideStream();return s.scrollHeight-s.scrollTop-s.clientHeight<80;}
+function sideAppend(el){const stick=sideNearBottom();const busy=sideStream().querySelector('.sbusy');
+  if(busy)sideStream().insertBefore(el,busy);else sideStream().appendChild(el);if(stick)sideScroll();}
+function sideAddUser(text){const d=document.createElement('div');d.className='sm u';
+  d.innerHTML='<div class="who">you</div><div class="body">'+sideUserHtml(text)+'</div>';sideAppend(d);}
+function sideAddAsst(text){const d=document.createElement('div');d.className='sm a';
+  d.innerHTML='<div class="who">claude</div><div class="body bubble">'+md(text)+'</div>';typesetMath(d);sideAppend(d);}
+function sideAddTool(ev){const d=document.createElement('div');d.className='stool';d.textContent=sideToolText(ev);sideAppend(d);}
+function sideAddResult(ev){const c=(''+(ev.content||'')).split('\n').find(x=>x.trim())||'';
+  const d=document.createElement('div');d.className='stool res'+(ev.isError?' err':'');
+  d.textContent=(ev.isError?'✖ ':'→ ')+(c.length>160?c.slice(0,160)+'…':c||'(done)');sideAppend(d);}
+function sideAddNotice(t){const d=document.createElement('div');d.className='snotice';d.textContent=t;sideAppend(d);}
+function sideToolText(ev){const inp=ev.input||{};const t=ev.tool||'tool';
+  if(t==='Bash'&&inp.command)return '⚙ '+(inp.command.length>140?inp.command.slice(0,140)+'…':inp.command);
+  if(inp.file_path)return '⚙ '+t+' '+inp.file_path;
+  if(inp.path)return '⚙ '+t+' '+inp.path;
+  if(inp.pattern)return '⚙ '+t+' '+inp.pattern;
+  if(inp.url)return '⚙ '+t+' '+inp.url;
+  return '⚙ '+t;}
+function sideUserHtml(t){const lines=(t||'').split('\n');const out=[];let q=[];
+  const flush=()=>{if(q.length){out.push('<div class="squote">'+q.map(esc).join('<br>')+'</div>');q=[];}};
+  for(const ln of lines){if(/^>\s?/.test(ln))q.push(ln.replace(/^>\s?/,''));else{flush();out.push(esc(ln));}}
+  flush();return out.join('<br>').replace(/<br>(<div)/g,'$1').replace(/(<\/div>)<br>/g,'$1');}
+function sideAddApproval(ev){const c=document.createElement('div');c.className='sappr';c.dataset.aid=ev.aid;
+  c.innerHTML='<div class="q">🔐 '+esc(ev.tool||'tool')+' '+esc(primaryArg(ev.input)||'')+'</div>'+
+    (ev.reason?'<div class="q" style="opacity:.8">'+esc(ev.reason)+'</div>':'')+
+    '<div class="btns"><button class="ok">✓ Approve</button>'+
+    (ev.always?'<button class="all">✓✓ Always</button>':'')+'<button class="no">✕ Deny</button></div>';
+  c.querySelector('.ok').onclick=()=>sideDecide(ev.aid,true,false);
+  const al=c.querySelector('.all');if(al)al.onclick=()=>sideDecide(ev.aid,true,true);
+  c.querySelector('.no').onclick=()=>sideDecide(ev.aid,false,false);sideAppend(c);}
+function sideDecide(aid,allow,always){sideSend({type:'approve',aid:aid,allow:allow,always:!!always});sideResolveApproval(aid,allow,always);}
+function sideResolveApproval(aid,allow,always){const c=sideStream().querySelector('.sappr[data-aid="'+aid+'"]');
+  if(c&&!c.classList.contains('done')){c.classList.add('done');
+    const b=c.querySelector('.btns');if(b)b.textContent=allow?('✓ Approved'+(always?' · always':'')):'✕ Denied';}}
+function sideAddQuestion(ev){const qs=ev.questions||[];const q=qs[0]||{};
+  const c=document.createElement('div');c.className='sappr';c.dataset.aid=ev.aid;
+  let h='<div class="q">❓ '+esc(q.question||q.header||'Question')+'</div><div class="btns">';
+  (q.options||[]).forEach(o=>{h+='<button data-label="'+esc(o.label)+'">'+esc(o.label)+'</button>';});
+  h+='</div>';c.innerHTML=h;
+  c.querySelectorAll('button').forEach(b=>b.onclick=()=>{sideSend({type:'answer',aid:ev.aid,answers:[b.dataset.label]});
+    c.classList.add('done');c.querySelector('.btns').textContent='→ '+b.dataset.label;});
+  sideAppend(c);}
+function sideResolveQuestion(aid){const c=sideStream().querySelector('.sappr[data-aid="'+aid+'"]');
+  if(c&&!c.classList.contains('done'))c.classList.add('done');}
+function sideRoute(ev){
+  switch(ev.kind){
+    case 'user_text':sideAddUser(ev.text||'');break;
+    case 'assistant_text':sideAddAsst(ev.text||'');break;
+    case 'tool_use':sideAddTool(ev);break;
+    case 'tool_result':sideAddResult(ev);break;
+    case 'approval':sideAddApproval(ev);break;
+    case 'approval_resolved':sideResolveApproval(ev.aid,ev.allow,ev.always);break;
+    case 'question':sideAddQuestion(ev);break;
+    case 'question_resolved':sideResolveQuestion(ev.aid);break;
+    case 'turn_start':sideSetBusy(true);break;
+    case 'turn_done':sideSetBusy(false);break;
+    case 'notice':sideAddNotice(ev.text||'');break;
+    case 'ready':if(ev.session_id)sideActiveCC=ev.session_id;break;   /* a new side chat learns its own id */
+    default:break;}
+}
+function sideOnMsg(e){let m;try{m=JSON.parse(e.data);}catch(_){return;}
+  if(m.type==='hello'||m.type==='favorites'||m.type==='projects'||m.type==='sessions')return;
+  if(m.type==='side_list'){if(m.parent===curCC||!curCC)sideRenderList(m.items||[]);return;}
+  if(m.type==='started'){sideSid=m.id;sideActiveCC=m.cc||null;sideSetBusy(false);if(m.model&&m.model!=='default')sideFillModel(m.model);sideReqList();return;}
+  if(m.type==='attached'){sideSid=m.id;sideActiveCC=m.cc||sideActiveCC;sideClearStream();
+    if(m.model&&m.model!=='default')sideFillModel(m.model);
+    (m.events||[]).forEach(sideRoute);sideSetBusy(!!m.busy);sideScroll();return;}
+  if(m.type==='events'){(m.events||[]).forEach(sideRoute);return;}
+  if(m.type==='error'){sideAddNotice('⚠ '+(m.error||'error'));sideSetBusy(false);return;}
+  if(m.type==='no_session'){sideAddNotice('this side chat is no longer running');sideSetBusy(false);return;}
+  if(m.type==='exit'||m.type==='ended'){sideSetBusy(false);return;}
+}
 
 /* bindings */
 ta.addEventListener('input',()=>{ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,160)+'px';
@@ -8700,12 +9122,50 @@ window.addEventListener('resize',closeCardMenu);
 window.addEventListener('scroll',closeCardMenu,true);
 $('#tabEdits').onclick=()=>showTab('edits');
 $('#tabGit').onclick=()=>showTab('git');
+$('#tabSide').onclick=()=>showTab('side');
+$('#sideBack').onclick=sideShowList;
+$('#sideSend').onclick=sideComposerSend;
+$('#sideNewBtn').onclick=()=>{openDrawer('side');
+  if(!curCC){$('#sideList').innerHTML='<div class="empty">Send a first message in this session, then start a side chat.</div>';return;}
+  sideOpenNew('','');};
+$('#sideModelSel').onchange=()=>{const v=$('#sideModelSel').value||'sonnet';sideModel=v;localStorage.setItem('al_sidemodel',v);if(sideSid&&sideWs&&sideWs.readyState===1)sideSend({type:'set_model',model:v});};
+$('#sideTa').addEventListener('input',()=>{const t=$('#sideTa');t.style.height='auto';t.style.height=Math.min(t.scrollHeight,140)+'px';});
+$('#sideTa').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sideComposerSend();}});
+/* selection → "在辅助对话中提问" popup over the conversation */
+function updateSelPop(){
+  const pop=$('#selpop'),sel=window.getSelection();
+  if(!sel||sel.isCollapsed){pop.hidden=true;return;}
+  const text=sel.toString();if(!text.trim()){pop.hidden=true;return;}
+  let n=sel.anchorNode;n=n&&(n.nodeType===1?n:n.parentNode);
+  if(!n||!stream.contains(n)){pop.hidden=true;return;}
+  let r;try{r=sel.getRangeAt(0).getBoundingClientRect();}catch(_){pop.hidden=true;return;}
+  if(!r||(!r.width&&!r.height)){pop.hidden=true;return;}
+  pop.hidden=false;const pw=pop.offsetWidth||130,ph=pop.offsetHeight||30;
+  let left=Math.max(6,Math.min(r.left+r.width/2-pw/2,innerWidth-pw-6)),top=r.top-ph-6;
+  if(top<4)top=r.bottom+6;pop.style.left=left+'px';pop.style.top=top+'px';}
+stream.addEventListener('mouseup',()=>setTimeout(updateSelPop,0));
+stream.addEventListener('scroll',()=>{$('#selpop').hidden=true;});
+document.addEventListener('mousedown',e=>{if(!e.target.closest('#selpop')&&!e.target.closest('#stream'))$('#selpop').hidden=true;});
+/* mousedown only keeps the selection; the work happens on click. Hiding the popup
+   on mousedown sent the click to the message underneath, and the drawer's
+   outside-click rule closed it again straight after it opened. */
+$('#spAsk').addEventListener('mousedown',e=>e.preventDefault());
+$('#spAsk').addEventListener('click',e=>{e.preventDefault();e.stopPropagation();
+  const sel=window.getSelection();const text=sel?sel.toString().trim():'';
+  if(!text){$('#selpop').hidden=true;return;}
+  let n=sel.anchorNode;n=n&&(n.nodeType===1?n:n.parentNode);
+  const msg=n&&n.closest?n.closest('.msg'):null;
+  const context=((msg?msg.innerText:text)||'').trim();
+  $('#selpop').hidden=true;try{sel.removeAllRanges();}catch(_){}
+  askInSide(text,context);});
 $('#dclose').onclick=()=>$('#drawer').classList.remove('open');
 /* dismiss the Changes drawer on outside-click (chat, sidebar, composer…) or Escape,
    so you don't have to aim for the ✕. The .emark "see Changes" markers are the
    openers → excluded, else the opening click would immediately re-close it. */
 document.addEventListener('click',e=>{
-  if(drawerOpen()&&!e.target.closest('#drawer')&&!e.target.closest('.emark'))$('#drawer').classList.remove('open');});
+  /* a side chat stays open beside the main conversation: clicking, selecting or
+     typing there must not close it (✕ and Escape still do) */
+  if(drawerOpen()&&!sideTab()&&!e.target.closest('#drawer')&&!e.target.closest('.emark')&&!e.target.closest('#selpop'))$('#drawer').classList.remove('open');});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&drawerOpen())$('#drawer').classList.remove('open');});
 $('#grefresh').onclick=refreshGit;
 
