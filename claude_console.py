@@ -6613,8 +6613,9 @@ body.tabdrag,body.tabdrag .stab{cursor:grabbing}
 @media(max-width:480px){.session-dialog{padding:14px}.session-dialog .dialog-settings{grid-template-columns:1fr}
   .session-dialog .dialog-icon{width:40px;height:40px}.session-dialog .dialog-actions button{min-height:40px}}
 @media(max-width:860px){
-  #sidebar{position:fixed;left:0;top:0;bottom:0;z-index:40;transform:translateX(-100%);transition:transform .34s cubic-bezier(.32,.72,0,1);width:min(310px,86vw);box-shadow:2px 0 14px rgba(0,0,0,.5)}
-  #sidebar.open{transform:none}
+  #sidebar{position:fixed;left:0;top:0;bottom:0;z-index:40;transform:translateX(-100%);transition:transform .34s cubic-bezier(.32,.72,0,1);width:min(310px,86vw)}
+  /* the shadow only while open: closed, it spilled a grey strip onto the page's left edge */
+  #sidebar.open{transform:none;box-shadow:2px 0 14px rgba(0,0,0,.5)}
   #sidebar.collapsed{display:flex}
   #sb-backdrop.show{display:block;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:35}
   #sbresize,#drresize{display:none}
