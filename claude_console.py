@@ -5842,11 +5842,13 @@ html.in-desktop-app #prail{display:none!important}
 #sideNewBtn{display:inline-block;padding:5px 10px;font-size:12px;border:1px solid var(--acc);border-radius:7px;color:var(--acc);cursor:pointer}
 #sideNewBtn:hover{background:var(--acc);color:#fff}
 #sideBar .smodel{flex-shrink:0;max-width:42%;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:6px;font-size:11px;padding:2px 4px;height:24px;cursor:pointer}
-#sideList .srow{padding:9px 12px;border-bottom:1px solid var(--line);cursor:pointer}
-#sideList .srow:hover{background:var(--bg2)}
-#sideList .srow .ssel{font-size:12.5px;color:var(--fg);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-#sideList .srow .smeta{font-size:11px;color:var(--mut);margin-top:3px}
-#sideList .srow .smeta .dot-live{color:var(--ok,#3fb950)}
+/* own class names: the left list's .srow/.smeta rules (a flex row) would put the
+   time and model in a narrow column beside the title */
+#sideList .scrow{display:block;padding:9px 12px;border-bottom:1px solid var(--line);cursor:pointer}
+#sideList .scrow:hover{background:var(--bg2)}
+#sideList .scrow .sctitle{font-size:12.5px;color:var(--fg);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}
+#sideList .scrow .scmeta{display:block;font-size:11px;color:var(--mut);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#sideList .scrow .scmeta .dot-live{color:var(--ok,#3fb950)}
 #sideChat{flex:1;min-height:0;display:flex;flex-direction:column}
 #sideChat[hidden]{display:none}   /* its display:flex would beat the hidden attribute */
 #sideBar{display:flex;gap:8px;align-items:center;padding:6px 10px;border-bottom:1px solid var(--line);background:var(--bg2);flex-shrink:0}
@@ -6558,7 +6560,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
   <div class="dc" id="gitc" style="display:none"><div class="empty">—</div></div>
   <div class="dc" id="sidec" style="display:none">
     <div id="sideNewRow"><span class="btn" id="sideNewBtn">+ New side chat</span></div>
-    <div id="sideList"><div class="empty">No side chats yet. Start one above, or select text in a message and choose “在辅助对话中提问”.</div></div>
+    <div id="sideList"><div class="empty">No side chats yet. Start one above, or select text in a message and choose “Ask in side chat”.</div></div>
     <div id="sideChat" hidden>
       <div id="sideBar"><span class="sback" id="sideBack">‹ All</span><span class="stitle" id="sideTitle"></span><select id="sideModelSel" class="smodel" title="model for this side chat"></select></div>
       <div id="sideCtx" hidden></div>
@@ -6578,7 +6580,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
   <button class="prb" id="prSet" title="Settings"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg></button>
   <button class="prb" id="prGit" title="Git diff"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="7" cy="6" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="7" cy="18" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="17" cy="9" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M7 8v8 M17 11c0 3-4 3-8.5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
 </nav>
-<div id="selpop" hidden><span class="sp-ask" id="spAsk">在辅助对话中提问</span></div>
+<div id="selpop" hidden><span class="sp-ask" id="spAsk">Ask in side chat</span></div>
 <div id="pman" hidden>
   <div id="pmanpanel">
     <div class="fh"><span class="ft">☑ Manage</span><span id="pmansub" class="pmsub"></span>
@@ -9042,13 +9044,13 @@ function sideSync(){const cc=curCC||null;if(sideParent===cc)return;sideParent=cc
   if(!$('#sideChat').hidden||sideActiveCC||sidePending||sideSid)sideShowList();else sideReqList();}
 function sideRenderList(items){
   const box=$('#sideList');
-  if(!items||!items.length){box.innerHTML='<div class="empty">No side chats yet. Start one above, or select text in a message and choose “在辅助对话中提问”.</div>';$('#sideN').textContent='0';return;}
+  if(!items||!items.length){box.innerHTML='<div class="empty">No side chats yet. Start one above, or select text in a message and choose “Ask in side chat”.</div>';$('#sideN').textContent='0';return;}
   $('#sideN').textContent=''+items.length;
-  box.innerHTML=items.map(it=>'<div class="srow" data-cc="'+esc(it.cc)+'" data-cwd="'+esc(it.cwd||'')+'">'+
-    '<div class="ssel">'+esc(it.title||it.selection||'(side chat)')+'</div>'+
-    '<div class="smeta">'+(it.live?'<span class="dot-live">● live</span> · ':'')+reltime(it.created||0)+' ago'+
+  box.innerHTML=items.map(it=>'<div class="scrow" data-cc="'+esc(it.cc)+'" data-cwd="'+esc(it.cwd||'')+'">'+
+    '<div class="sctitle">'+esc(it.title||it.selection||'(side chat)')+'</div>'+
+    '<div class="scmeta">'+(it.live?'<span class="dot-live">● live</span> · ':'')+reltime(it.created||0)+' ago'+
     (it.model?' · '+esc(it.model):'')+'</div></div>').join('');
-  box.querySelectorAll('.srow').forEach(r=>r.onclick=()=>sideOpenExisting(r.dataset.cc,r.dataset.cwd,r.querySelector('.ssel').textContent));
+  box.querySelectorAll('.scrow').forEach(r=>r.onclick=()=>sideOpenExisting(r.dataset.cc,r.dataset.cwd,r.querySelector('.sctitle').textContent));
 }
 function sideShowList(){$('#sidec').classList.remove('on-chat');$('#sideList').style.display='';$('#sideChat').hidden=true;
   sideWsDrop();sideActiveCC=null;sidePending=null;sideBusy=false;sideReqList();}
@@ -9482,7 +9484,7 @@ $('#sideNewBtn').onclick=()=>{openDrawer('side');
 $('#sideModelSel').onchange=()=>{const v=$('#sideModelSel').value||'sonnet';sideModel=v;localStorage.setItem('al_sidemodel',v);if(sideSid&&sideWs&&sideWs.readyState===1)sideSend({type:'set_model',model:v});};
 $('#sideTa').addEventListener('input',()=>{const t=$('#sideTa');t.style.height='auto';t.style.height=Math.min(t.scrollHeight,140)+'px';});
 $('#sideTa').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sideComposerSend();}});
-/* selection → "在辅助对话中提问" popup over the conversation */
+/* selection → "Ask in side chat" popup over the conversation */
 /* selPopData keeps what was selected when the popup appeared: on a touch screen the
    tap on the popup can clear the selection before its click arrives. */
 let selTouch=false, selPopData=null, selAsking=false, selT=0;
