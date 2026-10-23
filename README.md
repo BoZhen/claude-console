@@ -139,7 +139,8 @@ which is the whole point.
   `POST /api/notify/approve` (`{"session", "aid", "allow", "always"}`) answers an
   approval without opening the session. The Android app turns these into
   notifications with Approve / Deny buttons.
-- **Voice input** — a 🎙 button beside 📎 (or **Alt+M**) records, transcribes on
+- **Voice input** (off until turned on in Settings → Voice) — a 🎙 button beside 📎
+  (or **Alt+M**) records, transcribes on
   *your* machine with [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
   or on another machine that keeps a speech model loaded,
   and shows a revisable draft while you speak. Pressing the mic prewarms the model;
@@ -202,10 +203,18 @@ CLAUDE_CONSOLE_BIND=0.0.0.0 CLAUDE_CONSOLE_AUTH=me:secret python claude_console.
 Open `http://<host>:7703`, pick a project dir, and start chatting; the change
 cards and the **Git diff** drawer update live as the agent works.
 
-Voice input is optional and off by default. To turn it on, install
-`faster-whisper` (and `opencc`, if you want Chinese script conversion) into
-*some* Python — it does not have to be the one running the console — and point
-`CLAUDE_CONSOLE_TRANSCRIBE_PYTHON` at it:
+Voice input is optional and off by default: there is no 🎙 button until it is
+turned on. Install `faster-whisper` (and `opencc`, if you want Chinese script
+conversion) into *some* Python — it does not have to be the one running the
+console — then turn it on in **Settings → Voice**: the model, that Python, the
+device, the language, or a command that reaches a model on another machine.
+**Save and test** loads the model once and reports how long it took. These are
+the server's settings, for every device; they are saved in
+`~/.claude/console-voice.json` and apply at once, without a restart.
+
+The same settings can come from the environment instead. A field saved in
+Settings wins over its variable; a field never saved there follows the
+variable:
 
 ```bash
 CLAUDE_CONSOLE_TRANSCRIBE=1 \

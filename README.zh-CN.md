@@ -109,7 +109,7 @@
   每个已被回答的（无论在哪儿回答）、每个结束的回合（附回复开头）和每个结束的 session。
   `POST /api/notify/approve`（`{"session", "aid", "allow", "always"}`）不用打开 session
   就能批准或拒绝。Android app 把这些变成带 Approve / Deny 按钮的通知。
-- **语音输入** —— 📎 旁边的 🎙 按钮（或 **Alt+M**）开始录音，在*你自己*的机器上用
+- **语音输入**（在 Settings → Voice 里打开之前没有）—— 📎 旁边的 🎙 按钮（或 **Alt+M**）开始录音，在*你自己*的机器上用
   [faster-whisper](https://github.com/SYSTRAN/faster-whisper) 实时转写，也可以交给另一台
   常驻加载语音模型的机器。按下麦克风即
   预热模型；已确认的词语和标点保持不变，最近 10 个中文字符仍可修正，停止后会用完整
@@ -160,9 +160,14 @@ CLAUDE_CONSOLE_BIND=0.0.0.0 CLAUDE_CONSOLE_AUTH=me:secret python claude_console.
 打开 `http://<host>:7703`，选一个项目目录，开始对话；agent 干活时变更卡片和
 **Git diff** 抽屉会实时更新。
 
-语音输入是可选的，默认关闭。要打开它，请在*某个* Python 中安装 `faster-whisper`
-（如果需要中文字形转换，再装 `opencc`）—— 那不必是运行 console 的那个 Python ——
-然后让 `CLAUDE_CONSOLE_TRANSCRIBE_PYTHON` 指向它：
+语音输入是可选的，默认关闭：打开之前没有 🎙 按钮。请在*某个* Python 中安装
+`faster-whisper`（如果需要中文字形转换，再装 `opencc`）—— 那不必是运行 console 的那个
+Python —— 然后在 **Settings → Voice** 里打开它：填模型、那个 Python、设备、语言，或者一条
+连到另一台机器上模型的命令。**Save and test** 会加载一次模型并报告用时。这些是服务器的
+设置，对所有设备生效；保存在 `~/.claude/console-voice.json`，立即生效，不用重启。
+
+同样的设置也可以来自环境变量。在 Settings 里保存过的字段优先于对应的变量；没在那里保存过的
+字段跟随变量：
 
 ```bash
 CLAUDE_CONSOLE_TRANSCRIBE=1 \

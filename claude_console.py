@@ -2436,7 +2436,131 @@ class RemoteTranscriber:
             self._close_locked()
 
 
-_TRANSCRIBER = RemoteTranscriber() if TRANSCRIBE_REMOTE else TranscriberManager()
+# ── voice settings: Settings > Voice input, over the environment ──
+# The CLAUDE_CONSOLE_TRANSCRIBE_* environment gives the starting values. A field
+# saved from Settings > Voice input goes to VOICE_FILE and wins over the
+# environment, field by field; a field never saved there keeps following the
+# environment. Saving applies at once: the module globals above are reassigned and
+# the transcriber is rebuilt, so no restart is needed.
+VOICE_FILE = os.path.join(HOME, ".claude", "console-voice.json")
+_VOICE_GLOBALS = {   # settings key -> the module global it sets
+    "enabled": "TRANSCRIBE_ENABLED", "python": "TRANSCRIBE_PYTHON",
+    "model": "TRANSCRIBE_MODEL", "device": "TRANSCRIBE_DEVICE",
+    "device_index": "TRANSCRIBE_DEVICE_INDEX", "compute_type": "TRANSCRIBE_COMPUTE_TYPE",
+    "language": "TRANSCRIBE_LANGUAGE", "chinese_conversion": "TRANSCRIBE_CHINESE_CONVERSION",
+    "pause_punctuation": "TRANSCRIBE_PAUSE_PUNCTUATION", "library_path": "TRANSCRIBE_LD_LIBRARY_PATH",
+    "remote": "TRANSCRIBE_REMOTE", "context": "TRANSCRIBE_CONTEXT", "ffmpeg": "TRANSCRIBE_FFMPEG",
+}
+# what the environment said at start, before any saved setting was applied
+_VOICE_ENV = {k: globals()[g] for k, g in _VOICE_GLOBALS.items()}
+_VOICE_DEVICES = ("auto", "cuda", "cpu")
+_VOICE_CONVERSIONS = ("none", "t2s", "tw2sp")
+
+
+def _voice_text(value, name, limit=500):
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(name + " must be text")
+    value = value.strip()
+    if len(value) > limit or any(c in value for c in "\0\r\n"):
+        raise ValueError(name + " is too long or has a line break")
+    return value
+
+
+def _voice_clean(raw):
+    """Settings > Voice input's fields, checked; ValueError names the bad one."""
+    if not isinstance(raw, dict):
+        raise ValueError("invalid settings")
+    out = {"enabled": bool(raw.get("enabled"))}
+    engine = raw.get("engine") or "local"
+    if engine not in ("local", "remote"):
+        raise ValueError("the engine is local or remote")
+    out["python"] = os.path.expanduser(_voice_text(raw.get("python"), "Python")) or sys.executable
+    out["model"] = os.path.expanduser(_voice_text(raw.get("model"), "Model"))
+    out["device"] = raw.get("device") or "auto"
+    if out["device"] not in _VOICE_DEVICES:
+        raise ValueError("the device is auto, cuda or cpu")
+    try:
+        out["device_index"] = int(raw.get("device_index") or 0)
+    except (TypeError, ValueError):
+        raise ValueError("the GPU number must be a whole number")
+    if not 0 <= out["device_index"] <= 63:
+        raise ValueError("the GPU number must be between 0 and 63")
+    out["compute_type"] = _voice_text(raw.get("compute_type"), "Compute type", 32) or "default"
+    if not re.fullmatch(r"[a-z0-9_]+", out["compute_type"]):
+        raise ValueError("the compute type is a word such as default, float16 or int8")
+    out["language"] = _voice_text(raw.get("language"), "Language", 16)
+    if out["language"] and not re.fullmatch(r"[A-Za-z]{2,3}(?:[-_][A-Za-z]{2,4})?", out["language"]):
+        raise ValueError("the language is a code such as zh or en, or empty for automatic")
+    out["chinese_conversion"] = raw.get("chinese_conversion") or "none"
+    if out["chinese_conversion"] not in _VOICE_CONVERSIONS:
+        raise ValueError("the Chinese conversion is none, t2s or tw2sp")
+    out["pause_punctuation"] = bool(raw.get("pause_punctuation"))
+    out["library_path"] = _voice_text(raw.get("library_path"), "Library path", 2000)
+    out["context"] = _voice_text(raw.get("context"), "Words to expect", 2000)
+    out["ffmpeg"] = (os.path.expanduser(_voice_text(raw.get("ffmpeg"), "ffmpeg"))
+                     or shutil.which("ffmpeg") or "")
+    remote = _voice_text(raw.get("remote"), "Command", 2000)
+    if engine == "remote":
+        try:
+            argv = shlex.split(remote)
+        except ValueError:
+            argv = []
+        if not argv:
+            raise ValueError("enter the command that reaches the transcription host")
+        out["remote"] = remote
+    else:
+        out["remote"] = ""
+    return out
+
+
+def _voice_saved():
+    """The fields saved from Settings, as stored; {} without the file."""
+    try:
+        with open(VOICE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in data.items() if k in _VOICE_GLOBALS} if isinstance(data, dict) else {}
+
+
+def _voice_effective():
+    """The settings in effect: the environment, then what Settings saved. A file
+    edited by hand into something invalid is checked like a save would be; if it
+    fails, the values are used as they are, as the environment always was."""
+    merged = {**_VOICE_ENV, **_voice_saved()}
+    try:
+        return _voice_clean({**merged, "engine": "remote" if merged.get("remote") else "local"})
+    except ValueError:
+        return merged
+
+
+def _apply_voice_settings(settings):
+    """Point the TRANSCRIBE_* globals at these settings and rebuild the
+    transcriber; the old one's worker or connection is closed."""
+    global _TRANSCRIBER
+    for k, g in _VOICE_GLOBALS.items():
+        if k in settings:
+            globals()[g] = settings[k]
+    old = globals().get("_TRANSCRIBER")
+    _TRANSCRIBER = RemoteTranscriber() if TRANSCRIBE_REMOTE else TranscriberManager()
+    if old is not None:
+        try:
+            old.shutdown()
+        except Exception:
+            pass
+
+
+def _voice_settings_reply():
+    eff = _voice_effective()
+    shown = {k: eff[k] for k in _VOICE_GLOBALS}
+    shown["engine"] = "remote" if eff.get("remote") else "local"
+    return {"ok": True, "settings": shown, "saved": sorted(_voice_saved()),
+            "file": VOICE_FILE.replace(HOME, "~", 1), "status": _transcribe_status()}
+
+
+_apply_voice_settings(_voice_effective())
 # The GPU fits one transcription at a time; a second caller is told to wait
 # rather than queued behind a lock holding an open request.
 _TRANSCRIBER_GATE = threading.BoundedSemaphore(1)
@@ -2446,6 +2570,50 @@ _AUDIO_TYPES = {
     "audio/ogg": ".ogg", "audio/wav": ".wav", "audio/x-wav": ".wav",
     "application/octet-stream": ".audio",
 }
+
+
+class VoiceSettingsHandler(AuthMixin, tornado.web.RequestHandler):
+    """Settings > Voice input: GET the settings in effect and the status, POST
+    new ones (same-origin JSON only: the command and the interpreter path are
+    run by this server)."""
+
+    def get(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Cache-Control", "no-store")
+        self.write(_voice_settings_reply())
+
+    def post(self):
+        if not self._ok_auth():
+            return
+        body = _read_json_post(self)
+        if body is None:
+            return
+        try:
+            clean = _voice_clean(body.get("settings"))
+        except ValueError as exc:
+            self.set_status(400)
+            self.write({"error": str(exc)})
+            return
+        # never swap the transcriber under a running transcription
+        if not _TRANSCRIBER_GATE.acquire(blocking=False):
+            self.set_status(409)
+            self.write({"error": "a transcription is running; save again when it has finished"})
+            return
+        try:
+            os.makedirs(os.path.dirname(VOICE_FILE), exist_ok=True)
+            tmp = VOICE_FILE + ".tmp"
+            with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
+                json.dump(clean, f, indent=1)
+            os.replace(tmp, VOICE_FILE)
+            _apply_voice_settings(_voice_effective())
+        except OSError as exc:
+            self.set_status(500)
+            self.write({"error": "could not save: %s" % exc})
+            return
+        finally:
+            _TRANSCRIBER_GATE.release()
+        self.write(_voice_settings_reply())
 
 
 class TranscribeWarmupHandler(AuthMixin, tornado.web.RequestHandler):
@@ -5754,6 +5922,7 @@ li.mdl1{margin-left:1.4em} li.mdl2{margin-left:2.8em} li.mdl3{margin-left:4.2em}
 #voiceBtn:disabled .voice-mic-icon{filter:grayscale(1)}
 #voiceBtn svg{width:19px;height:19px;display:block;fill:none;stroke:currentColor;
   stroke-width:2.25;stroke-linecap:round;stroke-linejoin:round}
+#voiceBtn[hidden]{display:none}   /* only while voice input is on (Settings > Voice) */
 #voiceBtn.recording{color:var(--delfg);border-color:var(--del);background:var(--nobg)}
 #voiceBtn.recording:hover:not(:disabled){background:var(--nobg)}
 /* status line above the composer: recording clock, then transcribing, then gone */
@@ -6218,6 +6387,22 @@ body.tabdrag,body.tabdrag .stab{cursor:grabbing}
 .acc-grid input:focus{outline:none;border-color:var(--acc)}
 .acc-grid #accdir{font-family:var(--fmono);font-size:12.5px}
 .acc-actions{display:flex;align-items:center;gap:12px;margin-top:14px}
+/* Settings > Voice */
+.acc-grid select{width:100%;height:34px;padding:4px 7px;border:1px solid var(--line);border-radius:7px;
+  background:var(--bg);color:var(--fg);font:inherit;font-size:13px}
+.acc-grid select:focus{outline:none;border-color:var(--acc)}
+.vs-on{display:flex;align-items:center;gap:8px;font-weight:650;font-size:13.5px;margin-bottom:8px;cursor:pointer}
+.vs-engine{display:flex;flex-wrap:wrap;gap:6px 18px;margin:0 0 14px;font-size:13px}
+.vs-engine label,.vs-check label{display:flex;align-items:center;gap:6px;cursor:pointer;color:var(--fg)}
+.vs-check{display:flex;align-items:flex-end;padding-bottom:8px}
+.acc-grid .vs-check label{font-size:13px;color:var(--fg);margin:0}
+.acc-grid input[type="checkbox"]{width:auto;height:auto;padding:0}
+#vsLocal input,#vsRemote input{font-family:var(--fmono);font-size:12.5px}
+.vs-state{margin:14px 0 0}
+.vs-state.ok{color:var(--add)}
+.vs-state.bad{color:var(--delfg)}
+.vs-file{margin:10px 0 0}
+#vsErr{flex:1;min-width:0;font-size:12px;color:var(--delfg);overflow-wrap:anywhere}
 #accerr{flex:1;min-width:0;font-size:12px;color:var(--delfg);overflow-wrap:anywhere}
 #accerr[hidden]{display:block;visibility:hidden}
 @media(max-width:480px){
@@ -6544,7 +6729,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
       <div class="wrap2">
       <input type="file" id="filePick" accept="image/png,image/jpeg,image/gif,image/webp,text/*,application/json,application/xml,application/javascript,application/x-yaml,application/pdf,.py,.ipynb,.js,.jsx,.ts,.tsx,.json,.jsonl,.yaml,.yml,.toml,.md,.rst,.tex,.bib,.c,.h,.cpp,.hpp,.cc,.rs,.go,.java,.kt,.sh,.bash,.zsh,.fish,.sql,.html,.css,.scss,.xml,.csv,.tsv,.ini,.cfg,.conf,.log,.diff,.patch,.mk,.m,.jl,.r,.f90,.cu,.pdf" multiple hidden>
       <button id="attachBtn" type="button" title="Attach images or files" aria-label="Attach files" disabled>📎</button>
-      <button id="voiceBtn" type="button" title="Voice input" aria-label="Start voice input" disabled><img class="voice-mic-icon" src="/static/icons/fluent-studio-microphone.png" alt=""></button>
+      <button id="voiceBtn" type="button" title="Voice input" aria-label="Start voice input" disabled hidden><img class="voice-mic-icon" src="/static/icons/fluent-studio-microphone.png" alt=""></button>
       <div id="atac"></div>
       <textarea id="ta" rows="1" placeholder="Type a message…" disabled></textarea>
       <button id="stop" title="interrupt / stop" style="display:none">⏹</button>
@@ -6615,6 +6800,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
   <div class="set-tabs" role="tablist">
     <button class="set-tab" type="button" role="tab" data-pane="appearance" aria-selected="true">Appearance</button>
     <button class="set-tab" type="button" role="tab" data-pane="accounts" aria-selected="false">Accounts</button>
+    <button class="set-tab" type="button" role="tab" data-pane="voice" aria-selected="false">Voice</button>
     <button class="set-tab" type="button" role="tab" data-pane="about" aria-selected="false">About</button>
   </div>
   <div class="set-body">
@@ -6656,6 +6842,42 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
           <div class="acc-actions"><span id="accerr" role="alert" hidden></span>
             <button id="accadd" class="set-btn primary" type="submit">Add account</button></div>
         </form>
+      </div>
+    </section>
+    <section class="set-pane" data-pane="voice" role="tabpanel" hidden>
+      <div class="set-group">
+        <label class="vs-on"><input type="checkbox" id="vsOn"> Voice input</label>
+        <div class="set-hint">Dictation into the message box: the browser records, and a Whisper model
+          (faster-whisper) on this server's computer, or on another machine, turns the speech into text you
+          can edit before sending. The 🎙 button next to 📎 appears only while this is on. These are the
+          server's settings, for every device.</div>
+        <div id="vsFields" hidden>
+          <div class="vs-engine" role="radiogroup" aria-label="Where the model runs">
+            <label><input type="radio" name="vsEngine" value="local"> On this server</label>
+            <label><input type="radio" name="vsEngine" value="remote"> On another machine</label>
+          </div>
+          <div class="acc-grid" id="vsLocal">
+            <div class="acc-wide"><label for="vsModel">Model</label><input id="vsModel" placeholder="a model name such as large-v3, or a model folder" spellcheck="false"></div>
+            <div class="acc-wide"><label for="vsPython">Python that has faster-whisper</label><input id="vsPython" placeholder="/path/to/env/bin/python" spellcheck="false"></div>
+            <div><label for="vsDevice">Device</label><select id="vsDevice"><option value="auto">automatic</option><option value="cuda">GPU (CUDA)</option><option value="cpu">CPU</option></select></div>
+            <div><label for="vsIndex">GPU number</label><input id="vsIndex" type="number" min="0" max="63" step="1"></div>
+            <div><label for="vsCompute">Compute type</label><input id="vsCompute" placeholder="default" spellcheck="false"></div>
+            <div><label for="vsLang">Language</label><input id="vsLang" placeholder="automatic" spellcheck="false"></div>
+            <div><label for="vsZh">Chinese characters</label><select id="vsZh"><option value="none">as recognized</option><option value="t2s">simplified (t2s)</option><option value="tw2sp">simplified, mainland words (tw2sp)</option></select></div>
+            <div class="vs-check"><label><input type="checkbox" id="vsPause"> Punctuation from pauses</label></div>
+            <div class="acc-wide"><label for="vsLib">Library path for the GPU libraries</label><input id="vsLib" placeholder="optional" spellcheck="false"></div>
+          </div>
+          <div class="acc-grid" id="vsRemote" hidden>
+            <div class="acc-wide"><label for="vsCmd">Command that reaches the transcription host</label><input id="vsCmd" placeholder="ssh gpu-host asr-relay" spellcheck="false"></div>
+            <div class="acc-wide"><label for="vsCtx">Words to expect</label><input id="vsCtx" placeholder="optional: names and terms you often say" spellcheck="false"></div>
+            <div class="acc-wide"><label for="vsFfmpeg">ffmpeg</label><input id="vsFfmpeg" placeholder="ffmpeg" spellcheck="false"></div>
+          </div>
+        </div>
+        <div class="set-hint vs-state" id="vsState" role="status"></div>
+        <div class="acc-actions"><span id="vsErr" role="alert" hidden></span>
+          <button class="set-btn" id="vsTest" type="button" hidden>Save and test</button>
+          <button class="set-btn primary" id="vsSave" type="button">Save</button></div>
+        <div class="set-hint vs-file" id="vsFile"></div>
       </div>
     </section>
     <section class="set-pane" data-pane="about" role="tabpanel" hidden>
@@ -8729,6 +8951,9 @@ function syncVoiceComposerState(){const locked=voiceLocksComposer(),enabled=!ta.
   sendBtn.title=locked?'Stop the recording first — dictation is still being revised':'';}
 function syncVoiceButton(){if(typeof voiceBtn==='undefined'||!voiceBtn)return;
   const reason=voiceUnavailableReason(),recording=voiceJob&&voiceJob.mode==='recording';
+  /* no button at all unless voice input is on (Settings > Voice); on but not
+     ready, it shows greyed with the reason */
+  voiceBtn.hidden=!voiceCaps.enabled&&!recording;
   voiceBtn.disabled=!!reason||(!ready&&!recording)||!!(voiceJob&&voiceJob.mode!=='recording');
   voiceBtn.classList.toggle('recording',!!recording);voiceBtn.innerHTML=recording?VOICE_STOP_ICON:VOICE_MIC_ICON;
   voiceBtn.title=reason||((recording?'Stop and transcribe':'Voice input')+' · Alt+M');
@@ -9218,7 +9443,7 @@ $('#voiceCancel').onclick=cancelVoiceInput;
 /* a live recording must not survive the page */
 window.addEventListener('beforeunload',cancelVoiceInput);
 /* capture phase: the textarea has the focus while dictating */
-document.addEventListener('keydown',e=>{if(e.repeat||!e.altKey||e.ctrlKey||e.metaKey||e.shiftKey||e.key.toLowerCase()!=='m')return;
+document.addEventListener('keydown',e=>{if(e.repeat||!e.altKey||e.ctrlKey||e.metaKey||e.shiftKey||e.key.toLowerCase()!=='m'||voiceBtn.hidden)return;
   e.preventDefault();e.stopPropagation();toggleVoiceInput();},true);
 /* clearing the value lets the same file be picked twice in a row */
 $('#filePick').onchange=e=>{takeFiles(e.target.files);e.target.value='';};
@@ -9338,11 +9563,59 @@ function settingsOpen(){const d=$('#settings');return !!(d&&d.open);}
 function settingsTab(name){
   document.querySelectorAll('#settings .set-tab').forEach(b=>b.setAttribute('aria-selected',String(b.dataset.pane===name)));
   document.querySelectorAll('#settings .set-pane').forEach(p=>{p.hidden=p.dataset.pane!==name;});}
-function openSettings(tab){buildThemeGrid();syncThemeGrid();syncFs();accErr('');renderAccounts();renderAbout();
+function openSettings(tab){buildThemeGrid();syncThemeGrid();syncFs();accErr('');renderAccounts();renderAbout();loadVoiceSettings();
   settingsTab(tab||'appearance');
   const d=$('#settings');if(!d.open)d.showModal();
   loadAccounts().then(renderAccounts);}
 function closeSettings(){const d=$('#settings');if(d&&d.open)d.close();}
+/* Settings > Voice: the server's voice input settings (api/voice/settings). Saved
+   fields win over the server's CLAUDE_CONSOLE_TRANSCRIBE_* environment. */
+let vsBusy=false;
+function vsErr(t){const e=$('#vsErr');e.textContent=t||'';e.hidden=!t;}
+function vsEngine(){const r=document.querySelector('input[name="vsEngine"]:checked');return r?r.value:'local';}
+function vsShow(){const on=$('#vsOn').checked,remote=vsEngine()==='remote';
+  $('#vsFields').hidden=!on;$('#vsLocal').hidden=remote;$('#vsRemote').hidden=!remote;$('#vsTest').hidden=!on;}
+function vsSetState(t,cls){const e=$('#vsState');e.textContent=t||'';e.classList.toggle('ok',cls==='ok');e.classList.toggle('bad',cls==='bad');}
+function vsShowStatus(st){if(!st)return vsSetState('');
+  if(!st.enabled)return vsSetState('Off: there is no microphone button.');
+  if(st.available)return vsSetState('On. The 🎙 button is next to 📎 in the message box.','ok');
+  vsSetState('On, but not ready: '+(st.reason||'unknown reason')+'. The 🎙 button shows greyed.','bad');}
+function vsFill(j){const s=(j&&j.settings)||{};
+  $('#vsOn').checked=!!s.enabled;
+  document.querySelectorAll('input[name="vsEngine"]').forEach(r=>{r.checked=r.value===(s.engine||'local');});
+  $('#vsModel').value=s.model||'';$('#vsPython').value=s.python||'';$('#vsDevice').value=s.device||'auto';
+  $('#vsIndex').value=String(s.device_index||0);$('#vsCompute').value=s.compute_type||'default';
+  $('#vsLang').value=s.language||'';$('#vsZh').value=s.chinese_conversion||'none';$('#vsPause').checked=!!s.pause_punctuation;
+  $('#vsLib').value=s.library_path||'';$('#vsCmd').value=s.remote||'';$('#vsCtx').value=s.context||'';$('#vsFfmpeg').value=s.ffmpeg||'';
+  vsShow();vsShowStatus(j.status);
+  $('#vsFile').textContent=(j.saved&&j.saved.length)?'Saved in '+j.file+' on the server.'
+    :'Nothing is saved yet: these come from the server\'s CLAUDE_CONSOLE_TRANSCRIBE_* environment. Save writes them to '+j.file+'.';}
+function vsCollect(){return {enabled:$('#vsOn').checked,engine:vsEngine(),model:$('#vsModel').value,python:$('#vsPython').value,
+  device:$('#vsDevice').value,device_index:parseInt($('#vsIndex').value||'0',10)||0,compute_type:$('#vsCompute').value,
+  language:$('#vsLang').value,chinese_conversion:$('#vsZh').value,pause_punctuation:$('#vsPause').checked,
+  library_path:$('#vsLib').value,remote:$('#vsCmd').value,context:$('#vsCtx').value,ffmpeg:$('#vsFfmpeg').value};}
+async function loadVoiceSettings(){vsErr('');
+  try{const r=await fetch('api/voice/settings',{cache:'no-store'}),j=await r.json();
+    if(!r.ok||j.error)throw new Error(j.error||('HTTP '+r.status));vsFill(j);}
+  catch(e){vsErr('Could not load the voice settings: '+(e.message||e));}}
+async function saveVoiceSettings(){if(vsBusy)return false;vsBusy=true;vsErr('');$('#vsSave').disabled=$('#vsTest').disabled=true;
+  try{const r=await fetch('api/voice/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({settings:vsCollect()})}),j=await r.json();
+    if(!r.ok||j.error)throw new Error(j.error||('HTTP '+r.status));
+    vsFill(j);await loadVoiceCapabilities();return true;}
+  catch(e){vsErr(e.message||String(e));return false;}
+  finally{vsBusy=false;$('#vsSave').disabled=$('#vsTest').disabled=false;}}
+/* Save, then load the model (or open the remote connection) once: the first
+   dictation is then quick, and a wrong path or command shows here. */
+async function testVoiceSettings(){if(!await saveVoiceSettings())return;
+  if(!voiceCaps.enabled||!voiceCaps.available)return;
+  vsBusy=true;$('#vsSave').disabled=$('#vsTest').disabled=true;vsSetState('Loading the model…');
+  try{const r=await fetch('api/transcribe/warmup',{method:'POST',cache:'no-store'});let j={};try{j=await r.json();}catch(_){}
+    if(r.status===202)vsSetState('On. The model is already loading for a dictation.','ok');
+    else if(!r.ok)vsSetState('The test failed: '+(j.error||r.statusText||('HTTP '+r.status))+'.','bad');
+    else vsSetState('Ready: the model answered'+(j.elapsed!=null?' in '+Number(j.elapsed).toFixed(1)+' s':'')+'. The 🎙 button is next to 📎.','ok');}
+  catch(e){vsSetState('The test failed: '+(e.message||e)+'.','bad');}
+  finally{vsBusy=false;$('#vsSave').disabled=$('#vsTest').disabled=false;}}
 /* Settings, About: the console's version (the commit the server started from), the
    desktop app's (from its user agent), and in the Android app its version with
    Check for updates and, once one is found, Update. */
@@ -9394,6 +9667,10 @@ $('#abUpdate').onclick=()=>{try{window.ClaudeConsoleApp.update();}catch(e){}};
 $('#settingsbtn').onclick=()=>openSettings();
 $('#setx').onclick=closeSettings;
 document.querySelectorAll('#settings .set-tab').forEach(b=>b.onclick=()=>settingsTab(b.dataset.pane));
+$('#vsOn').onchange=vsShow;
+document.querySelectorAll('input[name="vsEngine"]').forEach(r=>r.onchange=vsShow);
+$('#vsSave').onclick=saveVoiceSettings;
+$('#vsTest').onclick=testVoiceSettings;
 /* a click outside the panel lands on the dialog element itself (its ::backdrop) */
 $('#settings').addEventListener('click',ev=>{if(ev.target!==ev.currentTarget)return;
   const r=ev.currentTarget.getBoundingClientRect();
@@ -9704,6 +9981,7 @@ def main():
         (r"/api/import", ImportHandler),
         (r"/api/search", SearchHandler),
         (r"/api/thread", ThreadHandler),
+        (r"/api/voice/settings", VoiceSettingsHandler),
         (r"/api/transcribe/warmup", TranscribeWarmupHandler),
         (r"/api/transcribe", TranscribeHandler),
         (r"/ws/chat", ChatSocket),
