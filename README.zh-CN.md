@@ -10,15 +10,21 @@
   实时 `git diff`（事实依据）
 
 <p align="center">
-  <img src="figs/chat-plan-math-links.png" width="49%"
-       alt="Claude Console —— 悬停在对话上方的 plan、KaTeX 公式，以及渲染成链接的文件路径">
-  <img src="figs/choices-and-attachments.png" width="49%"
-       alt="Claude Console —— 带选项的 AskUserQuestion 卡片，以及输入框里待发送的附件">
+  <img src="figs/desktop-chat-side-chat.png" width="96%"
+       alt="宽屏上的 Claude Console —— 钉在回答上方的 plan、KaTeX 公式和文件链接，右侧停靠着一个辅助对话">
 </p>
 <p align="center">
-  <sub>左：回答向下滚动时 plan 始终钉在上方；公式由 KaTeX 渲染，文件路径变成链接，
-  点击可在 web file manager 中打开。右：agent 反过来问<em>你</em>问题，plan 已折叠到
-  只剩当前任务，下一条消息里附着一个文件。均为 One Light 主题。</sub>
+  <img src="figs/choices-and-attachments.png" width="74.5%"
+       alt="Claude Console —— 带选项的 AskUserQuestion 卡片，plan 折叠到当前一步，输入框里有一个待发送的文件">
+  <img src="figs/phone.png" width="21.5%"
+       alt="手机上的 Claude Console —— 顶栏上方的工具栏，以及同一个回答">
+</p>
+<p align="center">
+  <sub>上：回答向下滚动时 plan 始终钉在上方；公式由 KaTeX 渲染，文件路径变成链接，点击可在
+  web file manager 中打开。右侧是针对选中公式的辅助对话，停靠在对话旁边，用它自己的模型。
+  左下：agent 反过来问<em>你</em>问题，plan 折叠到当前一步，下一条消息里附着一个文件。右下：
+  手机上，用量、抽屉的各个标签页、搜索和设置都在顶栏上方的工具栏里。均为 One Light 主题，
+  来自一个脚本生成的演示 session。</sub>
 </p>
 
 它通过 **Claude Agent SDK** 驱动 Claude Code（SDK 以 headless stream-json 模式
@@ -133,6 +139,11 @@
 - **新建会话弹窗** —— 浏览或新建文件夹，再选择模型、思考深度和权限模式
   （默认 ⏩ Full auto / ⚡ Auto-accept / 🔐 Approve / 📋 Plan）。模型列表可在弹窗内刷新，
   已有会话的设置入口保持可用。
+- **辅助对话（side chats）** —— 在消息里选中一段文字，点 **Ask in side chat**：关于这段文字的
+  另一个对话在抽屉里打开，就在主对话旁边。它从这段引文和它所在的那条消息开始，用自己的模型
+  （默认 Sonnet，可以另选），不进入主 session 的上下文，也不出现在 session 列表里。每个 session
+  有自己的辅助对话。**+ New side chat** 新开一个不带引文的辅助对话，它了解这个项目，但不知道
+  主对话说了什么。
 
 ### 其他
 
@@ -146,6 +157,12 @@
   模型细分的周额度（Max 上的 Fable）也一并显示，悬停可看各自的复位时间；全宽输入框上方有一个
   浮动状态药丸（ready / 工作计时 / 实时 token 计数）以及模型和思考深度药丸。上下文用到
   60% 以上时，空输入框会显示 *update your snapshot*。
+- **宽屏和窄屏** —— 窗口足够宽时（桌面、平板、展开的折叠屏），抽屉停靠在对话旁边而不是盖住
+  它，右边缘的一列按钮打开 Side chats、Edits、Git diff 和 Settings。窄于 600 px 时，顶栏上方
+  有一条工具栏，放着用量计量、抽屉的各个标签页、搜索和设置。
+- **About** —— ⚙ Settings → About 显示 console 的版本（服务器启动时所在的 commit）。在 Android
+  和桌面 app 里还显示 app 自己的版本和 **Check for updates**；它们的更新由 console 提供
+  （`api/android/*`、`api/desktop/*`），文件在 `~/.local/share/claude-console/`。
 
 ## 运行
 

@@ -11,16 +11,22 @@ things a raw terminal tangles together:
   live `git diff` of the working directory (ground truth)
 
 <p align="center">
-  <img src="figs/chat-plan-math-links.png" width="49%"
-       alt="Claude Console — the plan pinned above the chat, KaTeX math, and file paths as links">
-  <img src="figs/choices-and-attachments.png" width="49%"
-       alt="Claude Console — an AskUserQuestion card with options, and a file waiting in the composer">
+  <img src="figs/desktop-chat-side-chat.png" width="96%"
+       alt="Claude Console on a wide screen — the plan pinned above an answer with KaTeX math and file links, and a side chat docked on the right">
 </p>
 <p align="center">
-  <sub>Left: the plan stays pinned while the answer scrolls under it; math renders with KaTeX and
-  file paths become links that open in a web file manager. Right: the agent asking <em>you</em> a
-  question, with the plan folded to just the active task and a file attached to the next message.
-  Both in the One Light theme.</sub>
+  <img src="figs/choices-and-attachments.png" width="74.5%"
+       alt="Claude Console — an AskUserQuestion card with options, the plan folded to its active step, and a file waiting in the composer">
+  <img src="figs/phone.png" width="21.5%"
+       alt="Claude Console on a phone — the toolbar above the header, and the same answer">
+</p>
+<p align="center">
+  <sub>Top: the plan stays pinned while the answer scrolls under it; math renders with KaTeX and
+  file paths become links that open in a web file manager. On the right, a side chat about a
+  selected formula, docked beside the chat, on its own model. Bottom left: the agent asking
+  <em>you</em> a question, with the plan folded to its active step and a file attached to the next
+  message. Bottom right: a phone, with the usage, the drawer's tabs, search and Settings in a
+  toolbar above the header. All in the One Light theme, from a scripted demo session.</sub>
 </p>
 
 It drives Claude Code through the **Claude Agent SDK** (which runs the real
@@ -174,6 +180,12 @@ which is the whole point.
 - **New session dialog** — browse or create a folder, then choose the model,
   thinking effort and permission mode (⏩ Full auto, the default / ⚡ Auto-accept / 🔐 Approve / 📋 Plan).
   The model list can be refreshed inside the dialog. Active-session controls remain available.
+- **Side chats** — select text in a message and choose **Ask in side chat**: a separate
+  conversation about the selection opens in the drawer, beside the main one. It starts from
+  the quote and the message it came from, runs on its own model (Sonnet unless you pick
+  another), and stays out of the main session's context and out of the session list. Each
+  session keeps its own side chats. **+ New side chat** starts one with no quote, which knows
+  the project but not the conversation.
 
 ### Everything else
 
@@ -189,6 +201,14 @@ which is the whole point.
   on Max), each with its reset time on hover; a floating status pill (ready / working timer / live token counts) plus
   the model and effort pills above a full-width composer. Past 60% of the window
   the empty composer reads *update your snapshot*.
+- **Wide and narrow screens** — when the window is wide enough (a desktop, a tablet, an
+  unfolded foldable), the drawer docks beside the chat instead of covering it, and a rail on
+  the right edge opens Side chats, Edits, Git diff and Settings. Below 600 px a toolbar above
+  the header carries the usage meters, the drawer's tabs, search and Settings.
+- **About** — ⚙ Settings → About shows the console's version (the commit the server started
+  from). In the Android and desktop apps it also shows the app's own version with **Check for
+  updates**; the console serves their updates (`api/android/*`, `api/desktop/*`) from
+  `~/.local/share/claude-console/`.
 
 ## Run
 
