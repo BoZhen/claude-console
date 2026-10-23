@@ -5730,6 +5730,28 @@ body.drawer-push{padding-right:calc(var(--drw,min(560px,92vw)) + var(--railw))}
   #drawer:not(.open){transform:translateX(calc(100% + var(--railw)))}
 }
 html.in-desktop-app{--railw:0px}
+#prail .prb[hidden]{display:none}
+#prail #prApp{order:9;margin-top:auto;margin-bottom:8px;position:relative}   /* the app button sits at the foot */
+/* Narrow screens (< 600 px): a slim toolbar above the header with what the header
+   has no room for: the usage, the drawer's tabs (there is no rail there), search,
+   settings, and in the Android app its version and updates. */
+#mtools{display:none}
+@media(max-width:599px){
+  #mtools{display:flex;align-items:center;gap:1px;height:32px;flex-shrink:0;padding:0 4px 0 10px;
+    background:var(--bg2);border-bottom:1px solid var(--line)}
+  #drawer{top:32px;height:calc(100% - 32px)}   /* below the toolbar, whose buttons then toggle it */
+}
+#mtools .mt-usage{flex:1;min-width:0;overflow:hidden;display:flex;align-items:center;gap:9px;white-space:nowrap;
+  font-size:11px;font-weight:600;font-family:var(--fmono);color:var(--fg)}
+#mtools .mtseg{display:inline-flex;align-items:center;gap:4px}
+#mtools .mtseg .ulabel{opacity:.7}
+#mtools .mtb{position:relative;width:29px;height:28px;border:0;border-radius:6px;background:transparent;color:var(--mut);
+  display:grid;place-items:center;padding:0;cursor:pointer;flex-shrink:0}
+#mtools .mtb[hidden]{display:none}
+#mtools .mtb:hover{background:var(--bg3);color:var(--fg)}
+#mtools .mtb.on{background:var(--sel);color:var(--acc)}
+.appbtn .mtdot{position:absolute;top:3px;right:3px;width:7px;height:7px;border-radius:50%;background:var(--acc)}
+.appbtn.has-up{color:var(--acc)}
 html.in-desktop-app #prail{display:none!important}
 #drresize{position:absolute;left:0;top:0;width:6px;height:100%;cursor:col-resize;background:transparent;transition:background .12s;z-index:30}
 #drresize:hover,#drresize.drag{background:var(--acc)}
@@ -6365,6 +6387,15 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
 <script src="/static/katex/katex.min.js"></script>
 </head>
 <body>
+<div id="mtools" role="toolbar" aria-label="Tools">
+  <span class="mt-usage" id="mtUsage"></span>
+  <button class="mtb" id="mtSide" title="Side chats"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><path d="M4 6.5A1.5 1.5 0 0 1 5.5 5h13A1.5 1.5 0 0 1 20 6.5v8a1.5 1.5 0 0 1-1.5 1.5H11l-4 3.5V16H5.5A1.5 1.5 0 0 1 4 14.5z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></button>
+  <button class="mtb" id="mtEdits" title="Edits"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><path d="M14.5 5.5l4 4L9 19H5v-4z M12.5 7.5l4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg></button>
+  <button class="mtb" id="mtGit" title="Git diff"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><circle cx="7" cy="6" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="7" cy="18" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="17" cy="9" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M7 8v8 M17 11c0 3-4 3-8.5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
+  <button class="mtb" id="mtSearch" title="Search history"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M15 15l5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
+  <button class="mtb" id="mtSettings" title="Settings"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg></button>
+  <button class="mtb appbtn" id="mtApp" title="App" hidden><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><rect x="7" y="3" width="10" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 7.5v6 M9.5 11l2.5 2.5 2.5-2.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="mtdot" hidden></span></button>
+</div>
 <header>
   <button class="iconbtn" id="navtoggle" title="sessions">☰</button>
   <span class="curname" id="curname">— no session —</span>
@@ -6466,6 +6497,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
 <nav id="prail" aria-label="Side panel">
   <button class="prb" id="prSide" title="Side chats"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M4 6.5A1.5 1.5 0 0 1 5.5 5h13A1.5 1.5 0 0 1 20 6.5v8a1.5 1.5 0 0 1-1.5 1.5H11l-4 3.5V16H5.5A1.5 1.5 0 0 1 4 14.5z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></button>
   <button class="prb" id="prEdits" title="Edits"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M14.5 5.5l4 4L9 19H5v-4z M12.5 7.5l4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg></button>
+  <button class="prb appbtn" id="prApp" title="App" hidden><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><rect x="7" y="3" width="10" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 7.5v6 M9.5 11l2.5 2.5 2.5-2.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="mtdot" hidden></span></button>
   <button class="prb" id="prGit" title="Git diff"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="7" cy="6" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="7" cy="18" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="17" cy="9" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M7 8v8 M17 11c0 3-4 3-8.5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
 </nav>
 <div id="selpop" hidden><span class="sp-ask" id="spAsk">在辅助对话中提问</span></div>
@@ -7494,7 +7526,7 @@ function fmtDur(ms){if(ms==null||ms<=0)return '0m';const m=Math.floor(ms/60000),
 function renderUsage(u){const el=$('#usage');const f=u&&u.five_hour,w=u&&u.seven_day;
   /* per-model weekly windows (e.g. Fable); label comes from the server */
   const sc=(u&&u.model_scoped)||[];
-  if((!f||f.utilization==null)&&(!w||w.utilization==null)&&!sc.length){el.style.display='none';return;}
+  if((!f||f.utilization==null)&&(!w||w.utilization==null)&&!sc.length){el.style.display='none';mtRenderUsage(null);return;}
   function seg(o,lbl){if(!o||o.utilization==null)return '';
     const pct=Math.round(o.utilization);
     return '<span class="useg"><span class="ulabel">'+lbl+'</span>'+cellBar(pct)+'<span>'+pct+'%</span></span>';}
@@ -7507,7 +7539,14 @@ function renderUsage(u){const el=$('#usage');const f=u&&u.five_hour,w=u&&u.seven
   const all=[['five_hour','5-hour'],['seven_day','7-day'],['seven_day_sonnet','7-day Sonnet'],['seven_day_opus','7-day Opus']];
   all.forEach(([k,lbl])=>row(lbl,u&&u[k]));
   sc.forEach(o=>row('7-day '+o.label,o));
-  el.title=t;}
+  el.title=t;mtRenderUsage(u);}
+/* the same allowance, compact, in the narrow-screen toolbar */
+function mtRenderUsage(u){const el=$('#mtUsage');if(!el)return;
+  const f=u&&u.five_hour,w=u&&u.seven_day,sc=(u&&u.model_scoped)||[];
+  const seg=(o,l)=>(o&&o.utilization!=null)?'<span class="mtseg"><span class="ulabel">'+esc(l)+'</span>'+
+    cellBar(Math.round(o.utilization))+'<span>'+Math.round(o.utilization)+'%</span></span>':'';
+  el.innerHTML=seg(f,'5h')+seg(w,'7d')+sc.map(o=>seg(o,o.label)).join('');
+  el.title=$('#usage').title||'';}
 /* The allowance shown belongs to whichever login is running the attached
    session, not to the console. Getting this wrong quotes the wrong budget. */
 function loadUsage(){fetch('api/usage?account='+encodeURIComponent(curAccount))
@@ -8827,7 +8866,8 @@ function drawerLayout(){const d=$('#drawer'),sb=$('#sidebar'),W=window.innerWidt
   if(wide)localStorage.setItem(DRAWER_KEY,drawerTab());
   railSync();}
 function railSync(){const t=drawerTab();
-  $('#prSide').classList.toggle('on',t==='side');$('#prEdits').classList.toggle('on',t==='edits');$('#prGit').classList.toggle('on',t==='git');}
+  for(const [w,ids] of [['side',['#prSide','#mtSide']],['edits',['#prEdits','#mtEdits']],['git',['#prGit','#mtGit']]])
+    ids.forEach(id=>$(id).classList.toggle('on',t===w));}
 /* a rail button opens its tab; the open tab's button closes the drawer */
 function railTap(w){if(drawerTab()===w)$('#drawer').classList.remove('open');else openDrawer(w);}
 (function(){const mo=new MutationObserver(drawerLayout);
@@ -8836,6 +8876,20 @@ function railTap(w){if(drawerTab()===w)$('#drawer').classList.remove('open');els
   mo.observe(document.documentElement,{attributes:true,attributeFilter:['style']});   /* --drw / --sbw drags */
   window.addEventListener('resize',drawerLayout);
   $('#prSide').onclick=()=>railTap('side');$('#prEdits').onclick=()=>railTap('edits');$('#prGit').onclick=()=>railTap('git');
+  $('#mtSide').onclick=()=>railTap('side');$('#mtEdits').onclick=()=>railTap('edits');$('#mtGit').onclick=()=>railTap('git');
+  $('#mtSearch').onclick=()=>openSearch();$('#mtSettings').onclick=()=>openSettings();
+  /* In the Android app (ClaudeConsoleApp): its version, a dot when an update is
+     waiting; a tap installs that update, or checks for one now. The app calls
+     ccaAppChanged() when what it knows changes. */
+  const appRefresh=()=>{const A=window.ClaudeConsoleApp;if(!A)return;let i;
+    try{i=JSON.parse(A.info());}catch(e){return;}
+    const up=i.update,tip=up?('Update to '+up.name+' (you have '+i.version+') \u00b7 tap to install')
+                            :('Claude Console app '+i.version+' \u00b7 tap to check for updates');
+    for(const b of [$('#mtApp'),$('#prApp')]){b.hidden=false;b.title=tip;b.classList.toggle('has-up',!!up);
+      b.querySelector('.mtdot').hidden=!up;}};
+  window.ccaAppChanged=appRefresh;
+  for(const b of [$('#mtApp'),$('#prApp')])b.onclick=()=>{try{window.ClaudeConsoleApp.update();}catch(e){}};
+  appRefresh();
   /* A sidebar left open on a wide screen is open again after a reload. Read now
      (layout passes save over it), reopened once the whole script has run: the
      side-chat code further down must exist before the drawer shows its tab. */
@@ -9329,7 +9383,7 @@ $('#dclose').onclick=()=>$('#drawer').classList.remove('open');
 document.addEventListener('click',e=>{
   /* a side chat stays open beside the main conversation: clicking, selecting or
      typing there must not close it (✕ and Escape still do) */
-  if(drawerOpen()&&!sideTab()&&!document.body.classList.contains('drawer-push')&&!e.target.closest('#drawer')&&!e.target.closest('#prail')&&!e.target.closest('.emark')&&!e.target.closest('#selpop'))$('#drawer').classList.remove('open');});
+  if(drawerOpen()&&!sideTab()&&!document.body.classList.contains('drawer-push')&&!e.target.closest('#drawer')&&!e.target.closest('#prail')&&!e.target.closest('#mtools')&&!e.target.closest('.emark')&&!e.target.closest('#selpop'))$('#drawer').classList.remove('open');});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&drawerOpen())$('#drawer').classList.remove('open');});
 $('#grefresh').onclick=refreshGit;
 
