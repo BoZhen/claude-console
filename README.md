@@ -12,7 +12,7 @@ things a raw terminal tangles together:
 
 <p align="center">
   <img src="figs/desktop-chat-side-chat.png" width="96%"
-       alt="Claude Console on a wide screen — the plan pinned above an answer with KaTeX math and file links, and a side chat docked on the right">
+       alt="Claude Console on a wide screen — the plan pinned above an answer with KaTeX math and file links; a formula selected with the Ask in side chat popup over it, and the side chat about it docked on the right">
 </p>
 <p align="center">
   <img src="figs/choices-and-attachments.png" width="74.5%"
@@ -22,8 +22,9 @@ things a raw terminal tangles together:
 </p>
 <p align="center">
   <sub>Top: the plan stays pinned while the answer scrolls under it; math renders with KaTeX and
-  file paths become links that open in a web file manager. On the right, a side chat about a
-  selected formula, docked beside the chat, on its own model. Bottom left: the agent asking
+  file paths become links that open in a web file manager. Side chats: select text in a message
+  and choose <b>Ask in side chat</b> (the popup over the selected formula); a separate conversation
+  about it opens on the right, beside the chat, on its own model. Bottom left: the agent asking
   <em>you</em> a question, with the plan folded to its active step and a file attached to the next
   message. Bottom right: a phone, with the usage, the drawer's tabs, search and Settings in a
   toolbar above the header. All in the One Light theme, from a scripted demo session.</sub>

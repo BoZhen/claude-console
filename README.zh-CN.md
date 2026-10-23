@@ -11,7 +11,7 @@
 
 <p align="center">
   <img src="figs/desktop-chat-side-chat.png" width="96%"
-       alt="宽屏上的 Claude Console —— 钉在回答上方的 plan、KaTeX 公式和文件链接，右侧停靠着一个辅助对话">
+       alt="宽屏上的 Claude Console —— 钉在回答上方的 plan、KaTeX 公式和文件链接；选中的公式上方是 Ask in side chat 弹出框，右侧停靠着关于它的辅助对话">
 </p>
 <p align="center">
   <img src="figs/choices-and-attachments.png" width="74.5%"
@@ -21,7 +21,8 @@
 </p>
 <p align="center">
   <sub>上：回答向下滚动时 plan 始终钉在上方；公式由 KaTeX 渲染，文件路径变成链接，点击可在
-  web file manager 中打开。右侧是针对选中公式的辅助对话，停靠在对话旁边，用它自己的模型。
+  web file manager 中打开。辅助对话（side chats）：在消息里选中文字，点 <b>Ask in side chat</b>
+  （选中的公式上方的弹出框），关于它的另一个对话就在右侧、主对话旁边打开，用它自己的模型。
   左下：agent 反过来问<em>你</em>问题，plan 折叠到当前一步，下一条消息里附着一个文件。右下：
   手机上，用量、抽屉的各个标签页、搜索和设置都在顶栏上方的工具栏里。均为 One Light 主题，
   来自一个脚本生成的演示 session。</sub>
