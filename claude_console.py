@@ -3316,6 +3316,76 @@ class AndroidApkHandler(AuthMixin, tornado.web.RequestHandler):
                 await self.flush()
 
 
+# ───────────────────── desktop app updates ─────────────────────
+#
+# The desktop app (Electron) updates its own code from here: GET api/desktop/latest
+# is the newest published bundle's manifest {version, size, sha256, signature,
+# electron, notes}, GET api/desktop/bundle/<version> its bytes. The app checks the
+# Ed25519 signature against a key built into it, so a bundle is only as trusted as
+# the build machine. claude-console-desktop/scripts/publish.sh writes them here as
+# claude-console-desktop-<version>.asar with latest.json beside it.
+DESKTOP_DIR = os.path.join(HOME, ".local", "share", "claude-console", "desktop")
+
+
+def desktop_latest():
+    """The newest published desktop bundle, or None. Its file must be present at the
+    recorded size, so a half-copied one is never offered."""
+    try:
+        with open(os.path.join(DESKTOP_DIR, "latest.json"), encoding="utf-8") as fh:
+            info = json.load(fh)
+        ver = str(info["version"])
+        if not re.fullmatch(r"\d+(?:\.\d+)*", ver):
+            return None
+        name = "claude-console-desktop-%s.asar" % ver
+        path = os.path.join(DESKTOP_DIR, name)
+        size = os.path.getsize(path)
+        if size != int(info.get("size", -1)):
+            return None
+        return {"version": ver, "size": size, "sha256": str(info.get("sha256") or ""),
+                "signature": str(info.get("signature") or ""), "electron": int(info.get("electron") or 0),
+                "notes": str(info.get("notes") or ""), "published": str(info.get("published") or ""),
+                "url": "api/desktop/bundle/%s" % ver, "_path": path, "_file": name}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+class DesktopLatestHandler(AuthMixin, tornado.web.RequestHandler):
+    def get(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "application/json")
+        self.set_header("Cache-Control", "no-store")
+        info = desktop_latest()
+        if not info:
+            self.set_status(404)
+            self.write(json.dumps({"error": "no desktop update published"}))
+            return
+        self.write(json.dumps({k: v for k, v in info.items() if not k.startswith("_")}))
+
+
+class DesktopBundleHandler(AuthMixin, tornado.web.RequestHandler):
+    """The newest bundle's bytes; any other version is a 404 and the app checks again."""
+    async def get(self, which):
+        if not self._ok_auth():
+            return
+        info = desktop_latest()
+        if not info or which not in ("latest", info["version"]):
+            self.set_status(404)
+            self.finish()
+            return
+        self.set_header("Content-Type", "application/octet-stream")
+        self.set_header("Content-Length", str(info["size"]))
+        self.set_header("Content-Disposition", 'attachment; filename="%s"' % info["_file"])
+        self.set_header("Cache-Control", "no-store")
+        with open(info["_path"], "rb") as fh:
+            while True:
+                chunk = fh.read(256 * 1024)
+                if not chunk:
+                    break
+                self.write(chunk)
+                await self.flush()
+
+
 class ImageHandler(AuthMixin, tornado.web.RequestHandler):
     """An image copy from IMAGE_DIR, for the conversation's thumbnails. Nothing
     outside that directory is served, whatever path is asked for."""
@@ -5347,7 +5417,8 @@ class ConsoleHandler(AuthMixin, tornado.web.RequestHandler):
             return
         self.set_header("Cache-Control", "no-store")
         self.write(CONSOLE_HTML.replace("__CLAUDE_CONSOLE_WEBFM_URL__", json.dumps(WEBFM_URL))
-                   .replace("__CLAUDE_CONSOLE_STAMP__", PAGE_STAMP))
+                   .replace("__CLAUDE_CONSOLE_STAMP__", PAGE_STAMP)
+                   .replace("__CLAUDE_CONSOLE_VERSION__", CONSOLE_VERSION))
 
 
 CONSOLE_HTML = r"""<!DOCTYPE html>
@@ -5731,7 +5802,10 @@ body.drawer-push{padding-right:calc(var(--drw,min(560px,92vw)) + var(--railw))}
 }
 html.in-desktop-app{--railw:0px}
 #prail .prb[hidden]{display:none}
-#prail #prApp{order:9;margin-top:auto;margin-bottom:8px;position:relative}   /* the app button sits at the foot */
+/* at the rail's foot: an update when one waits, then settings */
+#prail .prsp{order:8;flex:1}
+#prail #prApp{order:9}
+#prail #prSet{order:10;margin-bottom:8px}
 /* Narrow screens (< 600 px): a slim toolbar above the header with what the header
    has no room for: the usage, the drawer's tabs (there is no rail there), search,
    settings, and in the Android app its version and updates. */
@@ -5750,8 +5824,7 @@ html.in-desktop-app{--railw:0px}
 #mtools .mtb[hidden]{display:none}
 #mtools .mtb:hover{background:var(--bg3);color:var(--fg)}
 #mtools .mtb.on{background:var(--sel);color:var(--acc)}
-.appbtn .mtdot{position:absolute;top:3px;right:3px;width:7px;height:7px;border-radius:50%;background:var(--acc)}
-.appbtn.has-up{color:var(--acc)}
+.appbtn .upicon circle{stroke:var(--add);opacity:.75}
 html.in-desktop-app #prail{display:none!important}
 #drresize{position:absolute;left:0;top:0;width:6px;height:100%;cursor:col-resize;background:transparent;transition:background .12s;z-index:30}
 #drresize:hover,#drresize.drag{background:var(--acc)}
@@ -6087,6 +6160,9 @@ body.tabdrag,body.tabdrag .stab{cursor:grabbing}
   padding:6px 12px;font:12.5px var(--fsans);cursor:pointer}
 .set-btn:hover:not(:disabled){border-color:var(--acc);color:var(--acc)}
 .set-btn:disabled{opacity:.45;cursor:default}
+.ab-btns{display:flex;gap:8px;flex-wrap:wrap}
+#settings [data-pane="about"] .set-row{flex-wrap:wrap;row-gap:2px}   /* a long version goes under the name */
+#settings [data-pane="about"] .set-value{white-space:normal}
 .set-btn.primary{background:var(--acc);border-color:var(--acc);color:var(--onacc);font-weight:650}
 .set-btn.primary:hover:not(:disabled){filter:brightness(1.08);color:var(--onacc)}
 /* text size */
@@ -6394,7 +6470,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
   <button class="mtb" id="mtGit" title="Git diff"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><circle cx="7" cy="6" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="7" cy="18" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="17" cy="9" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M7 8v8 M17 11c0 3-4 3-8.5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
   <button class="mtb" id="mtSearch" title="Search history"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M15 15l5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
   <button class="mtb" id="mtSettings" title="Settings"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg></button>
-  <button class="mtb appbtn" id="mtApp" title="App" hidden><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><rect x="7" y="3" width="10" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 7.5v6 M9.5 11l2.5 2.5 2.5-2.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="mtdot" hidden></span></button>
+  <button class="mtb appbtn" id="mtApp" title="Update" hidden><svg class="upicon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="12" cy="12" r="8.6" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 7.2v8.6 M8.4 12.4l3.6 3.6 3.6-3.6" fill="none" stroke="var(--add)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
 </div>
 <header>
   <button class="iconbtn" id="navtoggle" title="sessions">☰</button>
@@ -6497,7 +6573,9 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
 <nav id="prail" aria-label="Side panel">
   <button class="prb" id="prSide" title="Side chats"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M4 6.5A1.5 1.5 0 0 1 5.5 5h13A1.5 1.5 0 0 1 20 6.5v8a1.5 1.5 0 0 1-1.5 1.5H11l-4 3.5V16H5.5A1.5 1.5 0 0 1 4 14.5z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></button>
   <button class="prb" id="prEdits" title="Edits"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M14.5 5.5l4 4L9 19H5v-4z M12.5 7.5l4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg></button>
-  <button class="prb appbtn" id="prApp" title="App" hidden><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><rect x="7" y="3" width="10" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 7.5v6 M9.5 11l2.5 2.5 2.5-2.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="mtdot" hidden></span></button>
+  <span class="prsp" aria-hidden="true"></span>
+  <button class="prb appbtn" id="prApp" title="Update" hidden><svg class="upicon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="12" cy="12" r="8.6" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 7.2v8.6 M8.4 12.4l3.6 3.6 3.6-3.6" fill="none" stroke="var(--add)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+  <button class="prb" id="prSet" title="Settings"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg></button>
   <button class="prb" id="prGit" title="Git diff"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="7" cy="6" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="7" cy="18" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="17" cy="9" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M7 8v8 M17 11c0 3-4 3-8.5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
 </nav>
 <div id="selpop" hidden><span class="sp-ask" id="spAsk">在辅助对话中提问</span></div>
@@ -6535,6 +6613,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
   <div class="set-tabs" role="tablist">
     <button class="set-tab" type="button" role="tab" data-pane="appearance" aria-selected="true">Appearance</button>
     <button class="set-tab" type="button" role="tab" data-pane="accounts" aria-selected="false">Accounts</button>
+    <button class="set-tab" type="button" role="tab" data-pane="about" aria-selected="false">About</button>
   </div>
   <div class="set-body">
     <section class="set-pane" data-pane="appearance" role="tabpanel">
@@ -6575,6 +6654,26 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
           <div class="acc-actions"><span id="accerr" role="alert" hidden></span>
             <button id="accadd" class="set-btn primary" type="submit">Add account</button></div>
         </form>
+      </div>
+    </section>
+    <section class="set-pane" data-pane="about" role="tabpanel" hidden>
+      <div class="set-group">
+        <div class="set-row"><span class="set-name">Claude Console</span><span class="set-value" id="abConsole"></span></div>
+        <div class="set-hint">The server and this page, from <span id="abHost"></span>. The version is the
+          commit the server started from.</div>
+      </div>
+      <div class="set-group" id="abDesk" hidden>
+        <div class="set-row"><span class="set-name">Desktop app</span><span class="set-value" id="abDeskVer"></span></div>
+        <div class="set-hint">The window loads this page from the server, so the page is always the console's.
+          <span id="abDeskState"></span></div>
+        <div class="ab-btns" id="abDeskBtns" hidden><button class="set-btn" id="abDeskCheck" type="button">Check for updates</button>
+          <button class="set-btn primary" id="abDeskUpdate" type="button" hidden>Restart to update</button></div>
+      </div>
+      <div class="set-group" id="abApp" hidden>
+        <div class="set-row"><span class="set-name">Android app</span><span class="set-value" id="abAppVer"></span></div>
+        <div class="set-hint" id="abAppState"></div>
+        <div class="ab-btns"><button class="set-btn" id="abCheck" type="button">Check for updates</button>
+          <button class="set-btn primary" id="abUpdate" type="button" hidden>Update</button></div>
       </div>
     </section>
   </div>
@@ -8881,12 +8980,15 @@ function railTap(w){if(drawerTab()===w)$('#drawer').classList.remove('open');els
   /* In the Android app (ClaudeConsoleApp): its version, a dot when an update is
      waiting; a tap installs that update, or checks for one now. The app calls
      ccaAppChanged() when what it knows changes. */
-  const appRefresh=()=>{const A=window.ClaudeConsoleApp;if(!A)return;let i;
-    try{i=JSON.parse(A.info());}catch(e){return;}
-    const up=i.update,tip=up?('Update to '+up.name+' (you have '+i.version+') \u00b7 tap to install')
-                            :('Claude Console app '+i.version+' \u00b7 tap to check for updates');
-    for(const b of [$('#mtApp'),$('#prApp')]){b.hidden=false;b.title=tip;b.classList.toggle('has-up',!!up);
-      b.querySelector('.mtdot').hidden=!up;}};
+  $('#prSet').onclick=()=>settingsOpen()?closeSettings():openSettings();
+  /* In the Android app (window.ClaudeConsoleApp): when it has found an update, a
+     circle with a green arrow in the toolbar and on the rail installs it. The
+     version and Check for updates are in Settings, About. The app calls
+     ccaAppChanged() when what it knows changes. */
+  const appRefresh=()=>{const A=window.ClaudeConsoleApp;let up=null,ver='';
+    if(A){try{const i=JSON.parse(A.info());up=i.update;ver=i.version;}catch(e){}}
+    for(const b of [$('#mtApp'),$('#prApp')]){b.hidden=!up;
+      if(up)b.title='Update to '+up.name+' (you have '+ver+') \u00b7 tap to install';}};
   window.ccaAppChanged=appRefresh;
   for(const b of [$('#mtApp'),$('#prApp')])b.onclick=()=>{try{window.ClaudeConsoleApp.update();}catch(e){}};
   appRefresh();
@@ -9234,11 +9336,59 @@ function settingsOpen(){const d=$('#settings');return !!(d&&d.open);}
 function settingsTab(name){
   document.querySelectorAll('#settings .set-tab').forEach(b=>b.setAttribute('aria-selected',String(b.dataset.pane===name)));
   document.querySelectorAll('#settings .set-pane').forEach(p=>{p.hidden=p.dataset.pane!==name;});}
-function openSettings(tab){buildThemeGrid();syncThemeGrid();syncFs();accErr('');renderAccounts();
+function openSettings(tab){buildThemeGrid();syncThemeGrid();syncFs();accErr('');renderAccounts();renderAbout();
   settingsTab(tab||'appearance');
   const d=$('#settings');if(!d.open)d.showModal();
   loadAccounts().then(renderAccounts);}
 function closeSettings(){const d=$('#settings');if(d&&d.open)d.close();}
+/* Settings, About: the console's version (the commit the server started from), the
+   desktop app's (from its user agent), and in the Android app its version with
+   Check for updates and, once one is found, Update. */
+const CONSOLE_VERSION='__CLAUDE_CONSOLE_VERSION__';
+let abChecking=false;
+function renderAbout(){
+  $('#abConsole').textContent=CONSOLE_VERSION||'unknown';$('#abHost').textContent=location.host;
+  const dm=/\bElectron\//.test(navigator.userAgent)&&navigator.userAgent.match(/\bClaudeConsole\/(\S+)/);
+  $('#abDesk').hidden=!dm;if(dm)$('#abDeskVer').textContent=dm[1];
+  renderAboutDesktop();
+  const A=window.ClaudeConsoleApp;$('#abApp').hidden=!A;if(!A)return;
+  let i={};try{i=JSON.parse(A.info());}catch(e){}
+  const up=i.update;
+  $('#abAppVer').textContent=i.version||'?';
+  $('#abUpdate').hidden=!up;if(up)$('#abUpdate').textContent='Update to '+up.name;
+  $('#abCheck').disabled=abChecking;
+  $('#abAppState').textContent=abChecking?'Asking the console for a newer version\u2026'
+    :up?('Version '+up.name+' is available'+(up.notes?': '+up.notes:'.'))
+    :i.error?('Could not check: '+i.error)
+    :i.checked?('Up to date \u00b7 checked '+reltime(i.checked/1000)+' ago')
+    :'Not checked yet.';}
+/* The desktop app (window.ClaudeConsoleDesktop, answers are promises): the version
+   of the code it runs, and its updates from the console (see its updater.js). */
+let abDeskChecking=false;
+function renderAboutDesktop(){const D=window.ClaudeConsoleDesktop;$('#abDeskBtns').hidden=!D;
+  if(!D){$('#abDeskState').textContent='';return;}
+  D.info().then(i=>{if(!i)return;
+    $('#abDesk').hidden=false;
+    $('#abDeskVer').textContent=i.packaged?i.running:'from source';
+    const r=i.ready,st=!i.packaged?'It runs from a git checkout, its own code, and does not update.'
+      :abDeskChecking||i.checking?'Asking the console for a newer version\u2026'
+      :r?('Version '+r.version+' is downloaded and checked'+(r.notes?' ('+r.notes+')':'')+'; a restart puts it in.')
+      :i.needsReinstall?('Version '+i.needsReinstall.version+' needs a newer Electron: install the new package by hand.')
+      :i.error?('Could not check: '+i.error)
+      :i.checked?('Up to date \u00b7 checked '+reltime(i.checked/1000)+' ago')
+      :'Not checked yet.';
+    $('#abDeskState').textContent=st;
+    $('#abDeskBtns').hidden=!i.packaged;$('#abDeskCheck').disabled=abDeskChecking||!!i.checking;
+    $('#abDeskUpdate').hidden=!r;if(r)$('#abDeskUpdate').textContent='Restart to update to '+r.version;}).catch(()=>{});}
+$('#abDeskCheck').onclick=()=>{const D=window.ClaudeConsoleDesktop;if(!D)return;abDeskChecking=true;renderAboutDesktop();
+  D.check().catch(()=>{}).then(()=>{abDeskChecking=false;renderAboutDesktop();});};
+$('#abDeskUpdate').onclick=()=>{const D=window.ClaudeConsoleDesktop;if(D)D.update().catch(()=>{});};
+document.addEventListener('ccd-update-changed',()=>{if(settingsOpen())renderAboutDesktop();});
+$('#abCheck').onclick=()=>{const A=window.ClaudeConsoleApp;if(!A)return;abChecking=true;renderAbout();
+  try{A.check();}catch(e){abChecking=false;renderAbout();}};
+$('#abUpdate').onclick=()=>{try{window.ClaudeConsoleApp.update();}catch(e){}};
+{const prev=window.ccaAppChanged;   /* the app reports a finished check: the toolbar and About follow */
+ window.ccaAppChanged=()=>{abChecking=false;if(prev)prev();if(settingsOpen())renderAbout();};}
 $('#settingsbtn').onclick=()=>openSettings();
 $('#setx').onclick=closeSettings;
 document.querySelectorAll('#settings .set-tab').forEach(b=>b.onclick=()=>settingsTab(b.dataset.pane));
@@ -9471,6 +9621,25 @@ openWs();
 PAGE_STAMP = hashlib.sha1(CONSOLE_HTML.encode("utf-8")).hexdigest()[:12]
 
 
+def _console_version():
+    """The commit this server started from, for Settings > About: "1c56695 · 2026-10-22",
+    with "+ local changes" when this file differs from it. Empty outside a git checkout."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        head = subprocess.run(["git", "-C", here, "log", "-1", "--format=%h · %cs"],
+                              capture_output=True, text=True, timeout=5).stdout.strip()
+        if not head:
+            return ""
+        dirty = subprocess.run(["git", "-C", here, "status", "--porcelain", "--", os.path.basename(__file__)],
+                               capture_output=True, text=True, timeout=5).stdout.strip()
+        return head + (" + local changes" if dirty else "")
+    except Exception:
+        return ""
+
+
+CONSOLE_VERSION = _console_version()
+
+
 RECAP_KEEP_H = 24   # prune isolated recap-query transcripts older than this (hours)
 
 def _cleanup_recap_artifacts():
@@ -9523,6 +9692,8 @@ def main():
         (r"/api/notify/approve", NotifyApproveHandler),
         (r"/api/android/latest", AndroidLatestHandler),
         (r"/api/android/apk/(latest|\d+)", AndroidApkHandler),
+        (r"/api/desktop/latest", DesktopLatestHandler),
+        (r"/api/desktop/bundle/(latest|\d+(?:\.\d+)*)", DesktopBundleHandler),
         (r"/api/diff", DiffHandler),
         (r"/api/usage", UsageHandler),
         (r"/api/models", ModelsHandler),
