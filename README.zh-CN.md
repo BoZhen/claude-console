@@ -262,7 +262,7 @@ python claude_console.py
   唯一的例外是 `faster_whisper_worker.py`，因为语音模型想要的 Python 与 console
   运行所在的不是同一个，而且独立进程也正是模型内存得以释放的方式 —— 它闲置后
   会自行退出。
-- [KaTeX](https://katex.org/) 已内置于 `static/katex/`（MIT），用于离线渲染公式。
+- [KaTeX](https://katex.org/) 已内置于 `static/katex/`（MIT，许可证见 `static/katex/LICENSE`），用于离线渲染公式。
 - 非图片附件会写入 session 工作目录下的 `.claude-console/uploads/`，以便 agent
   打开并运行它们。该文件夹在 git 中自我忽略（它自带一个内容为 `*` 的 `.gitignore`），
   而排队消息若在发送前被你撤回，则不会写入任何东西。

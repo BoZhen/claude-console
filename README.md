@@ -319,8 +319,8 @@ The legacy `AGENTLENS_*` names are still honored as a fallback.
   The one exception is `faster_whisper_worker.py`, because speech models want a
   different Python than the console runs in, and a separate process is also how
   the model's memory gets released — it exits on its own when idle.
-- [KaTeX](https://katex.org/) is vendored under `static/katex/` (MIT) for offline
-  math rendering.
+- [KaTeX](https://katex.org/) is vendored under `static/katex/` (MIT, license in
+  `static/katex/LICENSE`) for offline math rendering.
 - Non-image attachments are written to `.claude-console/uploads/` inside the
   session's working directory, so the agent can open and run them. That folder
   ignores itself in git (it ships a `.gitignore` containing `*`), and nothing is
