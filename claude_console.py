@@ -7077,8 +7077,11 @@ function _mathObserver(){if(_mathObs)return _mathObs;
     {root:$('#chat'),rootMargin:'1200px 0px'});return _mathObs;}
 function _renderMathEl(el){if(!window.katex||el.dataset.done)return;el.dataset.done='1';
   try{katex.render(el.textContent,el,{displayMode:el.dataset.d==='1',throwOnError:false,errorColor:'#f85149'});}catch(e){}}
-function typesetMath(root){if(!window.katex)return;
-  root.querySelectorAll('.math:not([data-done])').forEach(el=>_mathObserver().observe(el));}
+/* In the chat, math is typeset as it comes near the view. now: at once, for
+   anything outside the chat (a side chat in the drawer), which the chat's
+   observer never sees intersect. */
+function typesetMath(root,now){if(!window.katex)return;
+  root.querySelectorAll('.math:not([data-done])').forEach(el=>now?_renderMathEl(el):_mathObserver().observe(el));}
 function diffHtml(t){return t.split('\n').map(l=>{let c='dl-ctx';
   if(l.startsWith('@@')||l.startsWith('diff ')||l.startsWith('+++')||l.startsWith('---'))c='dl-hdr';
   else if(l.startsWith('+'))c='dl-add';else if(l.startsWith('-'))c='dl-del';
@@ -9323,7 +9326,7 @@ function sideAppend(el){const stick=sideNearBottom();const busy=sideStream().que
 function sideAddUser(text){const d=document.createElement('div');d.className='sm u';
   d.innerHTML='<div class="who">you</div><div class="body">'+sideUserHtml(text)+'</div>';sideAppend(d);}
 function sideAddAsst(text){const d=document.createElement('div');d.className='sm a';
-  d.innerHTML='<div class="who">claude</div><div class="body bubble">'+md(text)+'</div>';typesetMath(d);sideAppend(d);}
+  d.innerHTML='<div class="who">claude</div><div class="body bubble">'+md(text)+'</div>';typesetMath(d,true);sideAppend(d);}
 function sideAddTool(ev){const d=document.createElement('div');d.className='stool';d.textContent=sideToolText(ev);sideAppend(d);}
 function sideAddResult(ev){const c=(''+(ev.content||'')).split('\n').find(x=>x.trim())||'';
   const d=document.createElement('div');d.className='stool res'+(ev.isError?' err':'');
