@@ -196,6 +196,10 @@ which is the whole point.
   It scales the conversation as a whole (messages, code, tool cards, images, the plan,
   the edits drawer) and the message box; the sidebar and header keep their size.
   Kept per device, like the theme.
+- **Chat width** — ⚙ Settings → Appearance: how wide the conversation may get on a wide
+  screen, Narrow (820 px), Medium (1000 px, the default), Wide (1200 px) or the full window.
+  Text size scales it with the rest; narrow windows always use their whole width. Kept per
+  device.
 - **At-a-glance status** — context-window, rolling 5-hour and weekly usage meters
   in the header, including any per-model weekly quota the account carries (Fable
   on Max), each with its reset time on hover; a floating status pill (ready / working timer / live token counts) plus

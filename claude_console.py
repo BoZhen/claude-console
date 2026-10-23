@@ -5596,7 +5596,8 @@ CONSOLE_HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,interactive-widget=resizes-content">
 <title>Claude Console</title>
 <script>try{var _t=localStorage.getItem('al_theme');if(_t&&_t!=='dark')document.documentElement.setAttribute('data-theme',_t);
-var _f=parseFloat(localStorage.getItem('al_fs'));if(_f>=12&&_f<=22)document.documentElement.style.setProperty('--chat-zoom',String(_f/14));}catch(e){}</script>
+var _f=parseFloat(localStorage.getItem('al_fs'));if(_f>=12&&_f<=22)document.documentElement.style.setProperty('--chat-zoom',String(_f/14));
+var _w={narrow:'820px',wide:'1200px',full:'none'}[localStorage.getItem('al_cw')];if(_w)document.documentElement.style.setProperty('--chat-width',_w);}catch(e){}</script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 /* ── theme palettes: 13 base vars each; panels/tints derived below ── */
@@ -5699,7 +5700,10 @@ header select,header input{background:var(--bg3);color:var(--fg);border:1px soli
 .btn:hover{background:var(--line)}
 
 #chat{flex:1;overflow-y:auto;overflow-x:hidden;padding:14px;-webkit-overflow-scrolling:touch}
-.wrap{max-width:820px;margin:0 auto}
+.wrap{max-width:var(--chat-width);margin:0 auto}
+/* ⚙ Settings → Chat width: the column the conversation and its plan keep to, at 14px
+   text (Text size scales it with the rest). none = the whole pane. */
+:root{--chat-width:1000px}
 /* ⚙ Settings → Text size. The conversation, the plan above it, a thread opened from
    history search and the edits drawer scale as a whole (CSS zoom), so code, tool
    cards, images and spacing keep their proportions to the text; the sidebar, header
@@ -5724,7 +5728,7 @@ header select,header input{background:var(--bg3);color:var(--fg);border:1px soli
    list on every change (the console's own plan tool, see PLAN_TOOL there), so
    this only ever paints a snapshot.
    Opaque background, because content scrolls behind it once it sticks. */
-.plandock{position:sticky;top:0;z-index:7;max-width:820px;margin:0 auto 10px;
+.plandock{position:sticky;top:0;z-index:7;max-width:var(--chat-width);margin:0 auto 10px;
   padding:0 0 8px;background:var(--bg);
   /* #chat carries 14px of padding, and a scroll container's padding scrolls WITH
      its content — so a sticky child pins below it and messages ride up through
@@ -6347,6 +6351,12 @@ body.tabdrag,body.tabdrag .stab{cursor:grabbing}
 .fs-preview{margin-top:14px;padding:14px 16px 2px;border:1px solid var(--line);border-radius:10px;
   background:var(--bg);overflow:hidden;max-height:260px}
 .fs-preview .zoom{zoom:var(--chat-zoom)}
+/* chat width */
+.cw-ctl{display:flex;flex-wrap:wrap;gap:6px}
+.cw-opt{flex:1 1 auto;min-width:84px;height:32px;padding:0 12px;border:1px solid var(--line);border-radius:7px;
+  background:var(--bg3);color:var(--fg);font:inherit;font-size:13px;cursor:pointer}
+.cw-opt:hover{border-color:var(--acc);color:var(--acc)}
+.cw-opt[aria-checked="true"]{background:var(--acc);border-color:var(--acc);color:var(--onacc);font-weight:650}
 /* theme swatches: colours come from the stylesheet's own palettes (themePalettes) */
 .theme-grp{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);margin:14px 0 8px}
 .theme-grp:first-child{margin-top:2px}
@@ -6821,6 +6831,17 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
           <div class="msg asst"><div class="b bubble">The fixture in <code>tests/conftest.py</code> opens the
             port before the server is up. 我会先修复这个问题，再重新运行测试。</div></div>
         </div></div>
+      </div>
+      <div class="set-group">
+        <div class="set-row"><span class="set-name">Chat width</span><span class="set-value" id="cwVal"></span></div>
+        <div class="set-hint">How wide the conversation may get on a wide screen; narrow windows always
+          use their whole width. Kept in this browser.</div>
+        <div class="cw-ctl" role="radiogroup" aria-label="Chat width">
+          <button class="cw-opt" type="button" role="radio" data-cw="narrow">Narrow</button>
+          <button class="cw-opt" type="button" role="radio" data-cw="medium">Medium</button>
+          <button class="cw-opt" type="button" role="radio" data-cw="wide">Wide</button>
+          <button class="cw-opt" type="button" role="radio" data-cw="full">Full window</button>
+        </div>
       </div>
       <div class="set-group">
         <div class="set-row"><span class="set-name">Theme</span><span class="set-value" id="themeVal"></span></div>
@@ -9519,10 +9540,21 @@ $('#fsDown').onclick=()=>setFs(curFs()-1);
 $('#fsUp').onclick=()=>setFs(curFs()+1);
 $('#fsReset').onclick=()=>setFs(FS_DEF);
 applyFs(curFs());
+/* chat width: medium (1000px) is the default; the head script sets it before paint */
+const CW={narrow:['820px','820 px'],medium:['1000px','1000 px · default'],wide:['1200px','1200 px'],full:['none','the whole pane']};
+function curCw(){const v=localStorage.getItem('al_cw');return CW[v]?v:'medium';}
+function applyCw(v){document.documentElement.style.setProperty('--chat-width',CW[v][0]);}
+function setCw(v){if(!CW[v])v='medium';
+  if(v==='medium')localStorage.removeItem('al_cw');else localStorage.setItem('al_cw',v);applyCw(v);syncCw();}
+function syncCw(){const v=curCw();$('#cwVal').textContent=CW[v][1];
+  document.querySelectorAll('.cw-opt').forEach(b=>b.setAttribute('aria-checked',String(b.dataset.cw===v)));}
+document.querySelectorAll('.cw-opt').forEach(b=>b.onclick=()=>setCw(b.dataset.cw));
+applyCw(curCw());
 /* another tab of this console changed one of them */
 window.addEventListener('storage',e=>{
   if(e.key==='al_theme'){applyTheme(curTheme());syncThemeGrid();}
-  if(e.key==='al_fs'){applyFs(curFs());syncFs();}});
+  if(e.key==='al_fs'){applyFs(curFs());syncFs();}
+  if(e.key==='al_cw'){applyCw(curCw());syncCw();}});
 /* ⚙ Settings → Accounts: the logins this machine knows about. ACCOUNTS
    always holds at least the one the console runs under, so a length of 1 is how
    the rest of the UI knows there is no choice to offer and stays as it was. */
@@ -9567,7 +9599,7 @@ function settingsOpen(){const d=$('#settings');return !!(d&&d.open);}
 function settingsTab(name){
   document.querySelectorAll('#settings .set-tab').forEach(b=>b.setAttribute('aria-selected',String(b.dataset.pane===name)));
   document.querySelectorAll('#settings .set-pane').forEach(p=>{p.hidden=p.dataset.pane!==name;});}
-function openSettings(tab){buildThemeGrid();syncThemeGrid();syncFs();accErr('');renderAccounts();renderAbout();loadVoiceSettings();
+function openSettings(tab){buildThemeGrid();syncThemeGrid();syncFs();syncCw();accErr('');renderAccounts();renderAbout();loadVoiceSettings();
   settingsTab(tab||'appearance');
   const d=$('#settings');if(!d.open)d.showModal();
   loadAccounts().then(renderAccounts);}
