@@ -6908,6 +6908,11 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
         <div class="set-hint">The server and this page, from <span id="abHost"></span>. The version is the
           commit the server started from.</div>
       </div>
+      <div class="set-group" id="abSrv" hidden>
+        <div class="set-row"><span class="set-name">Server</span><span class="set-value" id="abSrvWhere"></span></div>
+        <div class="set-hint" id="abSrvHint"></div>
+        <div class="ab-btns"><button class="set-btn" id="abSrvChange" type="button">Change…</button></div>
+      </div>
       <div class="set-group" id="abDesk" hidden>
         <div class="set-row"><span class="set-name">Desktop app</span><span class="set-value" id="abDeskVer"></span></div>
         <div class="set-hint">The window loads this page from the server, so the page is always the console's.
@@ -9661,7 +9666,7 @@ function renderAbout(){
   $('#abConsole').textContent=CONSOLE_VERSION||'unknown';$('#abHost').textContent=location.host;
   const dm=/\bElectron\//.test(navigator.userAgent)&&navigator.userAgent.match(/\bClaudeConsole\/(\S+)/);
   $('#abDesk').hidden=!dm;if(dm)$('#abDeskVer').textContent=dm[1];
-  renderAboutDesktop();
+  renderAboutDesktop();renderAboutServer();
   const A=window.ClaudeConsoleApp;$('#abApp').hidden=!A;if(!A)return;
   let i={};try{i=JSON.parse(A.info());}catch(e){}
   const up=i.update;
@@ -9695,6 +9700,19 @@ $('#abDeskCheck').onclick=()=>{const D=window.ClaudeConsoleDesktop;if(!D)return;
   D.check().catch(()=>{}).then(()=>{abDeskChecking=false;renderAboutDesktop();});};
 $('#abDeskUpdate').onclick=()=>{const D=window.ClaudeConsoleDesktop;if(D)D.update().catch(()=>{});};
 document.addEventListener('ccd-update-changed',()=>{if(settingsOpen())renderAboutDesktop();});
+/* The desktop app's server (window.ClaudeConsoleDesktop.serverInfo): this computer,
+   where the app runs the console itself, or another computer at an address. Change…
+   opens the app's Server dialog. */
+function renderAboutServer(){const D=window.ClaudeConsoleDesktop;
+  if(!D||!D.serverInfo){$('#abSrv').hidden=true;return;}
+  D.serverInfo().then(i=>{if(!i)return;$('#abSrv').hidden=false;
+    $('#abSrvWhere').textContent=i.mode==='local'?'This computer':'Another computer';
+    $('#abSrvHint').textContent=i.mode==='local'
+      ?'The app runs this console here'+(i.claude?', with '+i.claude:'')+', and stops it when the app quits.'
+      :'The console at '+i.url+'.';}).catch(()=>{});}
+$('#abSrvChange').onclick=()=>{const D=window.ClaudeConsoleDesktop;if(!D||!D.serverDialog)return;
+  closeSettings();D.serverDialog().catch(()=>{});};
+document.addEventListener('ccd-server-changed',()=>{if(settingsOpen())renderAboutServer();});
 $('#abCheck').onclick=()=>{const A=window.ClaudeConsoleApp;if(!A)return;abChecking=true;renderAbout();
   try{A.check();}catch(e){abChecking=false;renderAbout();}};
 $('#abUpdate').onclick=()=>{try{window.ClaudeConsoleApp.update();}catch(e){}};
