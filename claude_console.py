@@ -6015,6 +6015,26 @@ html.in-desktop-app{--railw:0px}
 #mtools .mtb.on{background:var(--sel);color:var(--acc)}
 .appbtn .upicon circle{stroke:var(--add);opacity:.75}
 html.in-desktop-app #prail{display:none!important}
+/* The Android app's computers (window.ClaudeConsoleApp.computers), as the desktop
+   app's rail has them: from two on a button each at the rail's top, the one shown in
+   the accent colour, a red dot with a count where approvals or questions wait, a grey
+   one where a turn finished unseen; + adds one. On a narrow screen one button in the
+   toolbar, the computer shown, opens the list. */
+#prComputers{display:flex;flex-direction:column;align-items:center;gap:6px;width:100%;
+  padding-bottom:6px;margin-bottom:2px;border-bottom:1px solid var(--line)}
+#prComputers[hidden]{display:none}
+.compbtn{position:relative;width:28px;height:28px;padding:0;border-radius:7px;font:inherit;font-size:11px;
+  font-weight:650;line-height:1;background:transparent;border:1px solid var(--line);color:var(--mut);cursor:pointer;
+  -webkit-touch-callout:none;user-select:none}
+.compbtn:hover{color:var(--fg);background:var(--bg3)}
+.compbtn.on,.compbtn.on:hover{color:var(--onacc);background:var(--acc);border-color:var(--acc)}
+.cdot{position:absolute;top:-5px;right:-6px;min-width:15px;height:15px;padding:0 3px;box-sizing:border-box;
+  border-radius:8px;border:1.5px solid var(--bg2);background:#e5534b;color:#fff;font-size:9.5px;font-weight:700;
+  line-height:12px;text-align:center}
+.cdot.done{min-width:10px;width:10px;height:10px;padding:0;top:-3px;right:-4px;background:var(--mut)}
+#mtools #mtComp{width:auto;min-width:29px;padding:0 6px;font-size:11px;font-weight:650;font-family:inherit;
+  color:var(--fg);border:1px solid var(--line);height:24px;margin-right:4px}
+#mtools #mtComp .cdot{top:-4px;right:-5px}
 #drresize{position:absolute;left:0;top:0;width:6px;height:100%;cursor:col-resize;background:transparent;transition:background .12s;z-index:30}
 #drresize:hover,#drresize.drag{background:var(--acc)}
 #drawer .dh{padding:8px 12px;background:var(--bg2);border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center}
@@ -6679,6 +6699,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
 <body>
 <div id="mtools" role="toolbar" aria-label="Tools">
   <span class="mt-usage" id="mtUsage"></span>
+  <button class="mtb" id="mtComp" type="button" hidden></button>
   <button class="mtb" id="mtSide" title="Side chats"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><path d="M4 6.5A1.5 1.5 0 0 1 5.5 5h13A1.5 1.5 0 0 1 20 6.5v8a1.5 1.5 0 0 1-1.5 1.5H11l-4 3.5V16H5.5A1.5 1.5 0 0 1 4 14.5z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></button>
   <button class="mtb" id="mtEdits" title="Edits"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><path d="M14.5 5.5l4 4L9 19H5v-4z M12.5 7.5l4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg></button>
   <button class="mtb" id="mtGit" title="Git diff"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><circle cx="7" cy="6" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="7" cy="18" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="17" cy="9" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M7 8v8 M17 11c0 3-4 3-8.5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
@@ -6785,6 +6806,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
   </div>
 </div>
 <nav id="prail" aria-label="Side panel">
+  <div id="prComputers" hidden aria-label="Computers"></div>
   <button class="prb" id="prSide" title="Side chats"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M4 6.5A1.5 1.5 0 0 1 5.5 5h13A1.5 1.5 0 0 1 20 6.5v8a1.5 1.5 0 0 1-1.5 1.5H11l-4 3.5V16H5.5A1.5 1.5 0 0 1 4 14.5z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></button>
   <button class="prb" id="prEdits" title="Edits"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M14.5 5.5l4 4L9 19H5v-4z M12.5 7.5l4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg></button>
   <span class="prsp" aria-hidden="true"></span>
@@ -9721,16 +9743,58 @@ document.addEventListener('ccd-update-changed',()=>{if(settingsOpen())renderAbou
 /* The desktop app's server (window.ClaudeConsoleDesktop.serverInfo): this computer,
    where the app runs the console itself, or another computer at an address. Change…
    opens the app's Server dialog. */
-function renderAboutServer(){const D=window.ClaudeConsoleDesktop;
+function renderAboutServer(){const D=window.ClaudeConsoleDesktop,A=window.ClaudeConsoleApp;
+  if((!D||!D.serverInfo)&&A&&A.serverInfo){   /* the Android app: the computer this page is on */
+    let i=null;try{i=JSON.parse(A.serverInfo());}catch(e){}
+    $('#abSrv').hidden=!i;if(!i)return;
+    $('#abSrvWhere').textContent=i.name||'';
+    $('#abSrvHint').textContent='The console at '+i.url+'. '+(i.count>1?'The app has '+i.count+
+      ' computers; the buttons on the right rail switch between them.':'Change… adds another computer.');
+    return;}
   if(!D||!D.serverInfo){$('#abSrv').hidden=true;return;}
   D.serverInfo().then(i=>{if(!i)return;$('#abSrv').hidden=false;
     $('#abSrvWhere').textContent=i.mode==='local'?'This computer':'Another computer';
     $('#abSrvHint').textContent=i.mode==='local'
       ?'The app runs this console here'+(i.claude?', with '+i.claude:'')+', and stops it when the app quits.'
       :'The console at '+i.url+'.';}).catch(()=>{});}
-$('#abSrvChange').onclick=()=>{const D=window.ClaudeConsoleDesktop;if(!D||!D.serverDialog)return;
-  closeSettings();D.serverDialog().catch(()=>{});};
+$('#abSrvChange').onclick=()=>{const D=window.ClaudeConsoleDesktop,A=window.ClaudeConsoleApp;
+  if(D&&D.serverDialog){closeSettings();D.serverDialog().catch(()=>{});}
+  else if(A&&A.serverDialog){closeSettings();A.serverDialog();}};
 document.addEventListener('ccd-server-changed',()=>{if(settingsOpen())renderAboutServer();});
+/* The Android app's computers (window.ClaudeConsoleApp, each page asking about its
+   own): computers() is {current, list:[{id,name,initials,url,waiting,unseen}]} and
+   the app calls ccaComputersChanged() when the list or what waits changes. Tap a
+   button to show that computer, long-press it to edit or remove it, + to add one. */
+const ADD_COMPUTER_SVG='<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">'+
+  '<rect x="3" y="4" width="18" height="12.5" rx="1.8" fill="none" stroke="currentColor" stroke-width="1.6"/>'+
+  '<path d="M9 20.5h6 M12 16.5v4 M12 7.6v5.3 M9.35 10.25h5.3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
+function compData(){const A=window.ClaudeConsoleApp;if(!A||!A.computers)return null;
+  try{const d=JSON.parse(A.computers());return d&&Array.isArray(d.list)?d:null;}catch(e){return null;}}
+function compDot(n,unseen){return n?'<span class="cdot">'+Math.min(n,9)+'</span>':unseen?'<span class="cdot done"></span>':'';}
+function compTip(c,shown){return c.name+' · '+c.url+(shown?' · shown':'')+(c.waiting?' · '+c.waiting+' waiting for you':c.unseen?' · a turn finished':'');}
+function compSync(){const d=compData(),box=$('#prComputers'),mt=$('#mtComp');
+  if(!d){box.hidden=true;mt.hidden=true;return;}
+  const list=d.list,multi=list.length>1,A=window.ClaudeConsoleApp;
+  box.hidden=false;box.innerHTML='';
+  if(multi)list.forEach(c=>{const b=document.createElement('button'),shown=c.id===d.current;
+    b.type='button';b.className='compbtn'+(shown?' on':'');b.dataset.id=c.id;
+    b.innerHTML=esc(c.initials||'?')+(shown?'':compDot(c.waiting,c.unseen));
+    b.title=compTip(c,shown)+'\nLong-press to edit or remove';b.setAttribute('aria-label',compTip(c,shown));
+    b.onclick=()=>{if(!shown)A.switchTo(c.id);};
+    b.oncontextmenu=e=>{e.preventDefault();A.computerMenu(c.id);};
+    box.appendChild(b);});
+  const add=document.createElement('button');add.type='button';add.className='prb';add.id='prCompAdd';
+  add.title='Add a computer: each one gets a button here and keeps running while another is shown';
+  add.innerHTML=ADD_COMPUTER_SVG;add.onclick=()=>A.addComputer();box.appendChild(add);
+  mt.hidden=!multi;
+  if(multi){const cur=list.find(c=>c.id===d.current)||list[0],others=list.filter(c=>c!==cur);
+    const waiting=others.reduce((n,c)=>n+(c.waiting||0),0),unseen=others.some(c=>c.unseen);
+    mt.innerHTML=esc(cur.initials||'?')+compDot(waiting,unseen);
+    mt.title=cur.name+' — the other computers'+(waiting?' · '+waiting+' waiting for you':'');}
+  if(settingsOpen())renderAboutServer();}
+$('#mtComp').onclick=()=>{const A=window.ClaudeConsoleApp;if(A&&A.computersDialog)A.computersDialog();};
+window.ccaComputersChanged=compSync;
+compSync();
 $('#abCheck').onclick=()=>{const A=window.ClaudeConsoleApp;if(!A)return;abChecking=true;renderAbout();
   try{A.check();}catch(e){abChecking=false;renderAbout();}};
 $('#abUpdate').onclick=()=>{try{window.ClaudeConsoleApp.update();}catch(e){}};
