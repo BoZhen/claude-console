@@ -6666,6 +6666,11 @@ body.tabdrag,body.tabdrag .stab{cursor:grabbing}
   #sb-backdrop.show{display:block;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:35}
   #sbresize,#drresize{display:none}
 }
+/* The open session list leaves the toolbar (narrow) and the rail (from 600 px) free,
+   so they work while it is open: switching to another computer in the Android app,
+   Settings, search. */
+@media(max-width:599px){#sidebar,#sb-backdrop.show{top:32px}}
+@media(min-width:600px) and (max-width:860px){#sb-backdrop.show{right:var(--railw)}}
 /* Medium widths (an unfolded foldable, a tablet, a half-width window): an open
    drawer docks at 45% of the width and the chat keeps the rest (see drawerLayout). */
 @media(min-width:600px) and (max-width:860px){
@@ -9840,6 +9845,10 @@ function switchAccount(s,to){
 loadAccounts();
 $('#navtoggle').onclick=toggleSidebar;
 $('#sb-backdrop').onclick=closeSidebar;
+/* the toolbar and the rail stay usable over the open session list; using them puts
+   the list away (capture phase: before the button does its work) */
+document.addEventListener('click',e=>{if(window.innerWidth<=860&&$('#sidebar').classList.contains('open')&&
+  e.target.closest&&e.target.closest('#mtools,#prail'))closeSidebar();},true);
 /* effort pill: click to pick thinking depth (low/medium/high/xhigh/max) */
 $('#effort').onclick=ev=>{ev.stopPropagation();toggleCardMenu(ev.currentTarget,
   EFFORTS.map(e=>({label:(e===curEffort?'● ':'○ ')+e,fn:()=>setEffort(e)})));};
