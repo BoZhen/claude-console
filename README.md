@@ -178,7 +178,8 @@ which is the whole point.
   sixth setting,
   **ultracode**, runs at xhigh and opts every message into multi-agent
   orchestration.
-- **New session dialog** — browse or create a folder, then choose the model,
+- **New session dialog** — browse or create a folder, optionally name the session (else
+  its first message names it), then choose the model,
   thinking effort and permission mode (⏩ Full auto, the default / ⚡ Auto-accept / 🔐 Approve / 📋 Plan).
   The model list can be refreshed inside the dialog. Active-session controls remain available.
 - **Side chats** — select text in a message and choose **Ask in side chat**: a separate

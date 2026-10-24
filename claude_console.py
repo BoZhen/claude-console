@@ -3918,6 +3918,9 @@ class ChatSession:
         self.viewers = set()   # currently-attached ChatSockets
         self.busy = False
         self.ended = False
+        # the name given in New session: the title until claude's session_id is known,
+        # then saved like a rename (custom labels are keyed by that id, see set_name)
+        self.pending_name = ""
         self.cc_id = resume_cc   # claude's own session_id; preset when resuming
         self.resume_cc = resume_cc
         self._pending = {}       # approval_id -> asyncio.Future
@@ -3958,6 +3961,11 @@ class ChatSession:
         self._agent_tasks = {}    # CLI task id -> Agent tool_use id, for the task_* lifecycle messages
         self.event_seq = 0        # monotonic event number, so a viewer can ask for the gap
 
+    def _keep_start_name(self):
+        """Saves the name given in New session once claude's session_id is known."""
+        if self.pending_name and self.cc_id and set_name(self.cc_id, self.pending_name):
+            self.pending_name = ""
+
     def preload(self):
         """Populate history from the on-disk transcript before resuming."""
         if self.resume_cc:
@@ -3968,11 +3976,14 @@ class ChatSession:
             self._fold_tasks(self.log)   # the plan the session was left holding
 
     def title(self):
-        """Custom label if the user set one, else the first user message."""
+        """Custom label if the user set one (or gave one in New session), else the
+        first user message."""
         if self.cc_id:
             nm = load_names().get(self.cc_id)
             if nm:
                 return nm
+        if self.pending_name:
+            return self.pending_name
         for e in self.log:
             if e.get("kind") == "user_text" and (e.get("text") or "").strip():
                 return e["text"].strip().replace("\n", " ")[:60]
@@ -4177,6 +4188,7 @@ class ChatSession:
                         self.compacting = False
                     elif e["kind"] == "ready":
                         self.cc_id = e.get("session_id") or self.cc_id
+                        self._keep_start_name()
                         if self.cc_id:   # record this session's mode/model once
                             save_pref(self.cc_id, mode=self.mode, model=self.model, effort=self.effort)
                             if self.is_side and not self._side_registered:
@@ -4382,6 +4394,7 @@ class ChatSession:
         elif isinstance(msg, AssistantMessage):
             if not self.cc_id and getattr(msg, "session_id", None):
                 self.cc_id = msg.session_id
+                self._keep_start_name()
             for b in msg.content:
                 if isinstance(b, TextBlock) and b.text.strip():
                     evs.append({"kind": "assistant_text", "text": b.text})
@@ -4401,6 +4414,7 @@ class ChatSession:
         elif isinstance(msg, ResultMessage):
             if getattr(msg, "session_id", None) and not self.cc_id:
                 self.cc_id = msg.session_id
+                self._keep_start_name()
             evs.append({"kind": "turn_done", "subtype": msg.subtype,
                         "isError": msg.is_error, "numTurns": msg.num_turns,
                         "cost": msg.total_cost_usd})
@@ -5256,6 +5270,8 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             sid = secrets.token_hex(6)
             sess = ChatSession(sid, cwd, msg.get("model") or "", _sanitize_mode(msg.get("mode")),
                                effort=_sanitize_effort(msg.get("effort")))
+            # an optional name from the dialog, on one line, as a rename would store it
+            sess.pending_name = " ".join(str(msg.get("name") or "").split())[:120]
             try:
                 await sess.start()
             except Exception as e:
@@ -5267,7 +5283,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             self.session = sess
             sess.attach(self)
             self._say({"type": "started", "id": sid, "cwd": cwd, **reply,
-                       "name": os.path.basename(cwd) or cwd,
+                       "name": os.path.basename(cwd) or cwd, "title": sess.title(),
                        "model": sess.model or "default", "mode": sess.mode, "effort": sess.effort,
                        "account": sess.account})
         elif mt == "side_new":
@@ -6938,6 +6954,8 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
         <input id="newCwd" class="path-input" autocomplete="off" spellcheck="false" placeholder="~/project" required>
         <button id="newBrowse" class="dialog-icon" type="button" title="Browse folders" aria-label="Browse folders" data-session-icon="folder-open"></button>
       </div></div>
+      <div class="dialog-field"><label for="newName">Name (optional)</label>
+        <input id="newName" autocomplete="off" spellcheck="false" maxlength="120" placeholder="empty: named after your first message"></div>
       <div class="dialog-field"><label for="newModel">Model</label><div class="path-row">
         <select id="newModel"><option value="opus">model: opus</option></select>
         <button id="mrefresh" class="dialog-icon" type="button" title="Refresh model list" aria-label="Refresh model list" data-session-icon="refresh"></button>
@@ -7775,7 +7793,7 @@ function onMsg(e){const m=JSON.parse(e.data);
     const startedTab=ensureTab(m,true);
     if(startedTab){startedTab.lastSeq=0;startedTab.serverSeq=0;persistTabs();renderTabs();}
     restoredViewId=m.id;
-    addNotice('new session « '+(m.name||'')+' »'+(m.effort?' · '+m.effort+' effort':'')+' in '+m.cwd+' — type your first message to begin');reqList();loadTree();}
+    addNotice('new session « '+(m.title||m.name||'')+' »'+(m.effort?' · '+m.effort+' effort':'')+' in '+m.cwd+' — type your first message to begin');reqList();loadTree();}
   else if(m.type==='attached'){
     /* a delta is only safe on top of the view it was measured against */
     const incremental=!!m.events_delta&&restoredViewId===m.id,stick=incremental&&atBottom();
@@ -8758,7 +8776,7 @@ function newEffortOptions(value){fillSelect($('#newEffort'),EFFORTS.map(v=>[v,v]
 function newSession(path){if($('#newSessionDialog').open)return;
   closeCardMenu();
   const dir=(typeof path==='string'&&path)||currentFolder()||'~';
-  $('#newCwd').value=dir;$('#newSessionError').textContent='';
+  $('#newCwd').value=dir;$('#newName').value='';$('#newSessionError').textContent='';
   const folders=new Map();if(cwd)folders.set(cwd,cwd);
   (projData||[]).forEach(p=>folders.set(p.path,p.path));
   recentFolders.forEach(p=>folders.set(p,p));
@@ -8780,7 +8798,7 @@ async function submitNewSession(e){e.preventDefault();if(newSessionRequest)retur
   const path=$('#newCwd').value.trim();if(!path){$('#newSessionError').textContent='Choose a working directory';return;}
   if(!ws||ws.readyState!==1){$('#newSessionError').textContent='Not connected. Wait for the connection, then try again.';return;}
   const request={id:'new-'+Date.now()+'-'+(++newSessionSerial),phase:'validating',abort:new AbortController(),
-    model:$('#newModel').value,mode:$('#newMode').value,effort:$('#newEffort').value};
+    model:$('#newModel').value,mode:$('#newMode').value,effort:$('#newEffort').value,name:$('#newName').value.trim()};
   newSessionRequest=request;$('#newSessionError').textContent='';$('#newSessionFields').disabled=true;
   $('#newSessionSubmit').disabled=true;$('#newSessionSubmit').textContent='Checking...';
   try{const data=await directoryData(path,false,request.abort.signal);
@@ -8788,7 +8806,7 @@ async function submitNewSession(e){e.preventDefault();if(newSessionRequest)retur
     if(!ws||ws.readyState!==1)throw new Error('Not connected. Try again when the connection returns.');
     request.phase='starting';request.cwd=data.path;$('#newCwd').value=data.path;
     $('#newSessionSubmit').textContent='Starting...';$('#newSessionCancel').disabled=true;$('#newSessionClose').disabled=true;
-    ws.send(JSON.stringify({type:'start',requestId:request.id,cwd:data.path,model:request.model,mode:request.mode,effort:request.effort}));
+    ws.send(JSON.stringify({type:'start',requestId:request.id,cwd:data.path,model:request.model,mode:request.mode,effort:request.effort,name:request.name}));
   }catch(error){if(newSessionRequest!==request)return;resetNewSessionRequest();$('#newSessionError').textContent=error.message||'Could not start session';}}
 function handleNewSessionReply(m){const request=newSessionRequest;
   if(!request||request.phase!=='starting'||m.requestId!==request.id)return false;
