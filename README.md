@@ -26,8 +26,8 @@ things a raw terminal tangles together:
   and choose <b>Ask in side chat</b> (the popup over the selected formula); a separate conversation
   about it opens on the right, beside the chat, on its own model. Bottom left: the agent asking
   <em>you</em> a question, with the plan folded to its active step and a file attached to the next
-  message. Bottom right: a phone, with the usage, the drawer's tabs, search and Settings in a
-  toolbar above the header. All in the One Light theme, from a scripted demo session.</sub>
+  message. Bottom right: a phone, with the context and usage rings, the drawer's tabs, search
+  and Settings in a toolbar above the header. All in the One Light theme, from a scripted demo session.</sub>
 </p>
 
 It drives Claude Code through the **Claude Agent SDK** (which runs the real
@@ -188,7 +188,7 @@ which is the whole point.
   another), and stays out of the main session's context and out of the session list. Each
   session keeps its own side chats. **+ New side chat** starts one with no quote, which knows
   the project but not the conversation. Its header shows how much of its own context window
-  it has used, like the main chat's Context meter.
+  it has used, as a ring like the main chat's Context.
 
 ### Everything else
 
@@ -203,15 +203,17 @@ which is the whole point.
   screen, Narrow (820 px), Medium (1000 px, the default), Wide (1200 px) or the full window.
   Text size scales it with the rest; narrow windows always use their whole width. Kept per
   device.
-- **At-a-glance status** — context-window, rolling 5-hour and weekly usage meters
-  in the header, including any per-model weekly quota the account carries (Fable
-  on Max), each with its reset time on hover; a floating status pill (ready / working timer / live token counts) plus
+- **At-a-glance status** — rings in the header for the context window and the rolling
+  5-hour and weekly usage, including any per-model weekly quota the account carries (Fable
+  on Max). A ring fills as the share grows and turns from green to yellow, orange and red;
+  hovering it, or tapping it on a touch screen, shows the figures (tokens and model, or the
+  share used and the reset time). A floating status pill (ready / working timer / live token counts) plus
   the model and effort pills above a full-width composer. Past 60% of the window
   the empty composer reads *update your snapshot*.
 - **Wide and narrow screens** — when the window is wide enough (a desktop, a tablet, an
   unfolded foldable), the drawer docks beside the chat instead of covering it, and a rail on
   the right edge opens Side chats, Edits, Git diff and Settings. Below 600 px a toolbar above
-  the header carries the usage meters, the drawer's tabs, search and Settings.
+  the header carries the context and usage rings, the drawer's tabs, search and Settings.
 - **About** — ⚙ Settings → About shows the console's version (the commit the server started
   from). In the Android and desktop apps it also shows the app's own version with **Check for
   updates**; the console serves their updates (`api/android/*`, `api/desktop/*`) from

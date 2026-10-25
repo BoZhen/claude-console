@@ -6007,6 +6007,8 @@ html.in-desktop-app{--railw:0px}
 #mtools .mt-usage{flex:1;min-width:0;overflow:hidden;display:flex;align-items:center;gap:9px;white-space:nowrap;
   font-size:11px;font-weight:600;font-family:var(--fmono);color:var(--fg)}
 #mtools .mtseg{display:inline-flex;align-items:center;gap:4px}
+#mtools .ring{width:15px;height:15px}
+#mtools .mtuse{display:inline-flex;align-items:center;gap:9px}
 #mtools .mtseg .ulabel{opacity:.7}
 #mtools .mtb{position:relative;width:29px;height:28px;border:0;border-radius:6px;background:transparent;color:var(--mut);
   display:grid;place-items:center;padding:0;cursor:pointer;flex-shrink:0}
@@ -6063,10 +6065,10 @@ html.in-desktop-app #prail{display:none!important}
 #sideBar{display:flex;gap:8px;align-items:center;padding:6px 10px;border-bottom:1px solid var(--line);background:var(--bg2);flex-shrink:0}
 #sideBar .sback{color:var(--acc);cursor:pointer;font-size:12px;white-space:nowrap}
 #sideBar .stitle{flex:1;min-width:0;color:var(--mut);font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-/* the side chat's own context-window use: the main meter's cells, smaller */
+/* the side chat's own context-window use: a ring, a little smaller than the header's */
 #sideBar .suse{display:inline-flex;align-items:center;gap:4px;flex-shrink:0;font-size:11px;font-weight:600;color:var(--mut);font-family:var(--fmono);white-space:nowrap}
 #sideBar .suse[hidden]{display:none}
-#sideBar .suse .cell{width:5px;height:10px}
+#sideBar .suse .ring{width:14px;height:14px}
 #sideCtx{flex-shrink:0;margin:8px 10px 0;padding:6px 9px;border-left:3px solid var(--acc);background:var(--bg2);border-radius:0 6px 6px 0;
   font-size:12px;color:var(--mut);max-height:84px;overflow:auto;white-space:pre-wrap}
 #sideStream{flex:1;min-height:0;overflow:auto;padding:10px}
@@ -6167,9 +6169,6 @@ html.in-desktop-app #prail{display:none!important}
 .ctx .ulabel,.usage .ulabel{opacity:.7}
 .usage .useg{display:inline-flex;align-items:center;gap:5px}
 .usage .useg + .useg::before{content:"|";opacity:.3;font-weight:400}   /* divider between 5h | 7d */
-/* shared segmented meter: 5 cells × 20%, whole bar coloured by the total % (Context + Usage) */
-.cells{display:inline-flex;gap:2px;align-items:center}
-.cells .cell{width:7px;height:13px;border-radius:2px;background:var(--bg3);border:1px solid var(--line);box-sizing:border-box;transition:background .25s,box-shadow .25s}
 /* Meter signal ramp — FIXED hues, deliberately not the semantic tokens.
    green/amber/orange/red mean the same thing in every theme, and the semantic
    tokens are tuned for text: pushing them to a text contrast ratio turns the
@@ -6179,10 +6178,20 @@ html.in-desktop-app #prail{display:none!important}
 :root[data-theme="light"],:root[data-theme="solarized-light"],:root[data-theme="catppuccin-latte"],
 :root[data-theme="gruvbox-light"],:root[data-theme="rose-pine-dawn"],:root[data-theme="one-light"],
 :root[data-theme="ayu-light"]{--mg:#22a83f;--my:#d9a800;--mo:#f57c00;--mr:#ef3f31}
-.cells.lv-g{color:var(--mg)}.cells.lv-y{color:var(--my)}
-.cells.lv-o{color:var(--mo)}.cells.lv-r{color:var(--mr)}
-.cells .cell.on{background:currentColor;border-color:currentColor;box-shadow:0 0 4px currentColor}
-@media(max-width:680px){.usage{display:none!important}}
+/* Ring meters (Context, Usage, a side chat's context): the arc is the share used and
+   takes the level colour, the track the same hue faint. The figures show in #ringTip. */
+.ring{width:16px;height:16px;flex-shrink:0;display:block}
+.ring circle{fill:none;stroke:currentColor;stroke-width:3}
+.ring .rtrack{opacity:.22}
+.ring .rarc{stroke-linecap:round;transition:stroke-dasharray .3s}
+.ring.lv-g{color:var(--mg)}.ring.lv-y{color:var(--my)}.ring.lv-o{color:var(--mo)}.ring.lv-r{color:var(--mr)}
+.rmeter{cursor:default}
+#ringTip{position:fixed;z-index:1000;max-width:min(340px,calc(100vw - 12px));padding:6px 9px;border-radius:7px;
+  background:var(--bg2);color:var(--fg);border:1px solid var(--line);box-shadow:0 6px 20px rgba(0,0,0,.28);
+  font-size:12px;line-height:1.5;white-space:pre-line;font-family:var(--fmono);pointer-events:none}
+#ringTip[hidden]{display:none}
+/* narrow screens: the toolbar above the header carries Context and Usage together */
+@media(max-width:599px){header .ctx,header .usage{display:none!important}}
 /* the way back down after reading up: over the chat's bottom-right corner, shown while
    the view is off the tail, hidden once it follows again or there is nothing to scroll */
 .jump{position:absolute;right:22px;top:-46px;width:34px;height:34px;border-radius:50%;z-index:6;
@@ -7903,36 +7912,65 @@ function fmtTok(n){if(n==null)return '?';
   if(n>=1e6)return (n/1e6).toFixed(1).replace(/\.0$/,'')+'M';
   if(n>=1000)return (n/1000).toFixed(n>=1e4?0:1)+'k';
   return ''+n;}
-/* shared segmented meter: 5 cells (20% each), whole bar coloured by the total % */
-function meterLvl(p){return p>80?'r':p>=60?'o':p>=40?'y':'g';}
-function cellBar(pct){const p=Math.max(0,Math.min(100,pct)),lit=Math.min(5,Math.ceil(p/20));
-  let s='<span class="cells lv-'+meterLvl(p)+'">';
-  for(let i=1;i<=5;i++)s+='<span class="cell'+(i<=lit?' on':'')+'"></span>';
-  return s+'</span>';}
 /* Past SNAPSHOT_AT the empty composer says "update your snapshot" instead of
    inviting a message: compaction is on its way, and a snapshot written now is
    what carries the session across it. The meter alone is easy to stop seeing;
    the box you are about to type into is not. */
 const TA_HINT='Type a message…', SNAPSHOT_AT=60;
+/* meter level by the share used: green below 40%, yellow from 40, orange from 60, red above 80 */
+function meterLvl(p){return p>80?'r':p>=60?'o':p>=40?'y':'g';}
+/* A ring: the arc is the share used (pathLength 100, so the dash is the percentage),
+   coloured by meterLvl, starting at the top. */
+function ringSvg(pct){const p=Math.max(0,Math.min(100,pct));
+  return '<svg class="ring lv-'+meterLvl(p)+'" viewBox="0 0 20 20" aria-hidden="true">'+
+    '<circle class="rtrack" cx="10" cy="10" r="7.5"/>'+
+    (p>0?'<circle class="rarc" cx="10" cy="10" r="7.5" pathLength="100" stroke-dasharray="'+p.toFixed(1)+' 100" transform="rotate(-90 10 10)"/>':'')+'</svg>';}
+/* the figures behind a context ring */
+function ctxTip(c,pct,what){const n=v=>v==null?'?':Number(v).toLocaleString('en-US');
+  return (what||'Context')+' '+pct+'% used\n'+n(c.totalTokens)+' / '+n(c.maxTokens)+' tokens'+(c.model?'\n'+c.model:'');}
+/* puts a meter's figures on it, for #ringTip and screen readers */
+function setTip(el,t){el.dataset.tip=t||'';el.setAttribute('aria-label',(t||'').replace(/\n/g,' · '));el.removeAttribute('title');
+  if(tipFor===el&&!ringTip.hidden)tipShow(el);}
 function renderCtx(c){const el=$('#ctx');curCtx=c||null;
   const pct=(c&&c.percentage!=null)?Math.round(c.percentage):null;
   ta.placeholder=(pct!=null&&pct>=SNAPSHOT_AT)?'update your snapshot':TA_HINT;
+  mtRender();
   if(pct==null){el.style.display='none';return;}
-  el.className='ctx';el.style.display='inline-flex';
-  el.innerHTML='<span class="ulabel">Context</span>'+cellBar(pct)+'<span>'+pct+'%</span>';
-  el.title='context '+(c.totalTokens||'?')+' / '+(c.maxTokens||'?')+' tokens ('+pct+'%)'+(c.model?' · '+c.model:'');
+  el.className='ctx rmeter';el.style.display='inline-flex';
+  el.innerHTML='<span class="ulabel">Context</span>'+ringSvg(pct);
+  setTip(el,ctxTip(c,pct));
   setResolvedModel(c.model, c.maxTokens);}
+/* Ring details: the figures in a small box below the ring, on hover with a mouse, on a
+   tap on a touch screen (a second tap, a tap elsewhere, scrolling or resizing closes it). */
+/* var, not let: renderCtx can run before these lines while the page starts */
+var ringTip=document.createElement('div');ringTip.id='ringTip';ringTip.setAttribute('role','tooltip');ringTip.hidden=true;
+var tipFor=null,tipPinned=false;
+function tipShow(m){const t=m.dataset.tip;if(!t){tipHide();return;}
+  if(!ringTip.isConnected)document.body.append(ringTip);
+  ringTip.textContent=t;ringTip.hidden=false;tipFor=m;
+  const r=m.getBoundingClientRect(),w=ringTip.offsetWidth;
+  ringTip.style.top=Math.round(r.bottom+6)+'px';
+  ringTip.style.left=Math.round(Math.max(6,Math.min(innerWidth-w-6,r.left+r.width/2-w/2)))+'px';}
+function tipHide(){ringTip.hidden=true;tipFor=null;tipPinned=false;}
+document.addEventListener('pointerover',e=>{if(e.pointerType!=='mouse'||tipPinned)return;
+  const m=e.target.closest&&e.target.closest('.rmeter');if(m){if(m!==tipFor)tipShow(m);}else if(tipFor)tipHide();});
+document.addEventListener('click',e=>{const m=e.target.closest&&e.target.closest('.rmeter');
+  if(!m){if(tipFor)tipHide();return;}
+  if(tipPinned&&tipFor===m){tipHide();return;}
+  tipShow(m);tipPinned=true;});
+addEventListener('resize',()=>{if(tipFor)tipHide();});
+document.addEventListener('scroll',()=>{if(tipFor)tipHide();},true);
 /* rolling 5-hour usage limit (Claude-Code-CLI style: Usage ░░░ 2% (4h 38m / 5h)) */
 function fmtDur(ms){if(ms==null||ms<=0)return '0m';const m=Math.floor(ms/60000),h=Math.floor(m/60);
   return h>0?(h+'h '+(m%60)+'m'):(m+'m');}
 function renderUsage(u){const el=$('#usage');const f=u&&u.five_hour,w=u&&u.seven_day;
   /* per-model weekly windows (e.g. Fable); label comes from the server */
   const sc=(u&&u.model_scoped)||[];
-  if((!f||f.utilization==null)&&(!w||w.utilization==null)&&!sc.length){el.style.display='none';mtRenderUsage(null);return;}
+  curUsage=u||null;
+  if((!f||f.utilization==null)&&(!w||w.utilization==null)&&!sc.length){el.style.display='none';curUsage=null;mtRender();return;}
   function seg(o,lbl){if(!o||o.utilization==null)return '';
-    const pct=Math.round(o.utilization);
-    return '<span class="useg"><span class="ulabel">'+lbl+'</span>'+cellBar(pct)+'<span>'+pct+'%</span></span>';}
-  el.className='usage';el.style.display='inline-flex';
+    return '<span class="useg"><span class="ulabel">'+esc(lbl)+'</span>'+ringSvg(Math.round(o.utilization))+'</span>';}
+  el.className='usage rmeter';el.style.display='inline-flex';
   el.innerHTML='<span class="ulabel">Usage</span>'+seg(f,'5h')+seg(w,'7d')+sc.map(o=>seg(o,o.label)).join('');
   let t='';
   function row(lbl,o){if(!o||o.utilization==null)return;
@@ -7941,14 +7979,19 @@ function renderUsage(u){const el=$('#usage');const f=u&&u.five_hour,w=u&&u.seven
   const all=[['five_hour','5-hour'],['seven_day','7-day'],['seven_day_sonnet','7-day Sonnet'],['seven_day_opus','7-day Opus']];
   all.forEach(([k,lbl])=>row(lbl,u&&u[k]));
   sc.forEach(o=>row('7-day '+o.label,o));
-  el.title=t;mtRenderUsage(u);}
-/* the same allowance, compact, in the narrow-screen toolbar */
-function mtRenderUsage(u){const el=$('#mtUsage');if(!el)return;
-  const f=u&&u.five_hour,w=u&&u.seven_day,sc=(u&&u.model_scoped)||[];
-  const seg=(o,l)=>(o&&o.utilization!=null)?'<span class="mtseg"><span class="ulabel">'+esc(l)+'</span>'+
-    cellBar(Math.round(o.utilization))+'<span>'+Math.round(o.utilization)+'%</span></span>':'';
-  el.innerHTML=seg(f,'5h')+seg(w,'7d')+sc.map(o=>seg(o,o.label)).join('');
-  el.title=$('#usage').title||'';}
+  usageTip=t;setTip(el,t);mtRender();}
+/* The narrow-screen toolbar: Context and the allowance together, as rings, each group
+   with its figures in #ringTip. */
+var curUsage=null,usageTip='';   /* var: renderCtx calls mtRender, maybe before this line ran */
+function mtRender(){const el=$('#mtUsage');if(!el)return;
+  const c=curCtx,pct=(c&&c.percentage!=null)?Math.round(c.percentage):null;
+  const u=curUsage,f=u&&u.five_hour,w=u&&u.seven_day,sc=(u&&u.model_scoped)||[];
+  const seg=(o,l)=>(o&&o.utilization!=null)?'<span class="mtseg"><span class="ulabel">'+esc(l)+'</span>'+ringSvg(Math.round(o.utilization))+'</span>':'';
+  const segs=seg(f,'5h')+seg(w,'7d')+sc.map(o=>seg(o,o.label)).join('');
+  el.innerHTML=(pct!=null?'<span class="mtseg rmeter" id="mtCtx"><span class="ulabel">ctx</span>'+ringSvg(pct)+'</span>':'')+
+    (segs?'<span class="mtuse rmeter" id="mtUse">'+segs+'</span>':'');
+  if(pct!=null)setTip($('#mtCtx'),ctxTip(c,pct));
+  if(segs)setTip($('#mtUse'),usageTip);}
 /* The allowance shown belongs to whichever login is running the attached
    session, not to the console. Getting this wrong quotes the wrong budget. */
 function loadUsage(){fetch('api/usage?account='+encodeURIComponent(curAccount))
@@ -9361,11 +9404,11 @@ function sideShowList(){$('#sidec').classList.remove('on-chat');$('#sideList').s
 function sideShowChat(){$('#sidec').classList.add('on-chat');$('#sideList').style.display='none';$('#sideChat').hidden=false;}
 function sideClearStream(){sideStream().innerHTML='';sideRenderCtx(null);}
 /* The side chat's context-window use, from its session's own "context" messages and
-   the ctx in "attached": cells and a percentage beside the model, tokens in the tooltip. */
+   the ctx in "attached": a ring beside the model, the figures on hover or tap. */
 function sideRenderCtx(c){const el=$('#sideUse');const pct=(c&&c.percentage!=null)?Math.round(c.percentage):null;
-  if(pct==null){el.hidden=true;el.innerHTML='';return;}
-  el.hidden=false;el.innerHTML=cellBar(pct)+'<span>'+pct+'%</span>';
-  el.title='side chat context '+(c.totalTokens||'?')+' / '+(c.maxTokens||'?')+' tokens ('+pct+'%)'+(c.model?' · '+c.model:'');}
+  if(pct==null){el.hidden=true;el.innerHTML='';if(tipFor===el)tipHide();return;}
+  el.hidden=false;el.classList.add('rmeter');el.innerHTML=ringSvg(pct);
+  setTip(el,ctxTip(c,pct,'Side chat context'));}
 function askInSide(selection,context){openDrawer('side');sideOpenNew(selection,context);}
 function sideOpenNew(selection,context){
   sideWsDrop();sideParent=curCC||null;
