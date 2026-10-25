@@ -17,14 +17,14 @@
   <img src="figs/choices-and-attachments.png" width="74.5%"
        alt="Claude Console —— 带选项的 AskUserQuestion 卡片，plan 折叠到当前一步，输入框里有一个待发送的文件">
   <img src="figs/phone.png" width="21.5%"
-       alt="手机上的 Claude Console —— 顶栏上方的工具栏，以及同一个回答">
+       alt="手机上的 Claude Console —— 工具栏、带上下文和用量圆环的顶栏，以及同一个回答">
 </p>
 <p align="center">
   <sub>上：回答向下滚动时 plan 始终钉在上方；公式由 KaTeX 渲染，文件路径变成链接，点击可在
   web file manager 中打开。辅助对话（side chats）：在消息里选中文字，点 <b>Ask in side chat</b>
   （选中的公式上方的弹出框），关于它的另一个对话就在右侧、主对话旁边打开，用它自己的模型。
   左下：agent 反过来问<em>你</em>问题，plan 折叠到当前一步，下一条消息里附着一个文件。右下：
-  手机上，上下文和用量圆环、抽屉的各个标签页、搜索和设置都在顶栏上方的工具栏里。均为 One Light 主题，
+  手机上，抽屉的各个标签页、搜索和设置在顶栏上方的工具栏里，上下文和用量圆环在顶栏里。均为 One Light 主题，
   来自一个脚本生成的演示 session。</sub>
 </p>
 
@@ -55,7 +55,7 @@
   当前任务；计划完成后两秒自行收起，按 `read` 可立即收起，收起过的计划切换或刷新
   时不会再出现。背后的工具由控制台提供给 session，只在多步任务时才要求建计划；
   一轮正常结束时，计划里还没关的步骤由控制台代为关闭。
-- **Plan 历史** —— 悬停区的 `history` 按钮或右上角的 `☑ plans` 药丸列出本 session 的全部
+- **Plan 历史** —— 悬停区的 `history` 按钮或右上角的 ☑ 按钮列出本 session 的全部
   计划，最新在前，每条带
   步骤、开始时间、用时，以及完成该计划的那一轮结束后由一个廉价模型写的一两句摘要。
   列表按 session 保存，恢复 session 后仍在；恢复时也会从 transcript 里补上控制台
@@ -164,7 +164,8 @@
   60% 以上时，空输入框会显示 *update your snapshot*。
 - **宽屏和窄屏** —— 窗口足够宽时（桌面、平板、展开的折叠屏），抽屉停靠在对话旁边而不是盖住
   它，右边缘的一列按钮打开 Side chats、Edits、Git diff 和 Settings。窄于 600 px 时，顶栏上方
-  有一条工具栏，放着上下文和用量圆环、抽屉的各个标签页、搜索和设置。
+  有一条工具栏，放着抽屉的各个标签页、搜索和设置；上下文和用量圆环留在顶栏里，紧凑地排成一组，
+  在 ☑ plans 按钮旁边。
 - **About** —— ⚙ Settings → About 显示 console 的版本（服务器启动时所在的 commit）。在 Android
   和桌面 app 里还显示 app 自己的版本和 **Check for updates**；它们的更新由 console 提供
   （`api/android/*`、`api/desktop/*`），文件在 `~/.local/share/claude-console/`。

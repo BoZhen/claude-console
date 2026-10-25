@@ -5996,20 +5996,15 @@ html.in-desktop-app{--railw:0px}
 #prail #prApp{order:9}
 #prail #prSet{order:10;margin-bottom:8px}
 /* Narrow screens (< 600 px): a slim toolbar above the header with what the header
-   has no room for: the usage, the drawer's tabs (there is no rail there), search,
-   settings, and in the Android app its version and updates. */
+   has no room for: the drawer's tabs (there is no rail there), search, settings, and
+   in the Android app its version and updates. */
 #mtools{display:none}
 @media(max-width:599px){
   #mtools{display:flex;align-items:center;gap:1px;height:32px;flex-shrink:0;padding:0 4px 0 10px;
     background:var(--bg2);border-bottom:1px solid var(--line)}
   #drawer{top:32px;height:calc(100% - 32px)}   /* below the toolbar, whose buttons then toggle it */
 }
-#mtools .mt-usage{flex:1;min-width:0;overflow:hidden;display:flex;align-items:center;gap:9px;white-space:nowrap;
-  font-size:11px;font-weight:600;font-family:var(--fmono);color:var(--fg)}
-#mtools .mtseg{display:inline-flex;align-items:center;gap:4px}
-#mtools .ring{width:15px;height:15px}
-#mtools .mtuse{display:inline-flex;align-items:center;gap:9px}
-#mtools .mtseg .ulabel{opacity:.7}
+#mtools::before{content:"";flex:1}   /* the buttons keep to the right */
 #mtools .mtb{position:relative;width:29px;height:28px;border:0;border-radius:6px;background:transparent;color:var(--mut);
   display:grid;place-items:center;padding:0;cursor:pointer;flex-shrink:0}
 #mtools .mtb[hidden]{display:none}
@@ -6190,8 +6185,15 @@ html.in-desktop-app #prail{display:none!important}
   background:var(--bg2);color:var(--fg);border:1px solid var(--line);box-shadow:0 6px 20px rgba(0,0,0,.28);
   font-size:12px;line-height:1.5;white-space:pre-line;font-family:var(--fmono);pointer-events:none}
 #ringTip[hidden]{display:none}
-/* narrow screens: the toolbar above the header carries Context and Usage together */
-@media(max-width:599px){header .ctx,header .usage{display:none!important}}
+/* Narrow screens: Context and Usage as one compact group in the header (#hMeters, short
+   labels, no divider). The names shrink first; when the meters still do not fit, they clip. */
+#hMeters{display:none}
+@media(max-width:599px){header .ctx,header .usage{display:none!important}
+  #hMeters{display:inline-flex;align-items:center;gap:9px;flex:0 1 auto;min-width:0;overflow:hidden;white-space:nowrap;
+    font-size:11px;font-weight:600;font-family:var(--fmono);color:var(--fg)}}
+#hMeters .hmseg{display:inline-flex;align-items:center;gap:4px}
+#hMeters .hmuse{display:inline-flex;align-items:center;gap:9px}
+#hMeters .ulabel{opacity:.7}
 /* the way back down after reading up: over the chat's bottom-right corner, shown while
    the view is off the tail, hidden once it follows again or there is nothing to scroll */
 .jump{position:absolute;right:22px;top:-46px;width:34px;height:34px;border-radius:50%;z-index:6;
@@ -6201,13 +6203,11 @@ html.in-desktop-app #prail{display:none!important}
 .jump[hidden]{display:none}
 @media(max-width:680px){.jump{right:12px}}
 /* header pill: the plan history, reachable when the dock is not showing */
-.hpill{display:inline-flex;align-items:center;gap:5px;height:24px;padding:0 9px;border:1px solid var(--line);
-  border-radius:12px;background:var(--bg3);color:var(--fg);font-family:var(--fmono);font-size:12px;
+.hpill{display:inline-flex;align-items:center;justify-content:center;height:24px;min-width:30px;padding:0 7px;
+  border:1px solid var(--line);border-radius:12px;background:var(--bg3);color:var(--fg);line-height:1;
   cursor:pointer;white-space:nowrap;flex:none;margin-left:auto}
 .hpill:hover{border-color:var(--acc);color:var(--acc)}
 .hpill[hidden]{display:none}
-.hpill span:not(:empty)::before{content:'· '}
-.hpill span{color:var(--mut)}
 #shell{flex:1;display:flex;min-height:0;position:relative}
 #mainCol{flex:1;display:flex;flex-direction:column;min-width:0}
 /* Session tabs — the working set of THIS browser, not the list of what is running.
@@ -6716,7 +6716,6 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
 </head>
 <body>
 <div id="mtools" role="toolbar" aria-label="Tools">
-  <span class="mt-usage" id="mtUsage"></span>
   <button class="mtb" id="mtComp" type="button" hidden></button>
   <button class="mtb" id="mtSide" title="Side chats"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><path d="M4 6.5A1.5 1.5 0 0 1 5.5 5h13A1.5 1.5 0 0 1 20 6.5v8a1.5 1.5 0 0 1-1.5 1.5H11l-4 3.5V16H5.5A1.5 1.5 0 0 1 4 14.5z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></button>
   <button class="mtb" id="mtEdits" title="Edits"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><path d="M14.5 5.5l4 4L9 19H5v-4z M12.5 7.5l4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg></button>
@@ -6730,7 +6729,8 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
   <span class="curname" id="curname">— no session —</span>
   <span class="ctx" id="ctx" title="context-window usage"></span>
   <span class="usage" id="usage" title="usage limits (5h / 7d)"></span>
-  <button class="hpill" id="planhistpill" hidden title="The plans of this session, each with a summary">☑ plans<span id="planhistN"></span></button>
+  <span id="hMeters"></span>
+  <button class="hpill" id="planhistpill" hidden title="The plans of this session, each with a summary" aria-label="Plans"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M8.2 12.4l2.7 2.7 5-5.6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
 </header>
 
 <div id="shell">
@@ -7467,7 +7467,8 @@ function planHistUpsert(it){if(!it||!it.id)return;const i=planHist.findIndex(x=>
   if(i>=0)planHist[i]=it;else planHist.push(it);renderPlanHistPill();if(phistOpened())renderPlanHist();}
 function phistOpened(){return !$('#phist').hasAttribute('hidden');}
 function renderPlanHistPill(){const p=$('#planhistpill');if(!p)return;
-  p.hidden=!sid;$('#planhistN').textContent=planHist.length?String(planHist.length):'';}
+  p.hidden=!sid;const n=planHist.length;
+  p.title=n?(n+' plan'+(n===1?'':'s')+' in this session, each with a summary'):'The plans of this session, each with a summary';}
 function openPlanHist(){phistSel=new Set();renderPlanHist();$('#phist').removeAttribute('hidden');
   if(planHist.some(it=>it.finished&&it.summary==null))wsSend({type:'plan_summaries'});}
 function closePlanHist(){$('#phist').setAttribute('hidden','');}
@@ -7934,7 +7935,7 @@ function setTip(el,t){el.dataset.tip=t||'';el.setAttribute('aria-label',(t||'').
 function renderCtx(c){const el=$('#ctx');curCtx=c||null;
   const pct=(c&&c.percentage!=null)?Math.round(c.percentage):null;
   ta.placeholder=(pct!=null&&pct>=SNAPSHOT_AT)?'update your snapshot':TA_HINT;
-  mtRender();
+  hmRender();
   if(pct==null){el.style.display='none';return;}
   el.className='ctx rmeter';el.style.display='inline-flex';
   el.innerHTML='<span class="ulabel">Context</span>'+ringSvg(pct);
@@ -7967,7 +7968,7 @@ function renderUsage(u){const el=$('#usage');const f=u&&u.five_hour,w=u&&u.seven
   /* per-model weekly windows (e.g. Fable); label comes from the server */
   const sc=(u&&u.model_scoped)||[];
   curUsage=u||null;
-  if((!f||f.utilization==null)&&(!w||w.utilization==null)&&!sc.length){el.style.display='none';curUsage=null;mtRender();return;}
+  if((!f||f.utilization==null)&&(!w||w.utilization==null)&&!sc.length){el.style.display='none';curUsage=null;hmRender();return;}
   function seg(o,lbl){if(!o||o.utilization==null)return '';
     return '<span class="useg"><span class="ulabel">'+esc(lbl)+'</span>'+ringSvg(Math.round(o.utilization))+'</span>';}
   el.className='usage rmeter';el.style.display='inline-flex';
@@ -7979,19 +7980,19 @@ function renderUsage(u){const el=$('#usage');const f=u&&u.five_hour,w=u&&u.seven
   const all=[['five_hour','5-hour'],['seven_day','7-day'],['seven_day_sonnet','7-day Sonnet'],['seven_day_opus','7-day Opus']];
   all.forEach(([k,lbl])=>row(lbl,u&&u[k]));
   sc.forEach(o=>row('7-day '+o.label,o));
-  usageTip=t;setTip(el,t);mtRender();}
-/* The narrow-screen toolbar: Context and the allowance together, as rings, each group
+  usageTip=t;setTip(el,t);hmRender();}
+/* The narrow-screen header: Context and the allowance together, as rings, each group
    with its figures in #ringTip. */
-var curUsage=null,usageTip='';   /* var: renderCtx calls mtRender, maybe before this line ran */
-function mtRender(){const el=$('#mtUsage');if(!el)return;
+var curUsage=null,usageTip='';   /* var: renderCtx calls hmRender, maybe before this line ran */
+function hmRender(){const el=$('#hMeters');if(!el)return;
   const c=curCtx,pct=(c&&c.percentage!=null)?Math.round(c.percentage):null;
   const u=curUsage,f=u&&u.five_hour,w=u&&u.seven_day,sc=(u&&u.model_scoped)||[];
-  const seg=(o,l)=>(o&&o.utilization!=null)?'<span class="mtseg"><span class="ulabel">'+esc(l)+'</span>'+ringSvg(Math.round(o.utilization))+'</span>':'';
+  const seg=(o,l)=>(o&&o.utilization!=null)?'<span class="hmseg"><span class="ulabel">'+esc(l)+'</span>'+ringSvg(Math.round(o.utilization))+'</span>':'';
   const segs=seg(f,'5h')+seg(w,'7d')+sc.map(o=>seg(o,o.label)).join('');
-  el.innerHTML=(pct!=null?'<span class="mtseg rmeter" id="mtCtx"><span class="ulabel">ctx</span>'+ringSvg(pct)+'</span>':'')+
-    (segs?'<span class="mtuse rmeter" id="mtUse">'+segs+'</span>':'');
-  if(pct!=null)setTip($('#mtCtx'),ctxTip(c,pct));
-  if(segs)setTip($('#mtUse'),usageTip);}
+  el.innerHTML=(pct!=null?'<span class="hmseg rmeter" id="hmCtx"><span class="ulabel">ctx</span>'+ringSvg(pct)+'</span>':'')+
+    (segs?'<span class="hmuse rmeter" id="hmUse">'+segs+'</span>':'');
+  if(pct!=null)setTip($('#hmCtx'),ctxTip(c,pct));
+  if(segs)setTip($('#hmUse'),usageTip);}
 /* The allowance shown belongs to whichever login is running the attached
    session, not to the console. Getting this wrong quotes the wrong budget. */
 function loadUsage(){fetch('api/usage?account='+encodeURIComponent(curAccount))

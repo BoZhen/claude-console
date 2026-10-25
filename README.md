@@ -18,7 +18,7 @@ things a raw terminal tangles together:
   <img src="figs/choices-and-attachments.png" width="74.5%"
        alt="Claude Console — an AskUserQuestion card with options, the plan folded to its active step, and a file waiting in the composer">
   <img src="figs/phone.png" width="21.5%"
-       alt="Claude Console on a phone — the toolbar above the header, and the same answer">
+       alt="Claude Console on a phone — the toolbar, the header with the context and usage rings, and the same answer">
 </p>
 <p align="center">
   <sub>Top: the plan stays pinned while the answer scrolls under it; math renders with KaTeX and
@@ -26,8 +26,9 @@ things a raw terminal tangles together:
   and choose <b>Ask in side chat</b> (the popup over the selected formula); a separate conversation
   about it opens on the right, beside the chat, on its own model. Bottom left: the agent asking
   <em>you</em> a question, with the plan folded to its active step and a file attached to the next
-  message. Bottom right: a phone, with the context and usage rings, the drawer's tabs, search
-  and Settings in a toolbar above the header. All in the One Light theme, from a scripted demo session.</sub>
+  message. Bottom right: a phone, with the drawer's tabs, search and Settings in a toolbar above
+  the header, and the context and usage rings in the header. All in the One Light theme, from a
+  scripted demo session.</sub>
 </p>
 
 It drives Claude Code through the **Claude Agent SDK** (which runs the real
@@ -65,7 +66,7 @@ which is the whole point.
   supplies the tool behind it to the session and asks for a plan only for work
   with several distinct steps; a turn that ends normally closes whatever the
   plan still has open.
-- **Plan history** — the dock's `history` button, or the `☑ plans` pill at the
+- **Plan history** — the dock's `history` button, or the ☑ button at the
   top right, lists every plan of the session, newest first, with its steps, start time, duration and a one- or
   two-sentence summary written by a cheap model once the turn that finished the
   plan ends. The list is kept per session and survives a resume; a resumed
@@ -213,7 +214,8 @@ which is the whole point.
 - **Wide and narrow screens** — when the window is wide enough (a desktop, a tablet, an
   unfolded foldable), the drawer docks beside the chat instead of covering it, and a rail on
   the right edge opens Side chats, Edits, Git diff and Settings. Below 600 px a toolbar above
-  the header carries the context and usage rings, the drawer's tabs, search and Settings.
+  the header carries the drawer's tabs, search and Settings, and the header keeps the context
+  and usage rings as one compact group beside the ☑ plans button.
 - **About** — ⚙ Settings → About shows the console's version (the commit the server started
   from). In the Android and desktop apps it also shows the app's own version with **Check for
   updates**; the console serves their updates (`api/android/*`, `api/desktop/*`) from
