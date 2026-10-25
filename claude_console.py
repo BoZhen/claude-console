@@ -6063,6 +6063,10 @@ html.in-desktop-app #prail{display:none!important}
 #sideBar{display:flex;gap:8px;align-items:center;padding:6px 10px;border-bottom:1px solid var(--line);background:var(--bg2);flex-shrink:0}
 #sideBar .sback{color:var(--acc);cursor:pointer;font-size:12px;white-space:nowrap}
 #sideBar .stitle{flex:1;min-width:0;color:var(--mut);font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* the side chat's own context-window use: the main meter's cells, smaller */
+#sideBar .suse{display:inline-flex;align-items:center;gap:4px;flex-shrink:0;font-size:11px;font-weight:600;color:var(--mut);font-family:var(--fmono);white-space:nowrap}
+#sideBar .suse[hidden]{display:none}
+#sideBar .suse .cell{width:5px;height:10px}
 #sideCtx{flex-shrink:0;margin:8px 10px 0;padding:6px 9px;border-left:3px solid var(--acc);background:var(--bg2);border-radius:0 6px 6px 0;
   font-size:12px;color:var(--mut);max-height:84px;overflow:auto;white-space:pre-wrap}
 #sideStream{flex:1;min-height:0;overflow:auto;padding:10px}
@@ -6800,7 +6804,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
     <div id="sideNewRow"><span class="btn" id="sideNewBtn">+ New side chat</span></div>
     <div id="sideList"><div class="empty">No side chats yet. Start one above, or select text in a message and choose “Ask in side chat”.</div></div>
     <div id="sideChat" hidden>
-      <div id="sideBar"><span class="sback" id="sideBack">‹ All</span><span class="stitle" id="sideTitle"></span><select id="sideModelSel" class="smodel" title="model for this side chat"></select></div>
+      <div id="sideBar"><span class="sback" id="sideBack">‹ All</span><span class="stitle" id="sideTitle"></span><span class="suse" id="sideUse" hidden></span><select id="sideModelSel" class="smodel" title="model for this side chat"></select></div>
       <div id="sideCtx" hidden></div>
       <div id="sideStream"></div>
       <div id="sideCompose">
@@ -9355,7 +9359,13 @@ function sideRenderList(items){
 function sideShowList(){$('#sidec').classList.remove('on-chat');$('#sideList').style.display='';$('#sideChat').hidden=true;
   sideWsDrop();sideActiveCC=null;sidePending=null;sideBusy=false;sideReqList();}
 function sideShowChat(){$('#sidec').classList.add('on-chat');$('#sideList').style.display='none';$('#sideChat').hidden=false;}
-function sideClearStream(){sideStream().innerHTML='';}
+function sideClearStream(){sideStream().innerHTML='';sideRenderCtx(null);}
+/* The side chat's context-window use, from its session's own "context" messages and
+   the ctx in "attached": cells and a percentage beside the model, tokens in the tooltip. */
+function sideRenderCtx(c){const el=$('#sideUse');const pct=(c&&c.percentage!=null)?Math.round(c.percentage):null;
+  if(pct==null){el.hidden=true;el.innerHTML='';return;}
+  el.hidden=false;el.innerHTML=cellBar(pct)+'<span>'+pct+'%</span>';
+  el.title='side chat context '+(c.totalTokens||'?')+' / '+(c.maxTokens||'?')+' tokens ('+pct+'%)'+(c.model?' · '+c.model:'');}
 function askInSide(selection,context){openDrawer('side');sideOpenNew(selection,context);}
 function sideOpenNew(selection,context){
   sideWsDrop();sideParent=curCC||null;
@@ -9456,11 +9466,12 @@ function sideRoute(ev){
 function sideOnMsg(e){let m;try{m=JSON.parse(e.data);}catch(_){return;}
   if(m.type==='hello'||m.type==='favorites'||m.type==='projects'||m.type==='sessions')return;
   if(m.type==='side_list'){if(m.parent===curCC||!curCC)sideRenderList(m.items||[]);return;}
-  if(m.type==='started'){sideSid=m.id;sideActiveCC=m.cc||null;sideSetBusy(false);if(m.model&&m.model!=='default')sideFillModel(m.model);sideReqList();return;}
+  if(m.type==='started'){sideSid=m.id;sideActiveCC=m.cc||null;sideSetBusy(false);sideRenderCtx(null);if(m.model&&m.model!=='default')sideFillModel(m.model);sideReqList();return;}
   if(m.type==='attached'){sideSid=m.id;sideActiveCC=m.cc||sideActiveCC;sideClearStream();
     if(m.model&&m.model!=='default')sideFillModel(m.model);
-    (m.events||[]).forEach(sideRoute);sideSetBusy(!!m.busy);sideScroll();return;}
+    (m.events||[]).forEach(sideRoute);sideSetBusy(!!m.busy);sideRenderCtx(m.ctx);sideScroll();return;}
   if(m.type==='events'){(m.events||[]).forEach(sideRoute);return;}
+  if(m.type==='context'){sideRenderCtx(m.ctx);return;}
   if(m.type==='error'){sideAddNotice('⚠ '+(m.error||'error'));sideSetBusy(false);return;}
   if(m.type==='no_session'){sideAddNotice('this side chat is no longer running');sideSetBusy(false);return;}
   if(m.type==='exit'||m.type==='ended'){sideSetBusy(false);return;}

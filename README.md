@@ -187,7 +187,8 @@ which is the whole point.
   the quote and the message it came from, runs on its own model (Sonnet unless you pick
   another), and stays out of the main session's context and out of the session list. Each
   session keeps its own side chats. **+ New side chat** starts one with no quote, which knows
-  the project but not the conversation.
+  the project but not the conversation. Its header shows how much of its own context window
+  it has used, like the main chat's Context meter.
 
 ### Everything else
 
