@@ -6697,6 +6697,9 @@ body.tabdrag,body.tabdrag .stab{cursor:grabbing}
 .session-dialog button:disabled{opacity:.45;cursor:default}
 .session-dialog .dialog-error{min-height:1.4em;margin:12px 0;color:var(--delfg);font-size:12px;overflow-wrap:anywhere}
 .session-dialog .dialog-actions{display:flex;justify-content:flex-end;align-items:center;gap:8px}
+#askDlg{width:min(420px,calc(100% - 24px))}
+#askDlg .ask-hint{font-size:12px;color:var(--mut);margin:8px 0 0;min-height:1em}
+#askDlg .dialog-actions{margin-top:16px}
 .session-dialog .dialog-actions button{min-height:36px;padding:7px 14px}
 .session-dialog .dialog-actions .check-label{display:flex;gap:7px;align-items:center;margin:0 auto 0 0}
 .session-dialog .dialog-actions input{accent-color:var(--acc)}
@@ -7051,6 +7054,14 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
     <div class="dialog-actions"><button id="newSessionCancel" class="btn" type="button">Cancel</button><button id="newSessionSubmit" class="newbtn" type="submit">Start session</button></div>
   </form>
 </dialog>
+<dialog id="askDlg" class="session-dialog" aria-labelledby="askTitle">
+  <form id="askForm">
+    <div class="dialog-heading"><h2 id="askTitle"></h2><button id="askClose" class="dialog-icon" type="button" title="Close" aria-label="Close" data-session-icon="x"></button></div>
+    <input id="askInput" autocomplete="off" spellcheck="false" maxlength="200" aria-labelledby="askTitle">
+    <div id="askHint" class="ask-hint"></div>
+    <div class="dialog-actions"><button id="askCancel" class="btn" type="button">Cancel</button><button id="askOk" class="newbtn" type="submit">OK</button></div>
+  </form>
+</dialog>
 <dialog id="folderDialog" class="session-dialog" aria-labelledby="folderTitle">
   <div class="dialog-heading"><h2 id="folderTitle">Select folder</h2><div class="dialog-tools">
     <button id="folderNew" class="dialog-icon" type="button" title="New folder" aria-label="New folder" data-session-icon="folder-plus" disabled></button>
@@ -7298,9 +7309,9 @@ function wireImageCopies(d,list){d.querySelectorAll('.imgcopy').forEach((fig,i)=
       {className:'gonebox',textContent:'temporary copy gone'}));
     fig.querySelectorAll('button').forEach(b=>b.disabled=true);};
   fig.querySelector('.imgsave').onclick=()=>postImageSave(f,cwd||'~','');
-  fig.querySelector('.imgsaveas').onclick=()=>openFolderDialog(cwd||HOMEDIR,dir=>{
-    const name=prompt('Save the image as',imageSaveName(f));
-    if(name!==null)postImageSave(f,dir,name.trim());});});}
+  fig.querySelector('.imgsaveas').onclick=()=>openFolderDialog(cwd||HOMEDIR,dir=>
+    askText('Save the image as',imageSaveName(f),{ok:'Save'}).then(name=>{
+      if(name!==null)postImageSave(f,dir,name.trim());}));});}
 async function postImageSave(f,dir,name){try{
     const r=await fetch('api/image/save',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({path:f.path,dir:dir,name:name||''})});
@@ -8290,9 +8301,9 @@ function pastSessRow(s){const r=document.createElement('div');r.className='srow'
   return r;}
 
 function renameProject(p){
-  const nm=prompt('Rename project (leave empty to reset to the folder name):',p.renamed?p.name:'');
-  if(nm===null)return;
-  wsSend({type:'proj_rename',path:p.path,name:nm});}
+  askText('Rename project',p.renamed?p.name:'',{ok:'Rename',placeholder:p.path.split('/').filter(Boolean).pop()||'',
+      hint:'Leave it empty to use the folder\'s own name.'}).then(nm=>{
+    if(nm!==null)wsSend({type:'proj_rename',path:p.path,name:nm});});}
 
 /* Open the creation dialog with this project's folder selected. */
 function newSessionIn(path){newSession(path);}
@@ -8589,9 +8600,8 @@ function wireImport(){
       .finally(()=>{inp.value='';});};}
 function renameSession(cc,cur){
   if(!cc){alert('This session is still starting — try again in a moment.');return;}
-  const nm=prompt('Rename session (leave empty to reset to the auto name):',cur||'');
-  if(nm===null)return;
-  wsSend({type:'rename',cc:cc,name:nm});}
+  askText('Rename session',cur||'',{ok:'Rename',hint:'Leave it empty to go back to the automatic name.'}).then(nm=>{
+    if(nm!==null)wsSend({type:'rename',cc:cc,name:nm});});}
 function delResumable(s){
   if(!confirm('Delete this session from disk?\n\n'+(s.title||s.name||s.cc||'session')+
     '\n\nIt is moved to the trash (recoverable), not permanently deleted.'))return;
@@ -8885,6 +8895,20 @@ const SESSION_ICON_PATHS={
 function sessionIcon(name){return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+
   (SESSION_ICON_PATHS[name]||[]).map(d=>'<path d="'+d+'"/>').join('')+'</svg>';}
 document.querySelectorAll('[data-session-icon]').forEach(b=>b.innerHTML=sessionIcon(b.dataset.sessionIcon));
+/* Ask for a short text (a name) in the page's own dialog. window.prompt is not an
+   option: the desktop app's Electron throws "prompt() is not supported", so every
+   name asked that way silently did nothing there. Resolves with the text, or null
+   when cancelled (Cancel, ✕, Esc, a click outside). */
+function askText(title,value,opts){opts=opts||{};return new Promise(res=>{const d=$('#askDlg'),i=$('#askInput');
+  if(d.open)d.close();
+  $('#askTitle').textContent=title;$('#askHint').textContent=opts.hint||'';
+  i.value=value||'';i.placeholder=opts.placeholder||'';$('#askOk').textContent=opts.ok||'OK';
+  let done=false;const finish=v=>{if(done)return;done=true;if(d.open)d.close();res(v);};
+  $('#askForm').onsubmit=e=>{e.preventDefault();finish(i.value);};
+  $('#askCancel').onclick=$('#askClose').onclick=()=>finish(null);
+  d.oncancel=e=>{e.preventDefault();finish(null);};
+  d.onclick=e=>{if(e.target===d)finish(null);};
+  d.showModal();i.focus();i.select();});}
 let newSessionRequest=null,newSessionSerial=0,folderSerial=0,folderAbort=null,folderState=null,folderSelectHandler=null;
 let folderCreateRequest=null;
 function fillSelect(sel,options,value){sel.replaceChildren();options.forEach(([v,label])=>{
@@ -8981,7 +9005,9 @@ $('#newSessionForm').onsubmit=submitNewSession;
 $('#newSessionCancel').onclick=$('#newSessionClose').onclick=closeNewSession;
 $('#newSessionDialog').addEventListener('cancel',e=>{e.preventDefault();closeNewSession();});
 document.addEventListener('keydown',e=>{if(e.key!=='Escape'||e.isComposing||!document.querySelector('.session-dialog[open]'))return;
-  e.preventDefault();e.stopImmediatePropagation();if($('#folderDialog').open)dismissFolderDialog();else closeNewSession();},true);
+  e.preventDefault();e.stopImmediatePropagation();
+  if($('#askDlg').open)$('#askCancel').click();   /* the name dialog sits on top of the others */
+  else if($('#folderDialog').open)dismissFolderDialog();else closeNewSession();},true);
 $('#newRecent').onchange=()=>{if($('#newRecent').value)$('#newCwd').value=$('#newRecent').value;};
 $('#newCwd').oninput=()=>{$('#newRecent').value='';};
 $('#newModel').onchange=()=>newEffortOptions($('#newEffort').value);
