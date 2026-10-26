@@ -90,14 +90,23 @@ which is the whole point.
   sidebar's LIVE list is what is running, the tabs are what you have open. Drag
   a tab to reorder the strip (on a phone, hold it first; a quick swipe scrolls
   the strip). The order is saved with the tabs.
-- **Multi-session sidebar** — projects grouped by folder, in Live / Favorites /
-  Recent sections (each collapsible); a folder row expands to the sessions
-  whose working directory is that folder. A project's own button opens
-  a new session there, browses the folder, favorites or renames it, or opens
-  **Manage sessions** to clean up several at once; a session's `⋮` covers
-  configure, rename, export and end (or delete to trash, for one on disk). Drag
-  the right edge to resize, double-click to reset.
-- **Resumable sessions** — reopen a project and pick up a previous Claude Code
+- **Multi-session sidebar** — sessions grouped by folder, in Live / Projects /
+  Favorites / Recent / All sections (each collapsible); a folder row expands to
+  the sessions whose working directory is that folder. **All** lists every folder
+  with every session on disk, so an old session is always somewhere; it starts
+  folded. A folder's own button opens a new session there, browses the folder,
+  favorites or renames it, or opens **Manage sessions** to clean up several at
+  once; a session's `⋮` covers configure, rename, export and end (or delete to
+  trash, for one on disk). Drag the right edge to resize, double-click to reset.
+- **Projects** — your own groups across folders. **＋** in the Projects header
+  makes one; drag a folder or a single session onto it (or use **Add to
+  project…** in its `⋮` menu, which is the way on a phone). A folder in a project
+  stands for the folder, so sessions started there later join too; a single
+  session shows under its folder, marked *1 of 4*. A session can be in several
+  projects. Removing from a project, renaming or deleting one never touches the
+  sessions or folders. Projects are kept by the server, so every device sees the
+  same ones.
+- **Resumable sessions** — reopen a folder and pick up a previous Claude Code
   conversation (transcripts under `~/.claude/projects` restore history and the
   right `cwd`).
 - **Full-text history search** (`⌘/Ctrl+K`) — search everything you and Claude

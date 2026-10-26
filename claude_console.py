@@ -1405,6 +1405,108 @@ def _write_project_meta(meta):
         return False
 
 
+# Projects: the user's own collections, e.g. "Project 1" holding the folders and the
+# single sessions dragged into it. A folder in a project stands for the folder, so
+# sessions started there later belong to the project too; a single session can sit
+# in several projects. Nothing about the sessions or folders themselves changes.
+GROUPS_FILE = os.path.join(HOME, ".claude", "console-groups.json")
+_groups_cache = {"mtime": -1.0, "v": []}
+
+
+def list_groups():
+    """[{id, name, folders: [abs path], sessions: [claude id]}], in the order made.
+    Cached by mtime; anything malformed in the file is dropped, not trusted."""
+    try:
+        m = os.path.getmtime(GROUPS_FILE)
+    except OSError:
+        _groups_cache["mtime"], _groups_cache["v"] = -1.0, []
+        return []
+    if m != _groups_cache["mtime"]:
+        out = []
+        try:
+            with open(GROUPS_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+            for g in (d.get("groups") if isinstance(d, dict) else None) or []:
+                if not isinstance(g, dict) or not isinstance(g.get("id"), str) or not g.get("name"):
+                    continue
+                out.append({"id": g["id"][:32], "name": str(g["name"])[:80],
+                            "folders": [x for x in g.get("folders") or [] if isinstance(x, str) and x.startswith("/")],
+                            "sessions": [x for x in g.get("sessions") or [] if isinstance(x, str) and _valid_cc(x)]})
+        except Exception:
+            out = []
+        _groups_cache["v"], _groups_cache["mtime"] = out, m
+    return [dict(g, folders=list(g["folders"]), sessions=list(g["sessions"])) for g in _groups_cache["v"]]
+
+
+def _write_groups(groups):
+    try:
+        os.makedirs(os.path.dirname(GROUPS_FILE), exist_ok=True)
+        tmp = GROUPS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"groups": groups}, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, GROUPS_FILE)
+        _groups_cache["mtime"] = -1.0
+        return True
+    except Exception:
+        return False
+
+
+def _group_name(name):
+    return " ".join(str(name or "").split())[:80]
+
+
+def _group_item(folder=None, cc=None):
+    """(folder, cc) checked: an existing directory, a well-formed claude id."""
+    folder = _norm_dir(folder) if folder else ""
+    cc = cc if isinstance(cc, str) and _valid_cc(cc) else ""
+    return folder, cc
+
+
+def edit_groups(op, gid=None, name=None, folder=None, cc=None):
+    """One change to the projects. op: new (name, and optionally a first folder or
+    session), rename, delete, add, remove. Returns the project id for new, True for
+    a change that went through, False when the request was not valid."""
+    groups = list_groups()
+    g = next((x for x in groups if x["id"] == gid), None)
+    raw_folder = folder if isinstance(folder, str) else ""
+    folder, cc = _group_item(folder, cc)
+    if op == "new":
+        name = _group_name(name)
+        if not name:
+            return False
+        gid = "g" + secrets.token_hex(4)
+        groups.append({"id": gid, "name": name, "folders": [folder] if folder else [],
+                       "sessions": [cc] if cc else []})
+        return gid if _write_groups(groups) else False
+    if g is None:
+        return False
+    if op == "rename":
+        name = _group_name(name)
+        if not name:
+            return False
+        g["name"] = name
+    elif op == "delete":
+        groups = [x for x in groups if x is not g]
+    elif op == "add":
+        if not folder and not cc:
+            return False
+        if folder and folder not in g["folders"]:
+            g["folders"].append(folder)
+        if cc and cc not in g["sessions"]:
+            g["sessions"].append(cc)
+    elif op == "remove":
+        # a folder deleted from disk no longer passes _norm_dir: match it as stored
+        drop = {x for x in (folder, raw_folder) if x}
+        if not drop and not cc:
+            return False
+        g["folders"] = [x for x in g["folders"] if x not in drop]
+        if cc:
+            g["sessions"] = [x for x in g["sessions"] if x != cc]
+    else:
+        return False
+    return _write_groups(groups)
+
+
 FAV_MIGRATION_KEY = "#migrated_session_favs"
 MODE_MIGRATION_KEY = "#migrated_modes_to_full_auto"
 DEFAULT_MODE = "bypassPermissions"     # Full auto
@@ -3162,7 +3264,7 @@ class TreeHandler(AuthMixin, tornado.web.RequestHandler):
     """The project-grouped sidebar: folders, each with the sessions it owns."""
     def get(self):
         self.set_header("Content-Type", "application/json")
-        self.write(json.dumps({"projects": project_tree()}))
+        self.write(json.dumps({"projects": project_tree(), "groups": list_groups()}))
 
 
 class PinFolderHandler(AuthMixin, tornado.web.RequestHandler):
@@ -5270,7 +5372,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
         ChatSocket.clients.add(self)
         self._say({"type": "hello", "stamp": PAGE_STAMP})
         self._say({"type": "favorites", "favorites": list_favorites()})
-        self._say({"type": "projects", "projects": project_tree()})
+        self._say({"type": "projects", "projects": project_tree(), "groups": list_groups()})
 
     def _say(self, obj):
         try:
@@ -5286,9 +5388,9 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
     def _broadcast_tree(self, rescan=False):
         """Push the project-grouped sidebar to every device. `rescan` forces a
         disk re-scan; metadata-only edits (star, rename, pin) reuse the cache."""
-        tree = project_tree(force=rescan)
+        tree, groups = project_tree(force=rescan), list_groups()
         for ws in list(ChatSocket.clients):
-            ws._say({"type": "projects", "projects": tree})
+            ws._say({"type": "projects", "projects": tree, "groups": groups})
 
     async def on_message(self, raw):
         try:
@@ -5591,6 +5693,12 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                 self._broadcast_tree()
         elif mt == "proj_refresh":
             self._broadcast_tree(rescan=True)
+        elif mt == "group":
+            # the user's projects: make, rename, delete one, or add / remove a folder
+            # or a single session. Every device gets the new list with the tree.
+            if edit_groups(msg.get("op"), gid=msg.get("id"), name=msg.get("name"),
+                           folder=msg.get("folder"), cc=msg.get("cc")):
+                self._broadcast_tree()
         elif mt == "rename":
             # Sidebar ✎: set/clear a custom label for a session (by claude id).
             cc = msg.get("cc")
@@ -6559,6 +6667,19 @@ body.tabdrag,body.tabdrag .stab{cursor:grabbing}
 .pgroup .plist .srow{padding-left:31px;border-left:none}
 .pgroup .plist .srow .sname{font-size:12px}
 .pgroup .plist .sb-empty{padding-left:31px;font-size:11px}
+/* Projects: the user's named blocks, each holding folder groups (a whole folder, or
+   the single sessions dragged in, under their folder). One step further in. */
+.gblock{border-left:2px solid transparent;border-radius:6px}
+.gblock>.glist{display:none}
+.gblock.open>.glist{display:block}
+.gblock>.ghead .caret::before{transform:translate(-2px,0) rotate(-45deg)}
+.gblock.open>.ghead .caret::before{transform:translate(-1px,-2px) rotate(45deg)}
+.gblock>.ghead .pname{font-weight:650}
+.gblock .glist .prow{padding-left:22px}
+.gblock .glist .plist .srow,.gblock .glist .plist .sb-empty{padding-left:46px}
+.gblock .glist>.sb-empty{padding-left:31px;font-size:11px}
+.gblock.drop{background:var(--sel);box-shadow:inset 0 0 0 2px var(--acc)}
+#secGroups.dragging>.sb-h{color:var(--acc)}
 
 /* Manage sessions — a project can accumulate a lot of threads (sub-agents in
    particular), so the ⋮ menu opens a checklist for deleting several at once. */
@@ -6784,19 +6905,27 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
     <button id="srchopen" title="search all conversation history"><span>🔍 Search history</span><kbd>⌘K</kbd></button>
     <div class="sb-new">
       <button class="newbtn" id="newbtn">＋ New session</button>
-      <div class="impline"><div class="improw"><input type="file" id="impfile" accept=".jsonl,application/x-ndjson" hidden><button id="impbtn" title="Choose a folder and import a saved transcript">Import session</button><button id="fimpbtn" title="add a folder to the sidebar as a project">Import folder</button></div><span id="imphint"></span><span id="impmsg"></span></div>
+      <div class="impline"><div class="improw"><input type="file" id="impfile" accept=".jsonl,application/x-ndjson" hidden><button id="impbtn" title="Choose a folder and import a saved transcript">Import session</button><button id="fimpbtn" title="add a folder to the sidebar">Import folder</button></div><span id="imphint"></span><span id="impmsg"></span></div>
     </div>
     <div class="sb-sec">
       <div class="sb-h">Live <span id="liveN" class="cnt">0</span></div>
-      <div id="liveList"><div class="sb-empty">no active project</div></div>
+      <div id="liveList"><div class="sb-empty">nothing running</div></div>
+    </div>
+    <div class="sb-sec" id="secGroups">
+      <div class="sb-h sb-toggle"><span class="caret"></span>📁 Projects <span id="groupsN" class="cnt">0</span><span class="grow"></span><span class="sb-ref" id="groupNew" role="button" title="New project: then drag folders or sessions into it">＋</span></div>
+      <div id="groupList" class="seclist"></div>
     </div>
     <div class="sb-sec" id="secFav">
       <div class="sb-h sb-toggle"><span class="caret"></span>★ Favorites <span id="favN" class="cnt">0</span></div>
-      <div id="favList" class="seclist"><div class="sb-empty">star a project to pin it here</div></div>
+      <div id="favList" class="seclist"><div class="sb-empty">star a folder to pin it here</div></div>
     </div>
     <div class="sb-sec" id="secRecent">
       <div class="sb-h sb-toggle"><span class="caret"></span>🕘 Recent <span class="grow"></span><span class="sb-ref" id="resumeRef" title="rescan">↻</span></div>
       <div id="recentList" class="seclist"><div class="sb-empty">—</div></div>
+    </div>
+    <div class="sb-sec" id="secAll">
+      <div class="sb-h sb-toggle"><span class="caret"></span>🗂 All <span id="allN" class="cnt">0</span></div>
+      <div id="allList" class="seclist"></div>
     </div>
     <div class="sb-foot">
       <button id="settingsbtn" class="sb-gear" title="Text size, theme and accounts">⚙ Settings</button>
@@ -7092,7 +7221,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
       <input id="fimpq" placeholder="type a path…  ↑↓ to pick, Enter to add" autocomplete="off" spellcheck="false">
       <div id="fimpac"></div>
       <div id="fimpmsg"></div>
-      <div class="fbtns"><button class="fcancel" id="fimpcancel">Cancel</button><button class="fadd" id="fimpok">Add project</button></div>
+      <div class="fbtns"><button class="fcancel" id="fimpcancel">Cancel</button><button class="fadd" id="fimpok">Add folder</button></div>
     </div>
   </div>
 </div>
@@ -7121,7 +7250,7 @@ if(!MODE_OPTIONS.some(([id])=>id===preferredMode))preferredMode='bypassPermissio
 let curEffort=localStorage.getItem('al_effort')||'max';
 let curModel='default', modelOnce='';   /* the live session's model; the model a @prefix put one turn on */
 let showThink=false;
-let liveSessions=[], projData=[], HOMEDIR='';
+let liveSessions=[], projData=[], groupsData=[], HOMEDIR='';
 let recentFolders=[],selectedFolder='';
 /* which project groups are expanded — per device, survives reloads */
 let pExp=new Set();try{pExp=new Set(JSON.parse(localStorage.getItem('al_pexp')||'[]'));}catch(e){}
@@ -7940,7 +8069,7 @@ function onMsg(e){const m=JSON.parse(e.data);
   else if(m.type==='agent_tokens'){const c=tools[m.parent];if(c)agentStat(c,{up:m.up,out:m.out,est:m.est});}
   else if(m.type==='tokens'){tokUp=m.up||0;tokOut=m.out||0;tokShow=true;
     if(m.word!=null&&m.word!==lastWordSeed){lastWordSeed=m.word;if(running&&!compacting)setWord(m.word);}}
-  else if(m.type==='projects'){projData=m.projects||[];renderSidebar();}
+  else if(m.type==='projects'){projData=m.projects||[];if(Array.isArray(m.groups))groupsData=m.groups;renderSidebar();}
 }
 function openWs(cb){const proto=location.protocol==='https:'?'wss:':'ws:';
   ws=new WebSocket(proto+'//'+location.host+'/ws/chat');
@@ -8171,9 +8300,11 @@ function openConfigure(s,anchor){const m=$('#cardMenu');m.innerHTML='';m._anchor
 const SECKEY='al_seccol';
 function toggleSec(id){const el=$('#'+id);if(!el)return;el.classList.toggle('collapsed');
   let c={};try{c=JSON.parse(localStorage.getItem(SECKEY)||'{}');}catch(e){}
-  c[id]=el.classList.contains('collapsed');localStorage.setItem(SECKEY,JSON.stringify(c));}
+  c[id]=el.classList.contains('collapsed');localStorage.setItem(SECKEY,JSON.stringify(c));
+  if(id==='secAll'&&!c[id])renderSidebar();}
 function applySecCollapse(){let c={};try{c=JSON.parse(localStorage.getItem(SECKEY)||'{}');}catch(e){}
-  ['secFav','secRecent'].forEach(id=>{const el=$('#'+id);if(el)el.classList.toggle('collapsed',!!c[id]);});}
+  ['secGroups','secFav','secRecent','secAll'].forEach(id=>{const el=$('#'+id);
+    if(el)el.classList.toggle('collapsed',c[id]===undefined?id==='secAll':!!c[id]);});}
 
 function renderLive(list){liveSessions=list||[];renderSidebar();}
 
@@ -8229,48 +8360,65 @@ function renderSidebar(){
   const rest=all.filter(p=>!p.isLive&&!p.fav).slice(0,40);
   $('#liveN').textContent=live.length;
   $('#favN').textContent=fav.length;
-  fillSec('#liveList',live,'no active project — pick a folder, ＋ New session');
-  fillSec('#favList',fav,'star a project to pin it here');
-  fillSec('#recentList',rest,'no projects yet');}
+  fillSec('#liveList',live,'nothing running — pick a folder, ＋ New session');
+  fillSec('#favList',fav,'star a folder to pin it here');
+  fillSec('#recentList',rest,'no folders yet');
+  renderGroups(all);
+  const nAll=all.reduce((n,p)=>n+p.total,0);
+  $('#allN').textContent=all.length;
+  $('#allN').title=all.length+' folders · '+nAll+' sessions';
+  /* every folder and session: built only while the section is open */
+  if($('#secAll').classList.contains('collapsed'))$('#allList').innerHTML='';
+  else fillSec('#allList',all,'no folders yet',{keyPre:'all:'});}
 
-function fillSec(sel,list,empty){const box=$(sel);if(!box)return;
+function fillSec(sel,list,empty,opts){const box=$(sel);if(!box)return;
   if(!list.length){box.innerHTML='<div class="sb-empty">'+esc(empty)+'</div>';return;}
-  box.innerHTML='';list.forEach(p=>box.appendChild(projGroup(p)));}
+  box.innerHTML='';list.forEach(p=>box.appendChild(projGroup(p,opts&&opts.keyPre?{key:opts.keyPre+p.path}:{})));}
 
-function projGroup(p){
+/* opts: key (the expansion key, when the same folder shows in two places), and
+   inside a project: group, whole (the folder itself is in the project), full
+   (the folder's own session count, when only some of them are). */
+function projGroup(p,opts){opts=opts||{};const key=opts.key||p.path,grp=opts.group||null;
   const g=document.createElement('div');
-  g.className='pgroup'+(pExp.has(p.path)?' open':'');
+  g.className='pgroup'+(pExp.has(key)?' open':'');
   const r=document.createElement('div');r.className='prow';
+  const sub=(p.sub||shortPath(p.path))+(grp&&!opts.whole?' · '+p.total+' of '+opts.full:'');
   r.innerHTML='<span class="caret"></span>'+
     '<div class="pmeta"><div class="pname">'+esc(p.name)+(p.fav?' <span class="pstar">★</span>':'')+'</div>'+
-    '<div class="psub">'+esc(p.sub||shortPath(p.path))+'</div></div>'+
+    '<div class="psub">'+esc(sub)+'</div></div>'+
     '<span class="pn">'+p.total+'</span>'+
-    '<span class="skebab pkebab" title="project actions" aria-label="project actions"><i></i></span>';
+    '<span class="skebab pkebab" title="folder actions" aria-label="folder actions"><i></i></span>';
+  dragSource(r,{folder:p.path});
   r.onclick=ev=>{if(ev.target.closest('.skebab'))return;
-    if(pExp.has(p.path))pExp.delete(p.path);else pExp.add(p.path);
+    if(pExp.has(key))pExp.delete(key);else pExp.add(key);
     saveExp();g.classList.toggle('open');};
-  r.querySelector('.skebab').onclick=ev=>{ev.stopPropagation();
+  r.querySelector('.skebab').onclick=ev=>{ev.stopPropagation();const kebab=ev.currentTarget;
     const items=[{label:'＋ New session here',fn:()=>newSessionIn(p.path)},
       {label:'☑ Manage sessions…',fn:()=>pmanOpen(p)},
       /* browse the project directory in web-file-manager (same ?open= scheme as
          file links — its openPath() loads a directory as a folder view) */
       {label:'📂 Open folder',fn:()=>window.open(webfmOpenUrl(p.path),'_blank')},
-      {label:'✎ Rename project',fn:()=>renameProject(p)},
-      {label:p.fav?'★ Unfavorite':'☆ Favorite',fn:()=>wsSend({type:'proj_fav',path:p.path,fav:!p.fav})}];
+      {label:'✎ Rename folder',fn:()=>renameProject(p)},
+      {label:p.fav?'★ Unfavorite':'☆ Favorite',fn:()=>wsSend({type:'proj_fav',path:p.path,fav:!p.fav})},
+      {label:'📁 Add to project…',fn:()=>pickGroup(kebab,{folder:p.path})}];
+    if(grp)items.push(opts.whole
+      ?{label:'✕ Remove from « '+grp.name+' »',fn:()=>wsSend({type:'group',op:'remove',id:grp.id,folder:p.path})}
+      :{label:'✕ Remove these sessions from « '+grp.name+' »',fn:()=>
+          p.liveS.concat(p.past).forEach(x=>{if(x.cc)wsSend({type:'group',op:'remove',id:grp.id,cc:x.cc});})});
     if(p.pinned)items.push({label:'✕ Remove from sidebar',danger:true,fn:()=>{
       if(confirm('Remove “'+p.name+'” from the sidebar?\n\nOnly the sidebar entry goes away. '+
                  'No session and no file is deleted.'))wsSend({type:'proj_unpin',path:p.path});}});
-    toggleCardMenu(ev.currentTarget,items);};
+    toggleCardMenu(kebab,items);};
   g.appendChild(r);
   const list=document.createElement('div');list.className='plist';
-  p.liveS.forEach(x=>list.appendChild(liveSessRow(x)));
-  p.past.forEach(x=>list.appendChild(pastSessRow(x)));
+  p.liveS.forEach(x=>list.appendChild(liveSessRow(x,grp)));
+  p.past.forEach(x=>list.appendChild(pastSessRow(x,grp)));
   if(!list.children.length)list.innerHTML='<div class="sb-empty">no sessions yet</div>';
   g.appendChild(list);
   return g;}
 
 /* a running session: green dot, click to switch to it */
-function liveSessRow(s){const r=document.createElement('div');
+function liveSessRow(s,grp){const r=document.createElement('div');
   r.className='srow'+(s.id===sid?' active':'')+(s.ended?' ended':'');
   const dot=s.busy?'busy':(s.ended?'':'on');
   r.innerHTML='<span class="sdot '+dot+'"></span><div class="smeta">'+
@@ -8282,26 +8430,114 @@ function liveSessRow(s){const r=document.createElement('div');
     const items=[{label:'⚙ Configure',fn:()=>openConfigure(s,kebab)},
       {label:'✎ Rename',fn:()=>renameSession(s.cc,s.title||s.name)}];
     if(s.cc)items.push({label:'⤓ Export transcript',fn:()=>exportSession(s.cc)});
+    groupItems(items,kebab,s.cc,grp);
     items.push({label:'✕ End session',danger:true,fn:()=>endSessionById(s.id,s.name)});
     toggleCardMenu(kebab,items);};
+  if(s.cc)dragSource(r,{cc:s.cc});
   return r;}
 
 /* an on-disk session: grey dot, click to resume */
-function pastSessRow(s){const r=document.createElement('div');r.className='srow';
+function pastSessRow(s,grp){const r=document.createElement('div');r.className='srow';
   r.innerHTML='<span class="sdot"></span><div class="smeta">'+
     '<div class="sname">'+esc(s.title||'session')+'</div>'+
     '<div class="ssub">↺ '+(s.mtime?esc(reltime(s.mtime)):'resume')+'</div></div>'+
     '<span class="skebab" title="more">⋮</span>';
   r.querySelector('.smeta').onclick=()=>resumeSession(s);
   r.querySelector('.sdot').onclick=()=>resumeSession(s);
-  r.querySelector('.skebab').onclick=ev=>{ev.stopPropagation();toggleCardMenu(ev.currentTarget,[
-    {label:'✎ Rename',fn:()=>renameSession(s.cc,s.title)},
-    {label:'⤓ Export transcript',fn:()=>exportSession(s.cc)},
-    {label:'🗑 Delete (to trash)',danger:true,fn:()=>delResumable(s)}]);};
+  r.querySelector('.skebab').onclick=ev=>{ev.stopPropagation();const kebab=ev.currentTarget;
+    const items=[{label:'✎ Rename',fn:()=>renameSession(s.cc,s.title)},
+      {label:'⤓ Export transcript',fn:()=>exportSession(s.cc)}];
+    groupItems(items,kebab,s.cc,grp);
+    items.push({label:'🗑 Delete (to trash)',danger:true,fn:()=>delResumable(s)});
+    toggleCardMenu(kebab,items);};
+  if(s.cc)dragSource(r,{cc:s.cc});
   return r;}
 
+/* ── Projects ─────────────────────────────────────────────────────────────
+   The user's own collections over the folders (groupsData, from the server with
+   the tree): a whole folder, which keeps taking in the sessions started there, or
+   single sessions, shown under their folder. A session can be in several. Folders
+   and sessions are added by dragging them onto a project, or, where there is no
+   dragging (a phone), from their ⋮ menu. */
+const DND_FOLDER='application/x-console-folder',DND_SESSION='application/x-console-session';
+let gExp=new Set();try{gExp=new Set(JSON.parse(localStorage.getItem('al_gexp')||'[]'));}catch(e){}
+function saveGExp(){try{localStorage.setItem('al_gexp',JSON.stringify([...gExp]));}catch(e){}}
+function dragSource(el,item){el.draggable=true;
+  el.addEventListener('dragstart',e=>{e.stopPropagation();
+    if(item.folder)e.dataTransfer.setData(DND_FOLDER,item.folder);else e.dataTransfer.setData(DND_SESSION,item.cc);
+    e.dataTransfer.setData('text/plain',item.folder||item.cc);e.dataTransfer.effectAllowed='copy';
+    $('#secGroups').classList.add('dragging');});
+  el.addEventListener('dragend',()=>{$('#secGroups').classList.remove('dragging');
+    document.querySelectorAll('.gblock.drop').forEach(b=>b.classList.remove('drop'));});}
+function dropItem(e){const t=[...(e.dataTransfer&&e.dataTransfer.types||[])];
+  if(t.includes(DND_FOLDER))return {folder:e.dataTransfer.getData(DND_FOLDER)};
+  if(t.includes(DND_SESSION))return {cc:e.dataTransfer.getData(DND_SESSION)};
+  return null;}
+function canDrop(e){const t=[...(e.dataTransfer&&e.dataTransfer.types||[])];return t.includes(DND_FOLDER)||t.includes(DND_SESSION);}
+/* dragging over a folded Projects section opens it, so there is somewhere to drop */
+function groupDropSetup(){const h=$('#secGroups .sb-h');
+  h.addEventListener('dragenter',e=>{if(canDrop(e)&&$('#secGroups').classList.contains('collapsed'))toggleSec('secGroups');});}
+function groupItems(items,kebab,cc,grp){if(!cc)return;
+  items.push({label:'📁 Add to project…',fn:()=>pickGroup(kebab,{cc})});
+  if(grp&&(grp.sessions||[]).includes(cc))
+    items.push({label:'✕ Remove from « '+grp.name+' »',fn:()=>wsSend({type:'group',op:'remove',id:grp.id,cc})});}
+/* the projects to add a folder or a session to, and a new one */
+function pickGroup(anchor,item){
+  const has=g=>item.folder?(g.folders||[]).includes(item.folder):(g.sessions||[]).includes(item.cc);
+  const items=groupsData.map(g=>({label:(has(g)?'✓ ':'')+g.name,fn:()=>{if(!has(g))groupAdd(g.id,item);}}));
+  items.push({label:'＋ New project…',fn:()=>newGroup(item)});
+  setTimeout(()=>openCardMenu(anchor,items),0);}   /* after the click that closed the first menu */
+function groupAdd(gid,item){wsSend(Object.assign({type:'group',op:'add',id:gid},item));
+  if(!gExp.has(gid)){gExp.add(gid);saveGExp();}}
+function newGroup(item){askText('New project','',{placeholder:'e.g. Thesis',ok:'Create',
+    hint:item?'The '+(item.folder?'folder':'session')+' goes into it.':'Then drag folders or sessions onto it, or use their ⋮ menu.'})
+  .then(nm=>{if(nm===null||!nm.trim())return;
+    wsSend(Object.assign({type:'group',op:'new',name:nm.trim()},item||{}));
+    const sec=$('#secGroups');if(sec.classList.contains('collapsed'))toggleSec('secGroups');});}
+/* a project's folder groups: whole folders, then folders with only some of their
+   sessions in it; newest first, like the other lists */
+function groupParts(g,by,all){const out=[],whole=new Set();
+  (g.folders||[]).forEach(path=>{if(whole.has(path))return;whole.add(path);
+    const p=by.get(path)||{path,name:path.split('/').filter(Boolean).slice(-1)[0]||path,sub:shortPath(path),
+      liveS:[],past:[],total:0,sortKey:0,fav:false,pinned:false};
+    out.push({p,whole:true,full:p.total});});
+  const ccs=new Set(g.sessions||[]);
+  if(ccs.size)all.forEach(p=>{if(whole.has(p.path))return;
+    const liveS=p.liveS.filter(x=>x.cc&&ccs.has(x.cc)),past=p.past.filter(x=>ccs.has(x.cc));
+    if(liveS.length||past.length)out.push({p:Object.assign({},p,{liveS,past,total:liveS.length+past.length}),whole:false,full:p.total});});
+  return out.sort((a,b)=>(b.p.sortKey||0)-(a.p.sortKey||0));}
+function renderGroups(all){const box=$('#groupList');if(!box)return;
+  $('#groupsN').textContent=groupsData.length;
+  if(!groupsData.length){box.innerHTML='<div class="sb-empty">＋ makes a project; then drag folders or sessions onto it, or use their ⋮ menu</div>';return;}
+  const by=new Map(all.map(p=>[p.path,p]));box.innerHTML='';
+  groupsData.forEach(g=>box.appendChild(groupBlock(g,by,all)));}
+function groupBlock(g,by,all){const parts=groupParts(g,by,all),n=parts.reduce((k,x)=>k+x.p.total,0);
+  const el=document.createElement('div');el.className='gblock'+(gExp.has(g.id)?' open':'');el.dataset.gid=g.id;
+  const r=document.createElement('div');r.className='prow ghead';
+  r.innerHTML='<span class="caret"></span><div class="pmeta"><div class="pname">'+esc(g.name)+'</div>'+
+    '<div class="psub">'+parts.length+' folder'+(parts.length===1?'':'s')+'</div></div>'+
+    '<span class="pn">'+n+'</span><span class="skebab pkebab" title="project actions" aria-label="project actions"><i></i></span>';
+  r.onclick=ev=>{if(ev.target.closest('.skebab'))return;
+    if(gExp.has(g.id))gExp.delete(g.id);else gExp.add(g.id);saveGExp();el.classList.toggle('open');};
+  r.querySelector('.skebab').onclick=ev=>{ev.stopPropagation();toggleCardMenu(ev.currentTarget,[
+    {label:'✎ Rename project',fn:()=>askText('Rename project',g.name,{ok:'Rename'}).then(nm=>{
+      if(nm!==null&&nm.trim())wsSend({type:'group',op:'rename',id:g.id,name:nm.trim()});})},
+    {label:'🗑 Delete project',danger:true,fn:()=>{
+      if(confirm('Delete the project « '+g.name+' »?\n\nOnly the project goes. Its folders and sessions stay where they are.'))
+        wsSend({type:'group',op:'delete',id:g.id});}}]);};
+  el.appendChild(r);
+  const list=document.createElement('div');list.className='glist';
+  parts.forEach(x=>list.appendChild(projGroup(x.p,{key:'g:'+g.id+':'+x.p.path,group:g,whole:x.whole,full:x.full})));
+  if(!parts.length)list.innerHTML='<div class="sb-empty">drag a folder or a session here, or use its ⋮ menu</div>';
+  el.appendChild(list);
+  el.addEventListener('dragover',e=>{if(!canDrop(e))return;e.preventDefault();e.dataTransfer.dropEffect='copy';el.classList.add('drop');});
+  el.addEventListener('dragleave',e=>{if(!el.contains(e.relatedTarget))el.classList.remove('drop');});
+  el.addEventListener('drop',e=>{el.classList.remove('drop');const it=dropItem(e);if(!it||!(it.folder||it.cc))return;
+    e.preventDefault();groupAdd(g.id,it);});
+  return el;}
+
 function renameProject(p){
-  askText('Rename project',p.renamed?p.name:'',{ok:'Rename',placeholder:p.path.split('/').filter(Boolean).pop()||'',
+  askText('Rename folder in the sidebar',p.renamed?p.name:'',{ok:'Rename',placeholder:p.path.split('/').filter(Boolean).pop()||'',
       hint:'Leave it empty to use the folder\'s own name.'}).then(nm=>{
     if(nm!==null)wsSend({type:'proj_rename',path:p.path,name:nm});});}
 
@@ -8333,7 +8569,7 @@ function pmanOpened(){return !$('#pman').hasAttribute('hidden');}
 
 function pmanRender(){
   const rows=pmanRows(),box=$('#pmanlist');
-  if(!rows.length){box.innerHTML='<div class="sb-empty">no sessions in this project</div>';}
+  if(!rows.length){box.innerHTML='<div class="sb-empty">no sessions in this folder</div>';}
   else{box.innerHTML='';rows.forEach(x=>{
     const el=document.createElement('div');el.className='pmrow';
     const dis=x.cc?'':' disabled title="this session has no transcript yet"';
@@ -8368,7 +8604,7 @@ function pmanDelete(){
   const ccs=[...pmanSel];if(!ccs.length)return;
   const liveN=pmanRows().filter(x=>x.live&&pmanSel.has(x.cc)).length;
   if(!confirm('Delete '+ccs.length+' session'+(ccs.length>1?'s':'')+' from '+
-      (pmanProj?pmanProj.name:'this project')+'?'+
+      (pmanProj?pmanProj.name:'this folder')+'?'+
       (liveN?('\n\n'+liveN+' of them '+(liveN>1?'are':'is')+' still running and will be ended first.'):'')+
       '\n\nTranscripts move to the trash (recoverable), they are not erased.'))return;
   pmanBatch={n:ccs.length,done:0,ok:0,err:[]};
@@ -8617,7 +8853,7 @@ function currentFolder(){return (sid&&cwd)||selectedFolder||HOMEDIR||'';}
    any change, so this is the cold-start and manual-rescan path. */
 function loadTree(){
   fetch('api/tree').then(r=>r.json())
-    .then(j=>{projData=j.projects||[];renderSidebar();})
+    .then(j=>{projData=j.projects||[];if(Array.isArray(j.groups))groupsData=j.groups;renderSidebar();})
     .catch(()=>{});}
 
 
@@ -10005,8 +10241,10 @@ function setDrawerW(w,save){const cap=Math.round(window.innerWidth*0.96);
 })();
 $('#resumeRef').onclick=e=>{e.stopPropagation();wsSend({type:'proj_refresh'});loadTree();};
 /* collapsible sections: clicking the header toggles; restore saved state */
-['secFav','secRecent'].forEach(id=>{
+['secGroups','secFav','secRecent','secAll'].forEach(id=>{
   const h=$('#'+id+' .sb-h');if(h)h.onclick=()=>toggleSec(id);});
+$('#groupNew').onclick=e=>{e.stopPropagation();newGroup(null);};
+groupDropSetup();
 applySecCollapse();
 /* dismiss the ⋯ card menu on outside-click, Escape, scroll or resize */
 document.addEventListener('click',e=>{if(!e.target.closest('#cardMenu')&&!e.target.closest('.skebab'))closeCardMenu();});
@@ -10111,7 +10349,7 @@ function fimpAdd(){
   fetch('api/pinfolder',{method:'POST',headers:{'Content-Type':'application/json'},
                          body:JSON.stringify({path:p})})
     .then(r=>r.json()).then(j=>{
-      if(j&&j.ok){fimpClose();addNotice('📁 project « '+(j.name||p)+' » added to the sidebar');loadTree();}
+      if(j&&j.ok){fimpClose();addNotice('📁 folder « '+(j.name||p)+' » added to the sidebar');loadTree();}
       else fimpMsg((j&&j.error)||'could not add that folder',true);})
     .catch(e=>fimpMsg(String(e),true));}
 $('#fimpbtn').onclick=fimpOpen;
