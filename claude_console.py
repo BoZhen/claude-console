@@ -1490,20 +1490,59 @@ def short_path(p):
 _scan_cache = {"t": 0.0, "v": {}}
 
 
+def _sidebar_transcripts():
+    """Every claude transcript that can be a sidebar row, newest first, as
+    [{id, cwd, title, mtime}]. No count limit. The sidebar used to take the newest
+    2000 files and drop junk afterwards; claude-mem's observer writes thousands of
+    files, so they filled the 2000 and older real sessions never showed at all.
+    A project directory holds the transcripts of one starting folder, so a single
+    peek tells whether the whole directory is junk, and such a directory is
+    skipped without reading each of its files."""
+    biggest = {}
+    for _a, root in account_roots():
+        for d in glob.glob(os.path.join(root, "*")):
+            files = glob.glob(os.path.join(d, "*.jsonl"))
+            if not files:
+                continue
+            probe = _peek_claude(files[0])[0]
+            if probe == "__recap__" or (probe and _is_junk(probe)):
+                continue
+            for p in files:
+                cc = os.path.basename(p)[:-6]
+                try:
+                    sz = os.path.getsize(p)
+                except OSError:
+                    continue
+                # one id in two account trees: keep the copy with the most of it
+                if cc not in biggest or sz > biggest[cc][0]:
+                    biggest[cc] = (sz, p)
+    out = []
+    for _sz, p in biggest.values():
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        cwd, _branch, title = _peek_claude(p)
+        if cwd == "__recap__":
+            continue
+        out.append({"id": p, "cwd": cwd, "title": title or os.path.basename(p),
+                    "mtime": st.st_mtime})
+    out.sort(key=lambda x: x["mtime"], reverse=True)
+    return out
+
+
 def _sessions_by_folder(force=False):
     """{folder: [session, ...]} over every claude transcript, newest first.
-    Grouping is by exact folder. ~0.25s over 875 transcripts, and it runs on every
-    sidebar refresh, so it is cached for a few seconds. _is_junk drops the
-    ~/.claude-mem observer artifacts, which are the large majority of the files."""
+    Grouping is by exact folder. It runs on every sidebar refresh, so it is cached
+    for a few seconds. _is_junk drops the ~/.claude-mem observer artifacts and
+    the other tool folders."""
     now = time.monotonic()
     if not force and _scan_cache["v"] and now - _scan_cache["t"] < 6:
         return _scan_cache["v"]
     names = load_names()
     sides = sidechat_child_ccs()
     out = {}
-    for s in list_sessions(2000):
-        if s.get("source") != "claude":
-            continue
+    for s in _sidebar_transcripts():
         folder = _norm_dir(s.get("cwd"))
         if not folder or _is_junk(folder):
             continue
@@ -1543,7 +1582,7 @@ def project_tree(force=False):
             "pinned": bool(m.get("pinned")),
             "renamed": bool(m.get("name")),
             "mtime": max([x["mtime"] for x in sessions], default=m.get("ts", 0)),
-            "sessions": sessions[:60],
+            "sessions": sessions,
             "n": len(sessions),
         })
     out.sort(key=lambda x: x.get("mtime", 0), reverse=True)
