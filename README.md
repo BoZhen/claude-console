@@ -26,8 +26,8 @@ things a raw terminal tangles together:
   and choose <b>Ask in side chat</b> (the popup over the selected formula); a separate conversation
   about it opens on the right, beside the chat, on its own model. Bottom left: the agent asking
   <em>you</em> a question, with the plan folded to its active step and a file attached to the next
-  message. Bottom right: a phone, with the drawer's tabs, search and Settings in a toolbar above
-  the header, and the context and usage rings in the header. All in the One Light theme, from a
+  message. Bottom right: a phone, with the folder, Side chats, Agents, search and Settings in a
+  toolbar above the header, and the context and usage rings in the header. All in the One Light theme, from a
   scripted demo session.</sub>
 </p>
 
@@ -56,9 +56,24 @@ which is the whole point.
   row (`▶ Bash ×5  ruff check .  1 failed`) that expands to the individual
   cards. Anything in between — an answer, an edit, an approval — ends the run.
 - **Delegated work** — when the agent hands a task to a subagent (the `Agent`
-  tool), everything the subagent says and does stays inside that one card,
-  collapsed, with its tool-call count and token usage in the header; the report
-  it returns is the card's result.
+  tool), its card goes to the **Agents** tab of the right-hand drawer, and the
+  chat keeps one line where it was started, with its live state (`running ·
+  Bash pytest -q`, `done`, `failed`); a click on it opens that card. The tab
+  lists the session's subagents with a summary on top (`2 running · 5 done`);
+  each card's header says what it was asked, its state, what it is doing now
+  (its progress note or the tool it last called), its tool-call count and token
+  usage, all live, and unfolds to everything the subagent said and did, then the
+  report it returned. Agents started together (in one message) form a group that
+  folds, with a name a cheap model writes from their tasks, kept for later. Each time
+  the tab opens, only groups with an agent still running are unfolded; a folded group
+  unfolds again when one of its agents starts. The chat
+  then has one line for the whole group (`Repo history survey  4 agents · 2 running ·
+  2 done`). A subagent that starts its own stays inside its card. The rail and the
+  phone toolbar show how many still run. After a console restart the agents come
+  back as they were, from the completion notices in the transcript and each
+  subagent's own file: done ones with their whole run and tool count, ones the
+  restart cut off as `stopped`. So a long run no longer sits in the conversation,
+  pushed out of view by what follows.
 - **Plan dock** — a task list pinned above the chat with the current step, a
   progress count, and a fold to just the active task. A finished plan retires
   two seconds after its last step, or at once with its `read` button, and a
@@ -81,6 +96,20 @@ which is the whole point.
   tab, so you can look at what the agent is talking about without leaving the
   conversation. Point `CLAUDE_CONSOLE_WEBFM_URL` at yours (defaults to this host
   on `:7701`); markdown links to local paths work the same way.
+- **Pictures inside a reply** — the agent can show an image right where it talks about
+  it: a Markdown image with a local path, `![Energy against sweeps](~/work/lattice-qmc/energy.png)`,
+  appears in place, below the sentence that introduces it, at most 560 × 380 px on a wide
+  screen and the reply's width on a phone. A click opens it over the chat in the
+  **picture viewer**: fitted to the window (the whole screen on a phone), zoomed by the
+  wheel, a pinch, `+`/`-` or a double click or tap (2.5× there, again back to fit),
+  dragged once zoomed, `0` or ⤢ to fit again; the header has the path, the file manager
+  and a download. Esc, ✕ or a click beside the picture closes it; Ctrl+click still
+  opens the file manager. The console tells the agent it can do this, so plots it makes and
+  screenshots it reads show up in the conversation. Only image files under your home
+  folder, the temporary folder or a session's folder are served, a relative path is
+  taken from the session's folder, and a picture redrawn on disk shows the new version.
+  A web address in an image is not loaded (an image URL is a way for injected
+  instructions to carry data out); it stays a link.
 
 ### Working across sessions
 
@@ -145,7 +174,7 @@ which is the whole point.
 - **Images in the conversation** — each image you send is also kept as a file in
   a private temporary folder (`/tmp/claude-console-<uid>/images`), and the message
   tells Claude its path. The conversation shows it as a thumbnail, also after a
-  reload, with **Save** (into the session's working directory) and **Save as…**
+  reload, that opens in the picture viewer, with **Save** (into the session's working directory) and **Save as…**
   (any folder in your home folder, with a name of your choice); a save never
   replaces an existing file. The temporary copy does not survive a restart of
   the computer, and the thumbnail then says so.
@@ -164,7 +193,10 @@ which is the whole point.
   confirmed words and punctuation stay fixed, the latest 10 Chinese characters
   remain revisable, and stopping re-runs the whole recording to correct whatever
   was not confirmed yet. It never sends by itself,
-  and the text stays with the session that started the recording.
+  and the text stays with the session that started the recording. A muted or dead
+  microphone delivers only silence, which speech models turn into a stray word; the
+  page measures the input level while you speak, and a recording that stayed silent
+  is not transcribed but answered with a notice naming that input.
 - **Punctuation from the pauses you actually made** — speech models return a wall
   of words, which is unreadable in Chinese and tiring in English. Silences are
   measured against the word timings and become punctuation: half a second is a
@@ -198,7 +230,7 @@ which is the whole point.
   another), and stays out of the main session's context and out of the session list. Each
   session keeps its own side chats. **+ New side chat** starts one with no quote, which knows
   the project but not the conversation. Its header shows how much of its own context window
-  it has used, as a ring like the main chat's Context.
+  it has used, as a ring like the main chat's ctx.
 
 ### Everything else
 
@@ -215,15 +247,17 @@ which is the whole point.
   device.
 - **At-a-glance status** — rings in the header for the context window and the rolling
   5-hour and weekly usage, including any per-model weekly quota the account carries (Fable
-  on Max). A ring fills as the share grows and turns from green to yellow, orange and red;
+  on Max), with the same short labels on every screen: `ctx`, `5h`, `7d` and the model's
+  initial (`F` for Fable). A ring fills as the share grows and turns from green to yellow, orange and red;
   hovering it, or tapping it on a touch screen, shows the figures (tokens and model, or the
   share used and the reset time). A floating status pill (ready / working timer / live token counts) plus
   the model and effort pills above a full-width composer. Past 60% of the window
   the empty composer reads *update your snapshot*.
 - **Wide and narrow screens** — when the window is wide enough (a desktop, a tablet, an
   unfolded foldable), the drawer docks beside the chat instead of covering it, and a rail on
-  the right edge opens Side chats, Edits, Git diff and Settings. Below 600 px a toolbar above
-  the header carries the drawer's tabs, search and Settings, and the header keeps the context
+  the right edge opens Side chats, Agents, Edits, Git diff and Settings. Below 600 px a toolbar above
+  the header carries a folder button (the session's folder in the file manager), Side chats,
+  Agents, search and Settings (Edits and Git diff stay in the drawer's own tab bar), and the header keeps the context
   and usage rings as one compact group beside the ☑ plans button.
 - **About** — ⚙ Settings → About shows the console's version (the commit the server started
   from). In the Android and desktop apps it also shows the app's own version with **Check for
@@ -335,7 +369,9 @@ The legacy `AGENTLENS_*` names are still honored as a fallback.
   different Python than the console runs in, and a separate process is also how
   the model's memory gets released — it exits on its own when idle.
 - [KaTeX](https://katex.org/) is vendored under `static/katex/` (MIT, license in
-  `static/katex/LICENSE`) for offline math rendering.
+  `static/katex/LICENSE`) for offline math rendering, and
+  [Panzoom](https://github.com/timmywil/panzoom) 4.6.2 under `static/panzoom/` (MIT,
+  `static/panzoom/LICENSE`) for the picture viewer's zoom and pan.
 - Non-image attachments are written to `.claude-console/uploads/` inside the
   session's working directory, so the agent can open and run them. That folder
   ignores itself in git (it ships a `.gitignore` containing `*`), and nothing is

@@ -231,6 +231,7 @@ RECAP_SYS = ("You write a one-line \"recap\" for a developer who stepped away fr
 # the plan history: one entry per plan, its summary written by a cheap model once the
 # plan is finished (see ChatSession._track_plan)
 PLAN_SUMMARY_MODEL = _env("PLAN_SUMMARY_MODEL", "haiku") or "haiku"
+AGENT_GROUP_MODEL = _env("AGENT_GROUP_MODEL", "haiku") or "haiku"     # names a group of parallel agents
 # the language of the plan's step titles and of the history summaries, as a language
 # name for the prompts ("Chinese"); unset, both follow the language the user writes in
 PLAN_LANG = (_env("PLAN_LANG", "") or "").strip()
@@ -352,6 +353,17 @@ PLAN_SCHEMA = {
 # TaskCreate {subject, description, activeForm} then TaskUpdate {taskId, status}.
 # TaskCreate never reports the id it was given; that comes back only in the tool
 # RESULT text, "Task #3 created successfully: Fix lint".
+# Pictures in a reply (see LocalImageHandler and mdImages in the page). Beside the
+# prompt with the plan protocol: a habit of formatting is taken up from there, as
+# the plan was, and not from the system prompt.
+IMAGE_PROMPT = (
+    "# Pictures in your replies\n"
+    "The console shows an image inside your reply where you write a Markdown image with "
+    "the file's absolute path, on its own line: `![what it shows](/abs/path/plot.png)` "
+    "(png, jpg, gif, webp, svg). Use it where a picture helps the explanation: a plot or "
+    "figure you made, a screenshot, an image file being discussed. Put it right after the "
+    "sentence that introduces it and say in the text what it shows. Only local files are "
+    "shown; web addresses are not loaded.")
 TASK_ID_RE = re.compile(r"[Tt]ask #(\d+)")
 TASK_FIELDS = ("subject", "description", "activeForm", "status")
 
@@ -624,8 +636,11 @@ def parse_claude(rec, idx):
                     if th.strip():
                         evs.append({**base, "kind": "thinking", "text": _cap(th)})
                 elif bt == "tool_use":
-                    evs.append({**base, "kind": "tool_use", "tool": b.get("name", ""),
-                                "input": _cap_input(b.get("input")), "toolId": b.get("id", "")})
+                    ev = {**base, "kind": "tool_use", "tool": b.get("name", ""),
+                          "input": _cap_input(b.get("input")), "toolId": b.get("id", "")}
+                    if b.get("name") in ("Agent", "Task") and msg.get("id"):
+                        ev["batch"] = msg["id"]      # agents started in one message form a group
+                    evs.append(ev)
     elif t == "user":
         if rec.get("isMeta") or rec.get("isCompactSummary"):
             return []          # harness/CLI-injected, never real chat: "Continue from where
@@ -1822,21 +1837,203 @@ def fetch_models(force=False, account="main"):
         return c["v"]
 
 
+def _trim_log(log, cap):
+    """A session's log past `cap` events loses its oldest subagent detail first, so
+    a run of busy subagents does not push the conversation itself out of a
+    reattach. A card keeps its state and its whole tool count: those travel on the
+    Agent call's result and on agent_done, which are not subagent events."""
+    over = len(log) - cap
+    if over <= 0:
+        return log
+    out = []
+    for e in log:
+        if over > 0 and e.get("parent"):
+            over -= 1
+            continue
+        out.append(e)
+    return out[-cap:] if len(out) > cap else out
+
+
+_NOTE_RE = re.compile(r"<task-notification>(.*?)</task-notification>", re.S)
+
+
+def _task_notifications(rec):
+    """The task notifications in one transcript record: [(tool_use_id, status,
+    summary)]. The CLI writes a finished background task as a user turn, or, when
+    it arrived while the agent was busy, only as queue and attachment records, so
+    every string in the record is searched."""
+    out = []
+    def walk(x):
+        if isinstance(x, str):
+            if "<task-notification>" in x:
+                for blk in _NOTE_RE.findall(x):
+                    tu = re.search(r"<tool-use-id>([^<]+)</tool-use-id>", blk)
+                    if not tu:
+                        continue
+                    st = re.search(r"<status>([^<]+)</status>", blk)
+                    sm = re.search(r"<summary>(.*?)</summary>", blk, re.S)
+                    out.append((tu.group(1).strip(), st.group(1).strip() if st else "completed",
+                                sm.group(1).strip() if sm else ""))
+        elif isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+    walk(rec)
+    return out
+
+
+SUB_KEEP = 80     # a subagent's own events kept on replay, the latest; its tool count stays whole
+
+
+def _subagent_runs(path):
+    """{Agent tool_use id: {"events", "ntools", "finished", "report"}} from the
+    subagents/ folder beside a transcript. The main transcript holds only the
+    Agent call and its result; what each subagent said and did is in its own file,
+    with a .meta.json naming the call. "finished" is the last request ending its
+    turn; "report" its last text."""
+    d = path[:-len(".jsonl")] + os.sep + "subagents" if path.endswith(".jsonl") else ""
+    out = {}
+    for meta in glob.glob(os.path.join(d, "*.meta.json")) if d else []:
+        try:
+            with open(meta, encoding="utf-8") as f:
+                tu = (json.load(f) or {}).get("toolUseId")
+        except Exception:
+            continue
+        if not tu:
+            continue
+        evs, ntools, finished, report = [], 0, False, ""
+        try:
+            with open(meta[:-len(".meta.json")] + ".jsonl", encoding="utf-8", errors="replace") as f:
+                for i, line in enumerate(f):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    if rec.get("type") == "assistant":
+                        sr = (rec.get("message") or {}).get("stop_reason")
+                        if sr:
+                            finished = sr == "end_turn"
+                    for e in parse_claude(rec, i):
+                        k = e.get("kind")
+                        if k == "user_text":
+                            continue          # its brief, already on the card
+                        if k == "tool_use":
+                            ntools += 1
+                        elif k == "assistant_text":
+                            report = e.get("text") or report
+                        e["parent"] = tu
+                        evs.append(e)
+        except OSError:
+            continue
+        out[tu] = {"events": evs[-SUB_KEEP:], "ntools": ntools, "finished": finished, "report": report}
+    return out
+
+
+def _with_subagents(path, evs):
+    """A resumed session's agents, as they were: each subagent's run goes right
+    after its Agent call, its tool count onto how the call ended. A background
+    agent with no notification either finished (its file says so) or was cut off:
+    the process that ran it is gone, so it cannot still be running."""
+    calls = [e for e in evs if e.get("kind") == "tool_use" and e.get("tool") in ("Agent", "Task")
+             and not e.get("parent")]
+    if not calls:
+        return evs
+    runs = _subagent_runs(path)
+    done = {e.get("toolId"): e for e in evs if e.get("kind") == "agent_done"}
+    results = {e.get("toolId"): e for e in evs if e.get("kind") == "tool_result" and not e.get("parent")}
+    out = []
+    for e in evs:
+        out.append(e)
+        if e.get("kind") != "tool_use" or e.get("tool") not in ("Agent", "Task") or e.get("parent"):
+            continue
+        tu = e.get("toolId")
+        run = runs.get(tu) or {"events": [], "ntools": 0, "finished": False, "report": ""}
+        out.extend(run["events"])
+        total = {"ntools": run["ntools"]}
+        if tu in done:
+            done[tu]["agent"] = dict(done[tu].get("agent") or {}, **total)
+            continue
+        res = results.get(tu)
+        if res is not None and not (res.get("content") or "").lstrip().startswith("Async agent launched"):
+            res["agent"] = dict(res.get("agent") or {}, **total)    # ran in the foreground: its result is the report
+            continue
+        if res is None:
+            continue          # the call never got as far as a result
+        out.append({"kind": "agent_done", "toolId": tu, "agent": total,
+                    "status": "completed" if run["finished"] else "stopped",
+                    "summary": _cap(run["report"], RESULT_CAP) if run["finished"] else ""})
+    return out
+
+
 def load_transcript_events(cc, cap=1000):
-    """Parse a saved transcript into console events, for preload on --resume."""
+    """Parse a saved transcript into console events, for preload on --resume.
+    Finished background tasks come back as agent_done, and each subagent's run
+    from its own file (see _with_subagents)."""
     path = find_transcript(cc)
     if not path:
         return []
-    evs = []
+    evs, noted = [], set()
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             for i, line in enumerate(f):
                 line = line.strip()
-                if line:
-                    evs.extend(parse_line(line, i, "claude"))
+                if not line:
+                    continue
+                evs.extend(parse_line(line, i, "claude"))
+                if "<task-notification>" in line:
+                    try:
+                        notes = _task_notifications(json.loads(line))
+                    except Exception:
+                        notes = []
+                    for tu, st, sm in notes:
+                        if tu not in noted:
+                            noted.add(tu)
+                            evs.append({"kind": "agent_done", "toolId": tu, "status": st,
+                                        "summary": _cap(sm, RESULT_CAP), "id": "N%d" % i})
     except Exception:
         pass
-    return evs[-cap:] if len(evs) > cap else evs
+    evs = evs[-cap:] if len(evs) > cap else evs
+    try:
+        return _with_subagents(path, evs)
+    except Exception:
+        return evs
+
+
+# Names for groups of agents started together, written by a cheap model once per
+# group and kept here by the message id that started them, so a replay shows them.
+AGENT_GROUPS_FILE = os.path.join(HOME, ".claude", "console-agent-groups.json")
+AGENT_GROUP_SYS = ("You name a group of subagent tasks that were started together. Reply with the name "
+                   "only: 3 to 8 words saying what the group works on, in the language the tasks are "
+                   "written in, no quotes, no final period.")
+
+
+def load_agent_groups():
+    try:
+        with open(AGENT_GROUPS_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_agent_group(batch, name):
+    d = load_agent_groups()
+    d[batch] = name
+    if len(d) > 4000:
+        d = dict(list(d.items())[-4000:])
+    try:
+        os.makedirs(os.path.dirname(AGENT_GROUPS_FILE), exist_ok=True)
+        tmp = AGENT_GROUPS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, AGENT_GROUPS_FILE)
+    except Exception:
+        pass
 
 
 def list_resumable(cwd=None, limit=20):
@@ -3715,6 +3912,69 @@ class ImageHandler(AuthMixin, tornado.web.RequestHandler):
             self.write(fh.read())
 
 
+# A picture the agent shows in its reply: a Markdown image with a local path,
+# ![what it shows](/abs/path/plot.png). The page asks for the file here. Only image
+# files, and only under the home folder, the temporary folder or a live session's
+# working directory. An SVG opened on its own runs no script (CSP sandbox). The
+# browser revalidates each time (ETag), so a figure redrawn on disk shows anew.
+LOCAL_IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+                     ".webp": "image/webp", ".svg": "image/svg+xml", ".avif": "image/avif", ".bmp": "image/bmp"}
+LOCAL_IMAGE_MAX = 40 * 1024 * 1024
+
+
+def local_image_path(path):
+    """The real path of an image the page may show, else None."""
+    if not isinstance(path, str) or not path.strip():
+        return None
+    path = path.strip()
+    if path.startswith("file://"):
+        path = urllib.parse.unquote(path[7:])
+    path = os.path.expanduser(path)
+    if not os.path.isabs(path):
+        return None
+    real = os.path.realpath(path)
+    if os.path.splitext(real)[1].lower() not in LOCAL_IMAGE_TYPES or not os.path.isfile(real):
+        return None
+    roots = [HOME, tempfile.gettempdir()] + [getattr(s, "cwd", "") for s in list(CHAT_SESSIONS.values())]
+    for root in roots:
+        if root and (real == os.path.realpath(root) or real.startswith(os.path.realpath(root).rstrip(os.sep) + os.sep)):
+            return real
+    return None
+
+
+class LocalImageHandler(AuthMixin, tornado.web.RequestHandler):
+    """GET ?path=… : an image file named in the agent's reply (local_image_path)."""
+    async def get(self):
+        if not self._ok_auth():
+            return
+        real = local_image_path(self.get_argument("path", ""))
+        try:
+            st = os.stat(real) if real else None
+        except OSError:
+            st = None
+        if not st or st.st_size > LOCAL_IMAGE_MAX:
+            self.set_status(404)
+            self.finish()
+            return
+        etag = '"%x-%x"' % (st.st_mtime_ns, st.st_size)
+        self.set_header("ETag", etag)
+        self.set_header("Cache-Control", "private, no-cache")
+        self.set_header("X-Content-Type-Options", "nosniff")
+        self.set_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox")
+        if self.request.headers.get("If-None-Match") == etag:
+            self.set_status(304)
+            self.finish()
+            return
+        self.set_header("Content-Type", LOCAL_IMAGE_TYPES[os.path.splitext(real)[1].lower()])
+        with open(real, "rb") as fh:
+            while True:
+                chunk = fh.read(256 * 1024)
+                if not chunk:
+                    break
+                self.write(chunk)
+                await self.flush()
+
+
 class ImageSaveHandler(AuthMixin, tornado.web.RequestHandler):
     """Save / Save as for an image copy: {"path", "dir", "name"} → the file is
     copied into dir (inside the home folder) and never replaces an existing one."""
@@ -4100,6 +4360,7 @@ class ChatSession:
         self._agents = {}         # Agent tool_use id -> its subagent's {up, out, steps}, for the card
         self._agent_reqs = {}     # Agent tool_use id -> message ids already counted
         self._agent_tasks = {}    # CLI task id -> Agent tool_use id, for the task_* lifecycle messages
+        self._batches = {}        # message id -> the agents it started, for the group's name
         self.event_seq = 0        # monotonic event number, so a viewer can ask for the gap
 
     def _keep_start_name(self):
@@ -4111,10 +4372,69 @@ class ChatSession:
         """Populate history from the on-disk transcript before resuming."""
         if self.resume_cc:
             self.log = load_transcript_events(self.resume_cc)
+            # the groups of agents it holds: their saved names, or one written now
+            names = load_agent_groups()
+            for ev in self.log:
+                self._batch_add(ev, schedule=False)
+            for b, rec in self._batches.items():
+                if len(rec["items"]) >= 2 and names.get(b):
+                    rec["named"] = True
+                    self.log.append({"kind": "agent_group", "batch": b, "name": names[b]})
             for ev in self.log:
                 self.event_seq += 1
                 ev["_seq"] = self.event_seq
             self._fold_tasks(self.log)   # the plan the session was left holding
+            for b, rec in self._batches.items():
+                if len(rec["items"]) >= 2 and not rec["named"]:
+                    tornado.ioloop.IOLoop.current().spawn_callback(self._name_batch, b)
+
+    def _batch_add(self, ev, schedule=True):
+        """Agents the main agent starts in one message form a group. Its name is
+        written once the message has started them all (a moment after the last)."""
+        b = ev.get("batch")
+        if not b or ev.get("kind") != "tool_use" or ev.get("parent"):
+            return
+        rec = self._batches.setdefault(b, {"items": [], "named": False, "timer": None})
+        i = ev.get("input") or {}
+        rec["items"].append((str(i.get("description") or ""), str(i.get("prompt") or "")[:400]))
+        if not schedule or rec["named"]:
+            return
+        loop = tornado.ioloop.IOLoop.current()
+        if rec["timer"]:
+            loop.remove_timeout(rec["timer"])
+        rec["timer"] = loop.call_later(3, lambda: loop.spawn_callback(self._name_batch, b))
+
+    async def _name_batch(self, b):
+        """A group's name: saved before, or an isolated single-turn call to a cheap
+        model over the agents' tasks. Sent to the viewers as a logged event."""
+        rec = self._batches.get(b)
+        if not rec or rec["named"] or len(rec["items"]) < 2:
+            return
+        rec["named"], rec["timer"] = True, None
+        name = load_agent_groups().get(b) or ""
+        if not name and HAVE_SDK:
+            try:
+                tasks = "\n".join("- %s: %s" % (d, " ".join(p.split())[:300]) for d, p in rec["items"])
+                cwd = os.path.join(HOME, ".cache", "claude-console-recap")
+                os.makedirs(cwd, exist_ok=True)
+                opts = ClaudeAgentOptions(model=AGENT_GROUP_MODEL, cwd=cwd, cli_path=CLAUDE_BIN,
+                                          system_prompt=AGENT_GROUP_SYS, allowed_tools=[], max_turns=1,
+                                          max_buffer_size=MAX_BUFFER, setting_sources=[])
+                chunks = []
+                async def _run():
+                    async for m in query(prompt="Tasks:\n" + tasks + "\n\nName:", options=opts):
+                        if isinstance(m, AssistantMessage):
+                            for blk in m.content:
+                                if isinstance(blk, TextBlock):
+                                    chunks.append(blk.text)
+                await asyncio.wait_for(_run(), 45)
+                name = " ".join(" ".join(chunks).split()).strip().strip('"\'“”「」').rstrip("。.")[:80]
+            except Exception:
+                name = ""
+            if name:
+                save_agent_group(b, name)
+        if name:
+            self._push([{"kind": "agent_group", "batch": b, "name": name}])
 
     def title(self):
         """Custom label if the user set one (or gave one in New session), else the
@@ -4199,7 +4519,7 @@ class ChatSession:
         if ((input_data or {}).get("prompt") or "").lstrip().startswith("/"):
             return {}
         return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
-                                       "additionalContext": PLAN_PROMPT}}
+                                       "additionalContext": PLAN_PROMPT + "\n\n" + IMAGE_PROMPT}}
 
     async def _hook_post_tool(self, input_data, tool_use_id, context):
         """PostToolUse: one nudge, at the first tool call of a turn that has no open
@@ -4542,8 +4862,10 @@ class ChatSession:
                 elif isinstance(b, ThinkingBlock) and b.thinking.strip():
                     evs.append({"kind": "thinking", "text": _cap(b.thinking)})
                 elif isinstance(b, ToolUseBlock):
-                    evs.append({"kind": "tool_use", "tool": b.name,
-                                "input": _cap_input(b.input), "toolId": b.id})
+                    ev = {"kind": "tool_use", "tool": b.name, "input": _cap_input(b.input), "toolId": b.id}
+                    if b.name in ("Agent", "Task") and getattr(msg, "message_id", None):
+                        ev["batch"] = msg.message_id   # agents started in one message form a group
+                    evs.append(ev)
         elif isinstance(msg, UserMessage):
             c = msg.content
             if isinstance(c, list):
@@ -4566,6 +4888,10 @@ class ChatSession:
         if par:
             for e in evs:
                 e["parent"] = par
+            n = sum(1 for e in evs if e.get("kind") == "tool_use")
+            if n:
+                a = self._agents.setdefault(par, {"up": 0, "out": 0, "steps": 0})
+                a["ntools"] = a.get("ntools", 0) + n
             if isinstance(msg, AssistantMessage):
                 self._agent_usage(par, msg)
         elif isinstance(msg, UserMessage):
@@ -5260,7 +5586,9 @@ class ChatSession:
             ev["_seq"] = self.event_seq
         self.log.extend(evs)
         if len(self.log) > 1500:
-            self.log = self.log[-1500:]
+            self.log = _trim_log(self.log, 1500)
+        for e in evs:
+            self._batch_add(e)
         self._emit({"type": "events", "events": evs})
         NOTIFY.on_events(self, evs)
 
@@ -5959,6 +6287,44 @@ header select,header input{background:var(--bg3);color:var(--fg);border:1px soli
 .tool .agst{color:var(--mut);font-family:var(--fmono);font-size:11.5px;flex-shrink:0;white-space:nowrap}
 .tool.agent.running>.th .agst{color:var(--tool)}
 .tool .brief{margin-bottom:8px}
+/* The Agents tab: the session's subagents, each a card whose header reads in two
+   lines (the task; then its state, what it does now, tools and tokens), the
+   summary above. The chat keeps a one-line marker where each one was started. */
+#agentsSum{font-size:12px;color:var(--mut);margin:0 0 9px;padding:5px 8px;background:var(--bg2);border:1px solid var(--line);border-radius:6px}
+#agentsSum b{color:var(--tool);font-weight:650}
+#agentsSum .fail{color:var(--delfg)}
+#agentsList .agbody>.tool.agent{margin:0 0 8px}
+#agentsList .agbody>.tool.agent>.th{flex-wrap:wrap;row-gap:3px}
+#agentsList .agbody>.tool.agent>.th .tp{flex:1 1 0;min-width:0}
+#agentsList .agbody>.tool.agent>.th .agst{order:10;flex-basis:100%;white-space:normal;padding-left:24px;line-height:1.45}
+/* agents started together (one message) form a group: a header with its name and
+   counts that folds the cards; a lone agent shows without one */
+.agroup{margin:0 0 8px}
+.agroup>.aghead{display:flex;align-items:center;gap:7px;padding:6px 9px;border:1px solid var(--line);border-radius:7px;
+  background:var(--bg2);cursor:pointer;user-select:none;font-size:12.5px}
+.agroup>.aghead:hover{background:var(--bg3)}
+.agroup.single>.aghead{display:none}
+.agroup:not(.single)>.agbody{margin:6px 0 0 9px;padding-left:10px;border-left:2px solid var(--line)}
+.agroup:not(.single):not(.open)>.agbody{display:none}
+.aghead .agcaret{flex:none;width:12px;height:12px;display:inline-flex;align-items:center;justify-content:center;opacity:.75}
+.aghead .agcaret::before{content:"";width:6px;height:6px;border-right:2px solid currentColor;border-bottom:2px solid currentColor;
+  transform:translate(-1px,0) rotate(-45deg);transition:transform .2s}
+.agroup.open>.aghead .agcaret::before{transform:translate(0,-2px) rotate(45deg)}
+.aghead .agname{flex:1;min-width:0;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.aghead .agname.pending{font-weight:500;color:var(--mut)}
+.aghead .agcount{color:var(--mut);font-family:var(--fmono);font-size:11.5px;white-space:nowrap}
+.aghead .agcount b{color:var(--tool);font-weight:600}
+.aghead .agcount .fail{color:var(--delfg)}
+.agroup.flash>.aghead{outline:2px solid var(--acc);outline-offset:-2px}
+.tool.agent.running>.th .agst::before{content:"● ";animation:pulse 1.4s infinite}
+.tool.flash{outline:2px solid var(--acc);outline-offset:-2px}
+.amark .ast{color:var(--mut)}
+.amark.running .ast{color:var(--tool)}
+.amark.fail .ast{color:var(--delfg)}
+.amark .adesc{max-width:46ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rbadge{position:absolute;top:1px;right:1px;min-width:14px;height:14px;padding:0 3px;box-sizing:border-box;border-radius:7px;
+  background:var(--tool);color:var(--bg);font:700 9.5px/14px var(--fsans);text-align:center;pointer-events:none}
+.rbadge[hidden]{display:none}
 .tool .sub{margin:0 0 8px;padding-left:10px;border-left:2px solid var(--line)}
 .tool .sub .tool,.tool .sub .toolgroup{margin:6px 0}
 .tool.err>.th .tn{color:var(--del)}
@@ -6013,6 +6379,39 @@ code{font-family:var(--fmono);font-size:12.5px;background:var(--codebg);border:1
 pre code{background:none;border:none;padding:0}
 .bubble a{color:var(--acc);text-decoration:underline;text-underline-offset:2px}
 .bubble a.filelink{text-decoration-style:dotted}
+/* a picture in a reply (mdImages): on its own line, a fixed size whatever the window:
+   a phone's whole bubble, on anything wider at most 560 x 380 px (or half the screen's
+   height), so a wide window does not blow a plot up; a click opens it whole in the
+   file manager */
+.mdimg{margin:8px 0;line-height:0}
+.mdimg a{display:inline-block;max-width:100%}
+.mdimg img{display:block;max-width:min(100%,560px);max-height:min(380px,50vh);width:auto;height:auto;border:1px solid var(--line);
+  border-radius:6px;background:var(--bg2);cursor:zoom-in}
+.mdimg.broken{line-height:1.4;font-size:12.5px;color:var(--mut)}
+/* the picture viewer (openImageViewer): over the chat, nearly the whole window; on a
+   phone the whole screen */
+.imgviewer{margin:auto;padding:0;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--fg);
+  width:min(1200px,96vw);height:min(880px,92dvh);max-width:none;max-height:none;overflow:hidden}
+.imgviewer[open]{display:flex;flex-direction:column}
+.imgviewer::backdrop{background:rgba(0,0,0,.62)}
+.imgviewer .ivhead{flex:none;display:flex;align-items:center;gap:4px;padding:8px 8px 8px 14px;border-bottom:1px solid var(--line)}
+.imgviewer .ivtitle{flex:1;min-width:0}
+.imgviewer .ivname{font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.imgviewer .ivpath{font-size:11.5px;color:var(--mut);font-family:var(--fmono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.imgviewer .ivpath:empty{display:none}
+.imgviewer .ivbtn{flex:none;width:32px;height:32px;display:grid;place-items:center;border:0;border-radius:7px;background:transparent;
+  color:var(--mut);cursor:pointer;padding:0}
+.imgviewer .ivbtn[hidden]{display:none}
+.imgviewer .ivbtn:hover{background:var(--bg3);color:var(--fg)}
+.imgviewer .ivbtn svg{width:18px;height:18px}
+.imgviewer .ivport{position:relative;flex:1;min-height:0;overflow:hidden;touch-action:none;background:var(--bg2);outline:none}
+.imgviewer .ivstage{display:flex;align-items:center;justify-content:center;width:100%;height:100%}
+.imgviewer .ivstage img{display:block;max-width:100%;max-height:100%;width:auto;height:auto;flex:none;
+  -webkit-user-select:none;user-select:none;-webkit-user-drag:none}
+.imgviewer .ivport.zoomed{cursor:grab}
+.imgviewer .ivport.zoomed.dragging{cursor:grabbing}
+.imgviewer .ivmsg{position:absolute;inset:0;display:grid;place-items:center;padding:20px;text-align:center;color:var(--mut)}
+@media(max-width:599px){.imgviewer{width:100vw;height:100dvh;border:0;border-radius:0}}
 .bubble h1{font-size:16px;font-weight:700;line-height:1.3;margin:14px 0 5px;text-wrap:balance}
 .bubble h2{font-size:15px;font-weight:700;line-height:1.35;margin:12px 0 4px;text-wrap:balance}
 .bubble h3{font-size:14px;font-weight:600;line-height:1.4;margin:10px 0 3px;text-wrap:balance}
@@ -6126,7 +6525,7 @@ body.drawer-push{padding-right:calc(var(--drw,min(560px,92vw)) + var(--railw))}
 #prail{display:none;position:fixed;top:0;right:0;bottom:0;width:var(--railw);z-index:22;background:var(--bg2);
   border-left:1px solid var(--line);flex-direction:column;align-items:center;gap:4px;padding-top:8px}
 #prail .prb{width:32px;height:32px;border:0;border-radius:7px;background:transparent;color:var(--mut);
-  display:grid;place-items:center;cursor:pointer;padding:0}
+  display:grid;place-items:center;cursor:pointer;padding:0;position:relative}
 #prail .prb:hover{background:var(--bg3);color:var(--fg)}
 #prail .prb.on{background:var(--sel);color:var(--acc)}
 @media(min-width:600px){
@@ -6143,15 +6542,16 @@ html.in-desktop-app{--railw:0px}
 #prail #prApp{order:9}
 #prail #prSet{order:10;margin-bottom:8px}
 /* Narrow screens (< 600 px): a slim toolbar above the header with what the header
-   has no room for: the drawer's tabs (there is no rail there), search, settings, and
-   in the Android app its version and updates. */
+   has no room for: the session's folder in the file manager, Side chats and Agents
+   (there is no rail there; Edits and Git diff are in the drawer's own tab bar), search,
+   settings, and in the Android app its version and updates. */
 #mtools{display:none}
 @media(max-width:599px){
   #mtools{display:flex;align-items:center;gap:1px;height:32px;flex-shrink:0;padding:0 4px 0 10px;
     background:var(--bg2);border-bottom:1px solid var(--line)}
   #drawer{top:32px;height:calc(100% - 32px)}   /* below the toolbar, whose buttons then toggle it */
 }
-#mtools #mtSide{margin-left:auto}   /* the buttons keep to the right, the computers to the left */
+#mtools #mtFiles{margin-left:auto}   /* the buttons keep to the right, the computers to the left */
 #mtools .mtb{position:relative;width:29px;height:28px;border:0;border-radius:6px;background:transparent;color:var(--mut);
   display:grid;place-items:center;padding:0;cursor:pointer;flex-shrink:0}
 #mtools .mtb[hidden]{display:none}
@@ -6246,7 +6646,8 @@ html.in-desktop-app #prail{display:none!important}
 #selpop .sp-ask{display:inline-block;padding:5px 10px;font-size:12px;color:var(--fg);cursor:pointer;border-radius:6px;white-space:nowrap}
 #selpop .sp-ask:hover{background:var(--acc);color:#fff}
 /* edits-out-of-chat */
-.dh .tab{cursor:pointer;padding:3px 9px;border-radius:5px;color:var(--mut);font-size:12.5px;user-select:none}
+.dh .tab{cursor:pointer;padding:3px 9px;border-radius:5px;color:var(--mut);font-size:12.5px;user-select:none;white-space:nowrap}
+@media(max-width:599px){#drawer .dh{gap:2px;padding:8px 8px}.dh .tab{padding:3px 6px}}   /* four tabs on one line */
 .dh .tab.on{background:var(--bg3);color:var(--fg)}
 .dh .tab span{font-size:10px;opacity:.8}
 .emark{font-size:12px;color:var(--tool);background:var(--toolbg);border:1px solid var(--toolln);border-radius:6px;
@@ -6323,7 +6724,7 @@ html.in-desktop-app #prail{display:none!important}
 :root[data-theme="light"],:root[data-theme="solarized-light"],:root[data-theme="catppuccin-latte"],
 :root[data-theme="gruvbox-light"],:root[data-theme="rose-pine-dawn"],:root[data-theme="one-light"],
 :root[data-theme="ayu-light"]{--mg:#22a83f;--my:#d9a800;--mo:#f57c00;--mr:#ef3f31}
-/* Ring meters (Context, Usage, a side chat's context): the arc is the share used and
+/* Ring meters (ctx, the usage limits, a side chat's context): the arc is the share used and
    takes the level colour, the track the same hue faint. The figures show in #ringTip. */
 .ring{width:16px;height:16px;flex-shrink:0;display:block}
 .ring circle{fill:none;stroke:currentColor;stroke-width:3}
@@ -6883,9 +7284,9 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
 <body>
 <div id="mtools" role="toolbar" aria-label="Tools">
   <div id="mtComputers" hidden aria-label="Computers"></div>
+  <button class="mtb" id="mtFiles" title="Open the session's folder"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h4.6l2 2h8.4A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></button>
   <button class="mtb" id="mtSide" title="Side chats"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><path d="M4 6.5A1.5 1.5 0 0 1 5.5 5h13A1.5 1.5 0 0 1 20 6.5v8a1.5 1.5 0 0 1-1.5 1.5H11l-4 3.5V16H5.5A1.5 1.5 0 0 1 4 14.5z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></button>
-  <button class="mtb" id="mtEdits" title="Edits"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><path d="M14.5 5.5l4 4L9 19H5v-4z M12.5 7.5l4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg></button>
-  <button class="mtb" id="mtGit" title="Git diff"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><circle cx="7" cy="6" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="7" cy="18" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="17" cy="9" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M7 8v8 M17 11c0 3-4 3-8.5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
+  <button class="mtb" id="mtAgents" title="Agents"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><rect x="5" y="8" width="14" height="11" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 8V5 M9 13h.01 M15 13h.01 M9.5 16.2h5 M3 12.5v3 M21 12.5v3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><circle cx="12" cy="4.2" r="1.2" fill="currentColor"/></svg><span class="rbadge" hidden></span></button>
   <button class="mtb" id="mtSearch" title="Search history"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M15 15l5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
   <button class="mtb" id="mtSettings" title="Settings"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg></button>
   <button class="mtb appbtn" id="mtApp" title="Update" hidden><svg class="upicon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="12" cy="12" r="8.6" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 7.2v8.6 M8.4 12.4l3.6 3.6 3.6-3.6" fill="none" stroke="var(--add)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
@@ -6980,8 +7381,12 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
 
 <div id="drawer">
   <div id="drresize"></div>
-  <div class="dh"><span class="tab on" id="tabEdits">Edits <span id="editN">0</span></span><span class="tab" id="tabGit">Git diff</span><span class="tab" id="tabSide">Side chats <span id="sideN">0</span></span><span class="grow"></span><span class="btn" id="grefresh">↻</span><span class="btn" id="dclose">✕</span></div>
+  <div class="dh"><span class="tab on" id="tabEdits">Edits <span id="editN">0</span></span><span class="tab" id="tabAgents">Agents <span id="agentN">0</span></span><span class="tab" id="tabGit">Git diff</span><span class="tab" id="tabSide">Side chats <span id="sideN">0</span></span><span class="grow"></span><span class="btn" id="grefresh">↻</span><span class="btn" id="dclose">✕</span></div>
   <div class="dc" id="edits"><div class="empty">no file changes yet</div></div>
+  <div class="dc" id="agentsc" style="display:none">
+    <div id="agentsSum" hidden></div>
+    <div id="agentsList"><div class="empty">No subagents in this session yet. When Claude hands work to a subagent, it shows here: what it was asked, what it is doing now, and its whole run.</div></div>
+  </div>
   <div class="dc" id="gitc" style="display:none"><div class="empty">—</div></div>
   <div class="dc" id="sidec" style="display:none">
     <div id="sideNewRow"><span class="btn" id="sideNewBtn">+ New side chat</span></div>
@@ -7000,6 +7405,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
 <nav id="prail" aria-label="Side panel">
   <div id="prComputers" hidden aria-label="Computers"></div>
   <button class="prb" id="prSide" title="Side chats"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M4 6.5A1.5 1.5 0 0 1 5.5 5h13A1.5 1.5 0 0 1 20 6.5v8a1.5 1.5 0 0 1-1.5 1.5H11l-4 3.5V16H5.5A1.5 1.5 0 0 1 4 14.5z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></button>
+  <button class="prb" id="prAgents" title="Agents"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><rect x="5" y="8" width="14" height="11" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 8V5 M9 13h.01 M15 13h.01 M9.5 16.2h5 M3 12.5v3 M21 12.5v3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><circle cx="12" cy="4.2" r="1.2" fill="currentColor"/></svg><span class="rbadge" hidden></span></button>
   <button class="prb" id="prEdits" title="Edits"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M14.5 5.5l4 4L9 19H5v-4z M12.5 7.5l4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg></button>
   <span class="prsp" aria-hidden="true"></span>
   <button class="prb appbtn" id="prApp" title="Update" hidden><svg class="upicon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="12" cy="12" r="8.6" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 7.2v8.6 M8.4 12.4l3.6 3.6 3.6-3.6" fill="none" stroke="var(--add)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
@@ -7183,6 +7589,14 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
     <div class="dialog-actions"><button id="newSessionCancel" class="btn" type="button">Cancel</button><button id="newSessionSubmit" class="newbtn" type="submit">Start session</button></div>
   </form>
 </dialog>
+<dialog id="imgViewer" class="imgviewer" aria-labelledby="ivName">
+  <div class="ivhead"><div class="ivtitle"><div id="ivName" class="ivname"></div><div id="ivPath" class="ivpath"></div></div>
+    <button id="ivFit" class="ivbtn" type="button" title="Fit the window (0)" aria-label="Fit the window" data-session-icon="maximize" hidden></button>
+    <a id="ivFm" class="ivbtn" target="_blank" rel="noopener" title="Open in the file manager" aria-label="Open in the file manager" data-session-icon="folder-open"></a>
+    <a id="ivDownload" class="ivbtn" title="Download to this device" aria-label="Download to this device" data-session-icon="download"></a>
+    <button id="ivClose" class="ivbtn" type="button" title="Close (Esc)" aria-label="Close" data-session-icon="x"></button></div>
+  <div id="ivPort" class="ivport" tabindex="0" aria-label="Picture"><div id="ivStage" class="ivstage"></div><div id="ivMsg" class="ivmsg" hidden></div></div>
+</dialog>
 <dialog id="askDlg" class="session-dialog" aria-labelledby="askTitle">
   <form id="askForm">
     <div class="dialog-heading"><h2 id="askTitle"></h2><button id="askClose" class="dialog-icon" type="button" title="Close" aria-label="Close" data-session-icon="x"></button></div>
@@ -7282,6 +7696,91 @@ function protectMarkdownLinks(h,links){
     links.push('<a href="'+escAttr(href)+'" target="_blank" rel="noopener">'+label+'</a>');
     return '%%LK'+(links.length-1)+'%%';
   });}
+/* ![what it shows](path): a local image shows right there in the reply, from
+   api/localimage (the server serves only image files in the home, temp or session
+   folders); a click opens it in the file manager. A relative path is taken from the
+   session's folder. A web address is not loaded (an image URL can carry data out of
+   the page if a prompt injection writes it); it stays a plain link. */
+function localImageTarget(t){if(isLocalTarget(t))return t.startsWith('file://')?t.slice(7):t;
+  if(/^[a-z][a-z0-9+.-]*:/i.test(t)||!t||t.startsWith('#'))return '';
+  return (typeof cwd==='string'&&cwd)?cwd.replace(/\/+$/,'')+'/'+t.replace(/^\.\//,''):'';}
+function mdImages(h,links){
+  return h.replace(/!\[([^\]\n]*)\]\((?:&lt;([^\n]*?)&gt;|([^)\s]+))\)/g,(m,alt,angle,bare)=>{
+    const target=cleanLinkTarget(angle!=null?angle:bare),label=alt||'image';
+    let out;
+    if(/^https?:\/\//i.test(target))out='<a href="'+escAttr(target)+'" target="_blank" rel="noopener noreferrer">🖼 '+label+'</a>';
+    else{const p=localImageTarget(target);if(!p)return m;
+      out='<figure class="mdimg"><a href="'+escAttr(webfmOpenUrl(p))+'" target="_blank" rel="noopener" title="'+escAttr(unescHtml(alt||p))+'">'+
+        '<img src="api/localimage?path='+encodeURIComponent(p)+'" alt="'+escAttr(unescHtml(alt))+'" loading="lazy" data-path="'+escAttr(p)+'"></a></figure>';}
+    links.push(out);return '%%LK'+(links.length-1)+'%%';});}
+/* ── the picture viewer ───────────────────────────────────────────────────────
+   A picture in the chat (one in a reply, or an attached image's thumbnail) opens here,
+   over the chat, as Codex Console's attachment preview does: fitted to the window;
+   zoomed by the wheel, a pinch, + and -, or a double click / double tap (2.5x there,
+   again back to fit); dragged once zoomed; 0 or ⤢ fits it again (Panzoom, loaded the
+   first time a picture opens). Esc, ✕ or a click beside the picture closes it. A click
+   with Ctrl/Cmd/Shift or the middle button still follows the link as before. */
+let imgView=null,panzoomLoad=null;
+function loadPanzoom(){if(typeof Panzoom==='function')return Promise.resolve(true);
+  if(!panzoomLoad)panzoomLoad=new Promise(res=>{const sc=document.createElement('script');sc.src='/static/panzoom/panzoom.min.js';
+    sc.onload=()=>res(typeof Panzoom==='function');sc.onerror=()=>{panzoomLoad=null;res(false);};document.head.appendChild(sc);});
+  return panzoomLoad;}
+function imgViewDestroy(){const v=imgView;imgView=null;if(!v)return;v.abort.abort();if(v.observer)v.observer.disconnect();
+  if(v.panzoom){v.panzoom.destroy();v.panzoom.resetStyle();}$('#ivPort').classList.remove('zoomed','dragging');$('#ivFit').hidden=true;}
+function openImageViewer(o){const d=$('#imgViewer'),port=$('#ivPort'),stage=$('#ivStage'),msg=$('#ivMsg');imgViewDestroy();
+  const name=o.name||'image';$('#ivName').textContent=name;$('#ivName').title=o.alt&&o.alt!==name?o.alt:name;$('#ivPath').textContent=o.path||'';
+  const dl=$('#ivDownload');dl.href=o.download||o.src;dl.setAttribute('download',name);
+  const fm=$('#ivFm');fm.hidden=!o.path;if(o.path)fm.href=webfmOpenUrl(o.path);
+  msg.hidden=true;stage.replaceChildren();const img=document.createElement('img');img.alt=o.alt||name;img.draggable=false;stage.appendChild(img);
+  const view=imgView={abort:new AbortController(),panzoom:null,observer:null,img:img};
+  if(!d.open)d.showModal();port.focus({preventScroll:true});
+  img.onerror=()=>{if(imgView!==view)return;stage.replaceChildren();msg.textContent='Picture unavailable: '+(o.path||name);msg.hidden=false;};
+  img.onload=async()=>{if(imgView!==view||!d.open)return;if(!(await loadPanzoom())||imgView!==view||!d.open)return;
+    const sig={signal:view.abort.signal};
+    const pz=view.panzoom=Panzoom(stage,{canvas:true,minScale:1,maxScale:8,step:.5,contain:'outside',panOnlyWhenZoomed:true,
+      cursor:'default',handleStartEvent:e=>e.preventDefault()});
+    view.observer=new ResizeObserver(()=>{if(imgView===view)pz.reset({animate:false});});view.observer.observe(port);
+    port.addEventListener('wheel',e=>pz.zoomWithWheel(e),{passive:false,...sig});
+    stage.addEventListener('panzoomchange',e=>{port.classList.toggle('zoomed',e.detail.scale>1.001);},sig);
+    stage.addEventListener('panzoomstart',()=>{if(pz.getScale()>1.001)port.classList.add('dragging');},sig);
+    stage.addEventListener('panzoomend',()=>port.classList.remove('dragging'),sig);
+    $('#ivFit').hidden=false;};
+  img.src=o.src;}
+/* taps and clicks in the viewer: a double one on the picture zooms there (or back to
+   fit), a single one beside an unzoomed picture closes it; a drag or a pinch is neither */
+(function(){const port=$('#ivPort'),d=$('#imgViewer'),pts=new Map();let g=null,lastTap=null;
+  const scale=()=>imgView&&imgView.panzoom?imgView.panzoom.getScale():1;
+  const onImg=(x,y)=>{const im=imgView&&imgView.img;if(!im||!im.isConnected)return false;const r=im.getBoundingClientRect();
+    return x>=r.left&&x<=r.right&&y>=r.top&&y<=r.bottom;};
+  port.addEventListener('pointerdown',e=>{pts.set(e.pointerId,{x:e.clientX,y:e.clientY});
+    if(pts.size===1)g={x:e.clientX,y:e.clientY,t:Date.now(),moved:false,multi:false};else if(g)g.multi=true;},true);
+  port.addEventListener('pointermove',e=>{const p=pts.get(e.pointerId);if(p&&g&&Math.hypot(e.clientX-p.x,e.clientY-p.y)>6)g.moved=true;},true);
+  const up=e=>{if(!pts.delete(e.pointerId)||pts.size||!g)return;const t=g;g=null;
+    if(e.type==='pointercancel'||t.moved||t.multi||Date.now()-t.t>400){lastTap=null;return;}
+    if(!onImg(t.x,t.y)){lastTap=null;if(scale()<=1.001)d.close();return;}
+    if(lastTap&&Date.now()-lastTap.t<350&&Math.hypot(t.x-lastTap.x,t.y-lastTap.y)<30){lastTap=null;
+      const pz=imgView&&imgView.panzoom;if(!pz)return;
+      if(pz.getScale()>1.001)pz.reset();else pz.zoomToPoint(2.5,{clientX:t.x,clientY:t.y});}
+    else lastTap={x:t.x,y:t.y,t:Date.now()};};
+  port.addEventListener('pointerup',up,true);port.addEventListener('pointercancel',up,true);
+  port.addEventListener('keydown',e=>{const pz=imgView&&imgView.panzoom;if(!pz||e.ctrlKey||e.metaKey||e.altKey||e.isComposing)return;
+    if(e.key==='+'||e.key==='='){e.preventDefault();pz.zoomIn();}else if(e.key==='-'){e.preventDefault();pz.zoomOut();}
+    else if(e.key==='0'||e.key==='Home'){e.preventDefault();pz.reset();}});
+  /* a click on the backdrop, outside the box */
+  d.addEventListener('click',e=>{if(e.target!==d)return;const r=d.getBoundingClientRect();
+    if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)d.close();});
+  $('#ivClose').onclick=()=>d.close();$('#ivFit').onclick=()=>{const pz=imgView&&imgView.panzoom;if(pz)pz.reset();};
+  d.addEventListener('close',()=>{imgViewDestroy();$('#ivStage').replaceChildren();});})();
+/* a picture in the chat opens in the viewer; with a modifier or the middle button the
+   link is followed (a reply's picture: the file manager; an attached image: the image) */
+document.addEventListener('click',e=>{const a=e.target.closest&&e.target.closest('.mdimg a,.imgcopy a');if(!a)return;
+  if(e.button!==0||e.ctrlKey||e.metaKey||e.shiftKey||e.altKey)return;
+  const img=a.querySelector('img');if(!img)return;e.preventDefault();
+  const path=img.dataset.path||'',name=path?path.split('/').pop():(img.alt||'image');
+  openImageViewer({src:img.currentSrc||img.src,download:img.getAttribute('src'),name:name,path:path,alt:img.alt});});
+/* a picture whose file is gone or not an image here: say so, with the path, in its place */
+document.addEventListener('error',e=>{const im=e.target;if(!(im instanceof HTMLImageElement)||!im.closest('.mdimg'))return;
+  const f=im.closest('.mdimg');f.classList.add('broken');f.textContent='🖼 image not found: '+(im.dataset.path||'');},true);
 function linkLocalPaths(h){
   const exts='pdf|png|jpe?g|gif|webp|svg|avif|heic|txt|md|markdown|rst|log|py|pyi|ipynb|js|mjs|ts|tsx|jsx|css|json|ya?ml|toml|ini|cfg|conf|xml|csv|tsv|sh|bash|zsh|fish|c|h|cpp|cc|hpp|rs|go|java|kt|rb|php|pl|lua|sql|tex|bib|m|jl|r|swift|html?';
   const re=new RegExp('(^|[\\s(>])((?:~|/)[^\\n<]*?\\.('+exts+'))(?=$|[\\s.,;:!?)}\\]]|<br>)','gi');
@@ -7316,6 +7815,7 @@ function md(src){
   h=mdTable(h);
   h=h.replace(/`([^`\n]+)`/g,(m,c)=>'<code>'+c+'</code>');
   const ll=[];
+  h=mdImages(h,ll);               /* ![alt](local path) → the picture, in place (before links: same shape after the !) */
   h=protectMarkdownLinks(h,ll);   /* [label](http|local path) → placeholder; local paths open in web-file-manager */
   h=linkLocalPaths(h);            /* bare ~/… or /… file paths → web-file-manager links */
   h=h.replace(/\*\*([^*\n]+)\*\*/g,'<b>$1</b>');
@@ -7330,7 +7830,8 @@ function md(src){
   h=h.replace(/(<uli[^>]*>.*?<\/uli>(?:\n<uli[^>]*>.*?<\/uli>)*)/g,m=>'<ul>'+m.replace(/\n/g,'').replace(/<(\/?)uli/g,'<$1li')+'</ul>');
   h=h.replace(/(<oli[^>]*>.*?<\/oli>(?:\n<oli[^>]*>.*?<\/oli>)*)/g,m=>'<ol>'+m.replace(/\n/g,'').replace(/<(\/?)oli/g,'<$1li')+'</ol>');
   h=h.replace(/\*(\S[^*\n]*?\S|\S)\*/g,'<i>$1</i>');
-  h=h.replace(/\n/g,'<br>').replace(/<br>(<(?:pre|h2|h3|ul|ol|table)>)/g,'$1').replace(/(<\/(?:pre|h2|h3|ul|ol|table)>)<br>/g,'$1');
+  h=h.replace(/\n/g,'<br>').replace(/<br>(<(?:pre|h2|h3|ul|ol|table)>)/g,'$1').replace(/(<\/(?:pre|h2|h3|ul|ol|table)>)<br>/g,'$1')
+   .replace(/<br>(<figure class="mdimg">)/g,'$1').replace(/(<\/figure>)<br>/g,'$1');
   h=h.replace(/%%CB(\d+)%%/g,(m,i)=>bl[+i]);
   h=h.replace(/%%MJ(\d+)%%/g,(m,i)=>'<span class="math'+(ml[+i].d?' display':'')+'" data-d="'+ml[+i].d+'">'+esc(ml[+i].t)+'</span>');
   return h;
@@ -7746,19 +8247,97 @@ const TOOL_EYE='<span class="eye"><svg class="e-shut" viewBox="0 0 24 24" fill="
    header carries a live count and the subagent's own token usage. */
 function agentStat(c,d){const a=c._ag;if(!a)return;
   if(d.tools)a.tools+=d.tools;if(d.up!=null)a.up=d.up;if(d.out!=null)a.out=d.out;if(d.est!=null)a.est=!!d.est;
-  if(d.doing!==undefined)a.doing=(''+(d.doing||'')).slice(0,48);   /* the brief needs its room too */
-  const el=c.querySelector(':scope>.th .agst');if(!el)return;
-  const run=c.classList.contains('running');
-  el.textContent=(run?(c._bg?'background':'running'):(a.status||'done'))+(run&&a.doing?(' · '+a.doing):'')+
-    ' · '+a.tools+' tool'+(a.tools===1?'':'s')+((a.up||a.out)?(' · ↑'+fmtTok(a.up)+' ↓'+(a.est?'~':'')+fmtTok(a.out)):'');}
+  if(d.ntools!=null)a.tools=Math.max(a.tools,d.ntools);   /* the server's whole count: the log may keep only part of the run */
+  /* what it does now: the CLI's progress note, or the tool it just called, whichever came last */
+  if(d.doing!==undefined)a.now=(''+(d.doing||'')).slice(0,60);
+  if(d.last!==undefined)a.now=(''+(d.last||'')).slice(0,60);
+  const run=c.classList.contains('running'),now=run?(a.now||''):'';
+  const state=run?(c._bg?'background':'running'):(a.status||(c.classList.contains('err')?'failed':'done'));
+  const el=c.querySelector(':scope>.th .agst');
+  if(el)el.textContent=state+(now?(' · '+now):'')+' · '+a.tools+' tool'+(a.tools===1?'':'s')+
+    ((a.up||a.out)?(' · ↑'+fmtTok(a.up)+' ↓'+(a.est?'~':'')+fmtTok(a.out)):'');
+  c._state=state+(now?' · '+now:'');
+  const g=c.closest&&c.closest('.agroup');
+  if(g&&g.parentElement&&g.parentElement.id==='agentsList'){groupSync(g);agentsSummary();}}
+/* ── the Agents tab ────────────────────────────────────────────────────────
+   An Agent call of the main agent gets its card in the drawer's Agents tab and a
+   one-line marker in the chat where it was started; both follow the run live, so
+   a long run no longer sits in the conversation and gets pushed up out of view.
+   Agents that a subagent starts stay folded inside their parent's card. */
+var AGENTS_EMPTY=$('#agentsList').innerHTML;   /* var: clearUI may run before this line */
+function agentCards(){return [...$('#agentsList').querySelectorAll(':scope>.agroup>.agbody>.tool.agent')];}
+/* agents started in one message of the main agent share a group; its name comes
+   later (agent_group), from a cheap model, and may arrive before the group does */
+var agentGroupNames={};
+function agentCounts(cs){const run=cs.filter(c=>c.classList.contains('running')).length,
+    fail=cs.filter(c=>!c.classList.contains('running')&&c.classList.contains('err')).length,
+    stop=cs.filter(c=>!c.classList.contains('running')&&c.classList.contains('stopped')).length;
+  return {run,fail,stop,done:cs.length-run-fail-stop};}
+function countsHTML(k){return (k.run?'<b>'+k.run+' running</b>':'')+
+  [k.done?k.done+' done':'',k.fail?'<span class="fail">'+k.fail+' failed</span>':'',k.stop?k.stop+' stopped':'']
+    .filter(Boolean).map((x,i)=>(i||k.run?' · ':'')+x).join('');}
+function agentGroupFor(ev){const box=$('#agentsList'),b=ev.batch||'';
+  let g=b?[...box.querySelectorAll(':scope>.agroup')].find(x=>x.dataset.batch===b):null;
+  if(g)return g;
+  if(!box.querySelector(':scope>.agroup'))box.innerHTML='';   /* the empty-state text */
+  g=document.createElement('div');g.className='agroup single open';if(b)g.dataset.batch=b;
+  g.innerHTML='<div class="aghead"><span class="agcaret"></span><span class="agname"></span><span class="agcount"></span></div><div class="agbody"></div>';
+  g.querySelector('.aghead').onclick=()=>g.classList.toggle('open');
+  box.appendChild(g);return g;}
+/* Each time the Agents list is opened (its tab shown, a session's list put in), a group
+   is unfolded only while one of its agents runs; groups with nothing running fold. */
+function agentFoldIdle(){for(const g of $('#agentsList').querySelectorAll(':scope>.agroup:not(.single)'))
+  g.classList.toggle('open',agentCounts([...g.querySelectorAll(':scope>.agbody>.tool.agent')]).run>0);}
+function groupSync(g){const cs=[...g.querySelectorAll(':scope>.agbody>.tool.agent')];if(!cs.length)return;
+  const multi=cs.length>1,k=agentCounts(cs),name=agentGroupNames[g.dataset.batch]||'';
+  g.classList.toggle('single',!multi);
+  /* a folded group unfolds when one of its agents starts running again */
+  if(k.run>0&&!g._run&&!replaying)g.classList.add('open');g._run=k.run>0;
+  const nm=g.querySelector('.agname');nm.textContent=name||(cs.length+' agents started together');nm.classList.toggle('pending',!name);
+  g.querySelector('.agcount').innerHTML=cs.length+' · '+countsHTML(k);
+  const m=g._mark;if(!m)return;
+  if(multi){m.querySelector('.adesc').textContent=name||(cs.length+' agents');
+    m.querySelector('.ast').innerHTML=(name?cs.length+' agents · ':'')+countsHTML(k);}   /* unnamed, the title already says how many */
+  else{m.querySelector('.adesc').textContent=primaryArg(cs[0]._ev&&cs[0]._ev.input)||'subagent';
+    m.querySelector('.ast').textContent=cs[0]._state||'';}
+  m.classList.toggle('running',k.run>0);m.classList.toggle('fail',!k.run&&k.fail>0);}
+function agentGroupNamed(ev){if(!ev.batch||!ev.name)return;agentGroupNames[ev.batch]=ev.name;
+  const g=[...document.querySelectorAll('#agentsList>.agroup')].find(x=>x.dataset.batch===ev.batch);if(g)groupSync(g);}
+function focusGroup(g){openDrawer('agents');g.classList.add('open');
+  g.classList.add('flash');g.scrollIntoView({block:'start'});setTimeout(()=>g.classList.remove('flash'),1200);}
+function agentsSummary(){const box=$('#agentsList'),cs=agentCards();
+  const {run,fail,stop,done}=agentCounts(cs);
+  if(!cs.length&&!box.children.length)box.innerHTML=AGENTS_EMPTY||'';
+  $('#agentN').textContent=cs.length;
+  const sum=$('#agentsSum');sum.hidden=!cs.length;
+  sum.innerHTML=(run?'<b>'+run+' running</b>':'none running')+(done?' · '+done+' done':'')+(fail?' · <span class="fail">'+fail+' failed</span>':'')+
+    (stop?' · '+stop+' stopped':'');
+  document.querySelectorAll('#prAgents .rbadge,#mtAgents .rbadge').forEach(b=>{b.hidden=!run;b.textContent=run>9?'9+':String(run);});
+  ['#prAgents','#mtAgents'].forEach(id=>{const b=$(id);if(b)b.title='Agents'+(cs.length?(' — '+run+' running, '+cs.length+' in this session'):'');});}
+function addAgentCard(c,ev){const g=agentGroupFor(ev),first=!g.querySelector('.tool.agent');
+  g.querySelector('.agbody').appendChild(c);
+  if(first)addAgentMarker(g,ev);   /* one line in the chat per group */
+  groupSync(g);agentsSummary();
+  if(!replaying&&drawerTab()==='agents'){const d=$('#agentsc');d.scrollTop=d.scrollHeight;}}
+function addAgentMarker(g,ev){const s=atBottom();const m=document.createElement('div');m.className='emark amark running';
+  m.innerHTML=(ICON[ev.tool]||'🤖')+'<span class="adesc"></span><span class="ast"></span><span class="mut">— see Agents</span>';
+  m.onclick=()=>{const cs=g.querySelectorAll(':scope>.agbody>.tool.agent');
+    if(cs.length>1)focusGroup(g);else focusAgent(cs[0]&&cs[0]._ev&&cs[0]._ev.toolId);};
+  g._mark=m;sink.appendChild(m);if(s)scroll();}
+function focusAgent(toolId){openDrawer('agents');const c=toolId&&tools[toolId];if(!c)return;
+  const g=c.closest('.agroup');if(g)g.classList.add('open');
+  if(!c.classList.contains('open'))c.querySelector(':scope>.th').click();
+  c.classList.add('flash');c.scrollIntoView({block:'start'});setTimeout(()=>c.classList.remove('flash'),1200);}
 /* a backgrounded subagent: the Agent tool result is only the launch notice, the
    real report arrives later as a task notification (agent_done) */
 function agentLaunched(c){c._bg=true;c.classList.add('running');
   (c.querySelector(':scope>.tb>.res')||{}).innerHTML='<div class="reslabel">running in the background — the report lands here when it finishes</div>';
   agentStat(c,{});}
 function agentDone(ev){const c=tools[ev.toolId];if(!c||!c._ag)return;
-  c._bg=false;c.classList.remove('running');c.classList.add('done');if(ev.status&&ev.status!=='completed')c.classList.add('err');
-  c._ag.status=ev.status&&ev.status!=='completed'?ev.status:'done';c._ag.doing='';
+  const stop=ev.status==='stopped'||ev.status==='killed';
+  c._bg=false;c.classList.remove('running');c.classList.add('done');
+  if(stop)c.classList.add('stopped');else if(ev.status&&ev.status!=='completed')c.classList.add('err');
+  c._ag.status=ev.status&&ev.status!=='completed'?ev.status:'done';c._ag.now='';
   const r=c.querySelector(':scope>.tb>.res');
   if(r&&ev.summary){r.innerHTML='<div class="reslabel">report ⤵</div><div class="b">'+md(ev.summary)+'</div>';typesetMath(r);}
   agentStat(c,ev.agent||{});}
@@ -7773,7 +8352,9 @@ function addTool(ev){const s=atBottom();const c=document.createElement('div');c.
   c.querySelector('.th').onclick=()=>{const open=c.classList.toggle('open');
     if(open&&!c._bodyDone){c._bodyDone=1;const b=c.querySelector(':scope>.tb>.brief');
       if(b)b.innerHTML=toolBody(c._ev);else c.querySelector('.res').insertAdjacentHTML('beforebegin',toolBody(c._ev));}};
-  placeToolCard(c,ev);if(ev.toolId)tools[ev.toolId]=c;if(s)scroll();}
+  if(ev.toolId)tools[ev.toolId]=c;
+  if(agent&&sink===stream){agentStat(c,{});addAgentCard(c,ev);return;}   /* the main agent's: to the Agents tab */
+  placeToolCard(c,ev);if(s)scroll();}
 function addResult(ev){const c=tools[ev.toolId];if(!c)return;if(ev.isError)c.classList.add('err');
   /* the card's OWN result box: an Agent card has more .res inside its fold; an edit card has no .tb at all */
   const b=(ev.content||'').trim();(c.querySelector(':scope>.tb>.res')||c.querySelector('.res')).innerHTML='<div class="reslabel">'+(ev.isError?'error ⤵':'output ⤵')+
@@ -7875,6 +8456,7 @@ function stopThinking(){clearInterval(thinkTimer);thinkTimer=0;const el=$('#thin
 function fmtSecs(ms){const s=Math.max(0,Math.round(ms/1000));if(s<60)return s+'s';const m=Math.floor(s/60);return m+'m '+(s%60)+'s';}
 function doInterrupt(){if(!running)return;wsSend({type:'interrupt'});addNotice('⏹ interrupt sent');}
 function clearUI(){stream.innerHTML='';$('#edits').innerHTML='<div class="empty">no file changes yet</div>';
+  $('#agentsList').innerHTML='';agentsSummary();
   $('#gitc').innerHTML='<div class="empty">—</div>';tools={};editCount=0;updateEditBadge();renderCtx(null);ready=false;
   queued={};renderQueue();stopThinking();clearPlan();planHist=[];phistSel=new Set();renderPlanHistPill();trimHidden=0;syncJump();
   endStream();}   /* also cancels a pending frame, which would else refill the cleared stream */
@@ -7964,7 +8546,8 @@ function route(ev){
     sink=c._sub;try{
       if(ev.kind==='assistant_text')addAsst(ev.text);
       else if(ev.kind==='thinking')addThink(ev.text);
-      else if(ev.kind==='tool_use'){if(EDIT_TOOLS.has(ev.tool)){addEditCard(ev);addMarker(ev);}else addTool(ev);agentStat(c,{tools:1});}
+      else if(ev.kind==='tool_use'){if(EDIT_TOOLS.has(ev.tool)){addEditCard(ev);addMarker(ev);}else addTool(ev);
+        const arg=primaryArg(ev.input);agentStat(c,{tools:1,last:toolLabel(ev.tool)+(arg?' '+arg:'')});}
       else if(ev.kind==='tool_result')addResult(ev);
     }finally{sink=stream;}
     return;}
@@ -7996,6 +8579,7 @@ function route(ev){
   else if(ev.kind==='model')setModelPill(ev.model,!!ev.once);
   else if(ev.kind==='agent_state'){const c=tools[ev.toolId];if(c&&c._ag&&ev.state==='background')agentLaunched(c);}
   else if(ev.kind==='agent_done')agentDone(ev);
+  else if(ev.kind==='agent_group')agentGroupNamed(ev);
   else if(ev.kind==='effort')setEffortPill(ev.effort);
   else if(ev.kind==='plan')setPlan(ev.tasks);
   else if(ev.kind==='plan_hist_item')planHistUpsert(ev.item);
@@ -8005,7 +8589,9 @@ function route(ev){
 
 /* persistent server-side session: attach / reattach / switch */
 function markEnded(msg){ready=false;ta.disabled=true;sendBtn.disabled=true;attachOff(true);$('#dot').className='dot';statset('ended');
-  localStorage.removeItem(SKEY);if(msg)addNotice(msg);}
+  localStorage.removeItem(SKEY);if(msg)addNotice(msg);
+  /* the process is gone and its subagents with it: no report will come */
+  agentCards().filter(c=>c.classList.contains('running')).forEach(c=>agentDone({toolId:c._ev&&c._ev.toolId,status:'stopped'}));}
 function onMsg(e){const m=JSON.parse(e.data);
   if(m.type==='hello'){if(m.stamp&&m.stamp!==PAGE_STAMP){try{saveDraft();}catch(_){}location.reload();}return;}   /* served under older code: pick up the new page */
   if(handleNewSessionReply(m))return;
@@ -8030,6 +8616,7 @@ function onMsg(e){const m=JSON.parse(e.data);
     ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));setModelPill(m.model,false);setEffortPill(m.effort);renderCtx(m.ctx);statset(m.ended?'ended':'ready');
     const tab=ensureTab(m,true);if(tab&&!incremental)planCollapsed=!!tab.planCollapsed;
     replaying=true;m.events.forEach(route);replaying=false;
+    if(!incremental)agentFoldIdle();
     setPlan(m.tasks);   /* authoritative: the log window may predate the plan */
     planHist=Array.isArray(m.plan_hist)?m.plan_hist:[];renderPlanHistPill();if(phistOpened())renderPlanHist();
     trimChatWindow();
@@ -8120,7 +8707,7 @@ function renderCtx(c){const el=$('#ctx');curCtx=c||null;
   hmRender();
   if(pct==null){el.style.display='none';return;}
   el.className='ctx rmeter';el.style.display='inline-flex';
-  el.innerHTML='<span class="ulabel">Context</span>'+ringSvg(pct);
+  el.innerHTML='<span class="ulabel">ctx</span>'+ringSvg(pct);
   setTip(el,ctxTip(c,pct));
   setResolvedModel(c.model, c.maxTokens);}
 /* Ring details: the figures in a small box below the ring, on hover with a mouse, on a
@@ -8143,9 +8730,12 @@ document.addEventListener('click',e=>{const m=e.target.closest&&e.target.closest
   tipShow(m);tipPinned=true;});
 addEventListener('resize',()=>{if(tipFor)tipHide();});
 document.addEventListener('scroll',()=>{if(tipFor)tipHide();},true);
-/* rolling 5-hour usage limit (Claude-Code-CLI style: Usage ░░░ 2% (4h 38m / 5h)) */
+/* the rolling 5-hour and weekly usage limits: 5h ◔ | 7d ◔ | F ◔ */
 function fmtDur(ms){if(ms==null||ms<=0)return '0m';const m=Math.floor(ms/60000),h=Math.floor(m/60);
   return h>0?(h+'h '+(m%60)+'m'):(m+'m');}
+/* A per-model weekly window is labelled by the model's initial (Fable: F), so every
+   screen shows the same short labels: ctx, 5h, 7d, F. The tooltip keeps the name. */
+function scopeAbbr(l){const s=String(l||'').replace(/^claude\s+/i,'').trim();return s?s.charAt(0).toUpperCase():'?';}
 function renderUsage(u){const el=$('#usage');const f=u&&u.five_hour,w=u&&u.seven_day;
   /* per-model weekly windows (e.g. Fable); label comes from the server */
   const sc=(u&&u.model_scoped)||[];
@@ -8154,7 +8744,7 @@ function renderUsage(u){const el=$('#usage');const f=u&&u.five_hour,w=u&&u.seven
   function seg(o,lbl){if(!o||o.utilization==null)return '';
     return '<span class="useg"><span class="ulabel">'+esc(lbl)+'</span>'+ringSvg(Math.round(o.utilization))+'</span>';}
   el.className='usage rmeter';el.style.display='inline-flex';
-  el.innerHTML='<span class="ulabel">Usage</span>'+seg(f,'5h')+seg(w,'7d')+sc.map(o=>seg(o,o.label)).join('');
+  el.innerHTML=seg(f,'5h')+seg(w,'7d')+sc.map(o=>seg(o,scopeAbbr(o.label))).join('');
   let t='';
   function row(lbl,o){if(!o||o.utilization==null)return;
     const rem=o.resets_at?fmtDur(new Date(o.resets_at)-Date.now()):'';
@@ -8170,7 +8760,7 @@ function hmRender(){const el=$('#hMeters');if(!el)return;
   const c=curCtx,pct=(c&&c.percentage!=null)?Math.round(c.percentage):null;
   const u=curUsage,f=u&&u.five_hour,w=u&&u.seven_day,sc=(u&&u.model_scoped)||[];
   const seg=(o,l)=>(o&&o.utilization!=null)?'<span class="hmseg"><span class="ulabel">'+esc(l)+'</span>'+ringSvg(Math.round(o.utilization))+'</span>':'';
-  const segs=seg(f,'5h')+seg(w,'7d')+sc.map(o=>seg(o,o.label)).join('');
+  const segs=seg(f,'5h')+seg(w,'7d')+sc.map(o=>seg(o,scopeAbbr(o.label))).join('');
   el.innerHTML=(pct!=null?'<span class="hmseg rmeter" id="hmCtx"><span class="ulabel">ctx</span>'+ringSvg(pct)+'</span>':'')+
     (segs?'<span class="hmuse rmeter" id="hmUse">'+segs+'</span>':'');
   if(pct!=null)setTip($('#hmCtx'),ctxTip(c,pct));
@@ -9034,7 +9624,7 @@ function stashView(id){
   if(!id)return false;const t=tabById(id);if(!t)return false;
   endStream();trimChatWindow();rememberTabView();
   viewCache.set(id,{stream:takeChildren(stream),plan:takeChildren($('#planDock')),
-    planHidden:$('#planDock').hidden,edits:takeChildren($('#edits')),git:takeChildren($('#gitc')),
+    planHidden:$('#planDock').hidden,edits:takeChildren($('#edits')),git:takeChildren($('#gitc')),agents:takeChildren($('#agentsList')),
     tools:tools,editCount:editCount,queued:queued,planTasks:planTasks,planCollapsed:planCollapsed,planHist:planHist,
     trimHidden:trimHidden,ctx:curCtx,cwd:cwd,cc:curCC,ready:ready,running:running,
     compacting:compacting,word:lastWordSeed,elapsed:running?Math.max(0,Date.now()-thinkStart):0,
@@ -9045,7 +9635,7 @@ function restoreView(id){
   const v=viewCache.get(id);if(!v)return false;
   restoreChildren(stream,v.stream);
   restoreChildren($('#planDock'),v.plan);$('#planDock').hidden=!!v.planHidden;
-  restoreChildren($('#edits'),v.edits);restoreChildren($('#gitc'),v.git);
+  restoreChildren($('#edits'),v.edits);restoreChildren($('#gitc'),v.git);restoreChildren($('#agentsList'),v.agents);agentsSummary();agentFoldIdle();
   tools=v.tools||{};editCount=v.editCount||0;queued=v.queued||{};
   planTasks=v.planTasks||[];planCollapsed=!!v.planCollapsed;planHist=v.planHist||[];renderPlanHistPill();trimHidden=Number(v.trimHidden||0);
   cwd=v.cwd||'';curCC=v.cc||null;sideSync();compacting=!!v.compacting;
@@ -9123,6 +9713,8 @@ const SESSION_ICON_PATHS={
   'folder-plus':['M12 10v6','M9 13h6','M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z'],
   refresh:['M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8','M21 3v5h-5','M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16','M8 16H3v5'],
   x:['M18 6 6 18','m6 6 12 12'],
+  download:['M12 15V3','M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4','m7 10 5 5 5-5'],
+  maximize:['M8 3H5a2 2 0 0 0-2 2v3','M21 8V5a2 2 0 0 0-2-2h-3','M3 16v3a2 2 0 0 0 2 2h3','M16 21h3a2 2 0 0 0 2-2v-3'],
   'arrow-up':['m5 12 7-7 7 7','M12 19V5'],
   'arrow-right':['M5 12h14','m12 5 7 7-7 7'],
   folder:['M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z'],
@@ -9399,7 +9991,29 @@ function renderVoiceState(){const bar=$('#voiceBar'),label=$('#voiceLabel');if(!
 function stopVoiceTracks(job){if(job&&job.stream){job.stream.getTracks().forEach(t=>t.stop());job.stream=null;}}
 function clearVoiceTimers(job){if(!job)return;clearInterval(job.tick);clearTimeout(job.limit);clearTimeout(job.previewTimer);
   job.tick=job.limit=job.previewTimer=0;}
-function cleanupVoiceJob(job){clearVoiceTimers(job);stopVoiceTracks(job);
+/* The input level while recording. A muted or dead microphone hands over digital
+   silence, and the model turns silence into a stray word ("嗯。"). So the page keeps the
+   loudest sample it sees, sends no live preview while there has been no sound, and at
+   the end does not transcribe a recording that never rose above VOICE_SILENT_PEAK but
+   says which input was silent. Where the level cannot be read, nothing changes. */
+const VOICE_SILENT_PEAK=0.01;   /* of full scale, about -40 dBFS; speech peaks far higher */
+function voiceLevelStart(job,stream){
+  try{const AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;
+    const t=stream.getAudioTracks()[0];job.inputLabel=(t&&t.label)||'';
+    const ctx=new AC(),an=ctx.createAnalyser();an.fftSize=4096;ctx.createMediaStreamSource(stream).connect(an);
+    const buf=new Float32Array(an.fftSize);job.levelCtx=ctx;job.peak=0;job.levelRead=false;
+    job.levelTimer=setInterval(()=>{if(ctx.state!=='running')return;an.getFloatTimeDomainData(buf);job.levelRead=true;
+      let p=job.peak;for(let i=0;i<buf.length;i++){const v=Math.abs(buf[i]);if(v>p)p=v;}job.peak=p;},80);
+    if(ctx.state!=='running')ctx.resume().catch(()=>{});
+  }catch(e){job.levelCtx=null;}}
+function voiceLevelStop(job){if(!job)return;clearInterval(job.levelTimer);job.levelTimer=0;
+  if(job.levelCtx){try{job.levelCtx.close();}catch(e){}job.levelCtx=null;}}
+/* silent: the level was read and never rose above the threshold */
+function voiceSilent(job){return !!job&&!!job.levelRead&&job.peak<VOICE_SILENT_PEAK;}
+function voiceSilenceMessage(job){
+  return 'The microphone'+(job.inputLabel?' ('+job.inputLabel+')':'')+' delivered only silence, so nothing was transcribed. '+
+    'Check that it is switched on and not muted, or choose another input in the system\'s sound settings.';}
+function cleanupVoiceJob(job){clearVoiceTimers(job);stopVoiceTracks(job);voiceLevelStop(job);
   if(job.previewController)job.previewController.abort();if(voiceJob===job){voiceJob=null;renderVoiceState();}}
 function voiceMime(){const choices=['audio/webm;codecs=opus','audio/mp4','audio/ogg;codecs=opus','audio/webm'];
   for(const type of choices){try{if(!MediaRecorder.isTypeSupported||MediaRecorder.isTypeSupported(type))return type;}catch(e){}}
@@ -9442,7 +10056,7 @@ async function loadVoiceCapabilities(){try{const r=await fetch('api/transcribe',
 async function warmVoiceModel(){try{await fetch('api/transcribe/warmup',{method:'POST',cache:'no-store'});}catch(e){}}
 function voiceStreamId(){if(globalThis.crypto&&crypto.randomUUID)return crypto.randomUUID();
   return 'voice-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2);}
-function queueVoicePreview(job){if(!job||job.cancelled||job.mode!=='recording'||job.liveUnavailable||!voiceCaps.livePreview)return;
+function queueVoicePreview(job){if(!job||job.cancelled||job.mode!=='recording'||job.liveUnavailable||!voiceCaps.livePreview||voiceSilent(job))return;
   if(Date.now()-job.startedAt<1500||job.chunks.length<2)return;job.previewQueued=true;
   if(job.previewPromise||job.previewTimer)return;const interval=Math.max(1000,Number(voiceCaps.previewIntervalMs)||1600);
   const wait=Math.max(0,interval-(Date.now()-(job.lastPreviewAt||0)));
@@ -9482,6 +10096,7 @@ async function uploadVoice(job,blob){if(job.cancelled)return;
   finally{cleanupVoiceJob(job);if(!job.cancelled&&job.targetSid===sid){
       requestAnimationFrame(()=>{if(!voiceJob&&job.targetSid===sid)ta.focus();});}}}
 function recorderStopped(job){stopVoiceTracks(job);if(job.cancelled){cleanupVoiceJob(job);return;}
+  if(voiceSilent(job)){restoreVoicePreview(job);addNotice('⚠ '+voiceSilenceMessage(job));cleanupVoiceJob(job);return;}
   const type=(job.recorder&&job.recorder.mimeType)||job.mime||'application/octet-stream';
   uploadVoice(job,new Blob(job.chunks,{type:type}));}
 function stopVoiceInput(){const job=voiceJob;if(!job||job.mode!=='recording')return;
@@ -9500,6 +10115,7 @@ async function startVoiceInput(){const reason=voiceUnavailableReason();if(reason
   try{const stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
     /* the permission prompt can outlive the job that asked for it */
     if(voiceJob!==job||job.cancelled){stream.getTracks().forEach(t=>t.stop());return;}job.stream=stream;job.mime=voiceMime();
+    voiceLevelStart(job,stream);
     job.recorder=job.mime?new MediaRecorder(stream,{mimeType:job.mime,audioBitsPerSecond:64000}):new MediaRecorder(stream);
     job.recorder.ondataavailable=e=>{if(e.data&&e.data.size){job.chunks.push(e.data);queueVoicePreview(job);}};
     job.recorder.onerror=e=>{if(!job.cancelled)addNotice('⚠ '+voiceErrorMessage(e.error||e));cancelVoiceInput();};
@@ -9564,12 +10180,13 @@ function toggleSidebar(){const sb=$('#sidebar');
 function drawerOpen(){return $('#drawer').classList.contains('open');}
 function gitTab(){return $('#tabGit').classList.contains('on');}
 function sideTab(){return $('#tabSide').classList.contains('on');}
+function agentsTab(){return $('#tabAgents').classList.contains('on');}
 function showTab(w){
-  const tabs={edits:'#tabEdits',git:'#tabGit',side:'#tabSide'},panes={edits:'#edits',git:'#gitc',side:'#sidec'};
+  const tabs={edits:'#tabEdits',agents:'#tabAgents',git:'#tabGit',side:'#tabSide'},panes={edits:'#edits',agents:'#agentsc',git:'#gitc',side:'#sidec'};
   if(!(w in panes))w='edits';
   for(const k in tabs)$(tabs[k]).classList.toggle('on',k===w);
   for(const k in panes)$(panes[k]).style.display=(k===w)?'':'none';
-  $('#grefresh').style.display=(w==='side')?'none':'';
+  $('#grefresh').style.display=(w==='side'||w==='agents')?'none':'';
   if(w==='edits'){buildPendingEdits();showAllEdits();}
   else if(w==='git')refreshGit();
   else if(w==='side')sideOnShow();
@@ -9588,7 +10205,8 @@ function focusEdit(toolId){const ed=$('#edits'),target=toolId&&tools[toolId];
   fb.innerHTML='showing one file · <span class="showall">show all changes</span>';
   fb.querySelector('.showall').onclick=showAllEdits;
   target.classList.add('flash');target.scrollIntoView({block:'start'});setTimeout(()=>target.classList.remove('flash'),1200);}
-function openDrawer(w){$('#drawer').classList.add('open');showTab(w||'edits');}
+function openDrawer(w){const was=drawerTab();$('#drawer').classList.add('open');showTab(w||'edits');
+  if(w==='agents'&&was!=='agents')agentFoldIdle();}
 /* An open drawer takes its own room, the way the desktop file pane does: the
    header and the chat column end where the drawer begins, so nothing is covered.
    Only on a wide window, and only while the chat column keeps DRAWER_PUSH_MIN px;
@@ -9598,7 +10216,7 @@ function openDrawer(w){$('#drawer').classList.add('open');showTab(w||'edits');}
 const DRAWER_PUSH_MIN=440, DRAWER_DOCK_FROM=600, DRAWER_KEY='al_drawer';
 let drawerWide=null;
 function railW(){return parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--railw'))||0;}
-function drawerTab(){return drawerOpen()?(sideTab()?'side':gitTab()?'git':'edits'):'';}
+function drawerTab(){return drawerOpen()?(sideTab()?'side':gitTab()?'git':agentsTab()?'agents':'edits'):'';}
 function drawerLayout(){const d=$('#drawer'),sb=$('#sidebar'),W=window.innerWidth,wide=W>=DRAWER_DOCK_FROM;
   /* Folding below 600 px puts the drawer away (it would cover the chat there);
      unfolding brings back the tab that was open. */
@@ -9619,7 +10237,7 @@ function drawerLayout(){const d=$('#drawer'),sb=$('#sidebar'),W=window.innerWidt
   if(wide)localStorage.setItem(DRAWER_KEY,drawerTab());
   railSync();}
 function railSync(){const t=drawerTab();
-  for(const [w,ids] of [['side',['#prSide','#mtSide']],['edits',['#prEdits','#mtEdits']],['git',['#prGit','#mtGit']]])
+  for(const [w,ids] of [['side',['#prSide','#mtSide']],['agents',['#prAgents','#mtAgents']],['edits',['#prEdits']],['git',['#prGit']]])
     ids.forEach(id=>$(id).classList.toggle('on',t===w));}
 /* a rail button opens its tab; the open tab's button closes the drawer */
 function railTap(w){if(drawerTab()===w)$('#drawer').classList.remove('open');else openDrawer(w);}
@@ -9629,7 +10247,11 @@ function railTap(w){if(drawerTab()===w)$('#drawer').classList.remove('open');els
   mo.observe(document.documentElement,{attributes:true,attributeFilter:['style']});   /* --drw / --sbw drags */
   window.addEventListener('resize',drawerLayout);
   $('#prSide').onclick=()=>railTap('side');$('#prEdits').onclick=()=>railTap('edits');$('#prGit').onclick=()=>railTap('git');
-  $('#mtSide').onclick=()=>railTap('side');$('#mtEdits').onclick=()=>railTap('edits');$('#mtGit').onclick=()=>railTap('git');
+  $('#prAgents').onclick=()=>railTap('agents');$('#mtAgents').onclick=()=>railTap('agents');
+  $('#mtSide').onclick=()=>railTap('side');
+  /* the folder of the session shown (else the folder picked in the list, else home), in
+     the file manager, as a file link in the chat opens */
+  $('#mtFiles').onclick=()=>{const f=currentFolder();if(f)window.open(webfmOpenUrl(f),'_blank');};
   $('#mtSearch').onclick=()=>openSearch();$('#mtSettings').onclick=()=>openSettings();
   /* In the Android app (ClaudeConsoleApp): its version, a dot when an update is
      waiting; a tap installs that update, or checks for one now. The app calls
@@ -10255,6 +10877,7 @@ window.addEventListener('scroll',closeCardMenu,true);
 $('#tabEdits').onclick=()=>showTab('edits');
 $('#tabGit').onclick=()=>showTab('git');
 $('#tabSide').onclick=()=>showTab('side');
+$('#tabAgents').onclick=()=>{const was=drawerTab();showTab('agents');if(was!=='agents')agentFoldIdle();};
 $('#sideBack').onclick=sideShowList;
 $('#sideSend').onclick=sideComposerSend;
 $('#sideNewBtn').onclick=()=>{openDrawer('side');
@@ -10314,8 +10937,8 @@ $('#dclose').onclick=()=>$('#drawer').classList.remove('open');
 document.addEventListener('click',e=>{
   /* a side chat stays open beside the main conversation: clicking, selecting or
      typing there must not close it (✕ and Escape still do) */
-  if(drawerOpen()&&!sideTab()&&!document.body.classList.contains('drawer-push')&&!e.target.closest('#drawer')&&!e.target.closest('#prail')&&!e.target.closest('#mtools')&&!e.target.closest('.emark')&&!e.target.closest('#selpop'))$('#drawer').classList.remove('open');});
-document.addEventListener('keydown',e=>{if(e.key==='Escape'&&drawerOpen())$('#drawer').classList.remove('open');});
+  if(drawerOpen()&&!sideTab()&&!document.body.classList.contains('drawer-push')&&!e.target.closest('#drawer')&&!e.target.closest('#prail')&&!e.target.closest('#mtools')&&!e.target.closest('.emark')&&!e.target.closest('#selpop')&&!e.target.closest('#imgViewer'))$('#drawer').classList.remove('open');});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&drawerOpen()&&!document.querySelector('dialog[open]'))$('#drawer').classList.remove('open');});
 $('#grefresh').onclick=refreshGit;
 
 /* ── Import folder ────────────────────────────────────────────────────────
@@ -10469,6 +11092,7 @@ def main():
         (r"/api/directories", DirectoriesHandler),
         (r"/api/image", ImageHandler),
         (r"/api/image/save", ImageSaveHandler),
+        (r"/api/localimage", LocalImageHandler),
         (r"/api/notify/stream", NotifyStreamHandler),
         (r"/api/notify/approve", NotifyApproveHandler),
         (r"/api/android/latest", AndroidLatestHandler),
