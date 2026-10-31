@@ -85,6 +85,13 @@
   所以它画的图、读到的截图都会出现在对话里。只提供家目录、临时目录或 session 文件夹下的
   图片文件；相对路径按 session 的文件夹解析；磁盘上的图重新生成后会显示新版本。图片里的
   网址不会被加载（图片 URL 可能被注入的指令用来把数据带出去），只保留为链接。
+- **回复里的交互式图表** —— 同样的写法换成一个自包含的 `.html` 文件，
+  `![可调失谐的拉比振荡](~/work/rabi.html)`（Plotly 用 `include_plotlyjs=True`，或 Bokeh、D3 等），
+  会显示成一张卡片；点 **▶ Run** 在卡片下方的框里运行这个页面（高度可以拖动），**⤢** 放大打开，
+  **■ Stop** 移除。这个页面是 agent 写的程序，所以它在封闭环境里运行：放在没有自己来源（origin）的沙箱中
+  （无法读取或操作 console 页面、它的存储和 API），并且完全断网（不能发请求、开 WebSocket、加载外部的
+  脚本、图片或字体，也不能提交表单或弹窗）。因此它用到的库必须都在文件里，从 CDN 加载的会是一片空白。带脚本、事件处理或悬停样式的
+  `.svg` 作为图片显示时什么都不会发生，所以它会自动得到同样的卡片。
 
 ### 跨 session 工作
 
@@ -248,6 +255,7 @@ python claude_console.py
 | `CLAUDE_CONSOLE_PORT` | `7703` | 监听端口 |
 | `CLAUDE_CONSOLE_BIND` | `127.0.0.1` | 绑定地址；设为 `0.0.0.0` 可从局域网访问 |
 | `CLAUDE_CONSOLE_AUTH` | *(disabled)* | 可选的 HTTP Basic Auth `user:pass` |
+| `CLAUDE_CONSOLE_ORIGINS` | *(none)* | 除了请求本身所访问的地址（经代理时也认 `X-Forwarded-Host`）之外，另外允许使用对话 socket 和执行修改操作的页面地址（`host[:port]`，逗号分隔） |
 | `CLAUDE_CONSOLE_WEBFM_URL` | this host on `:7701` | 打开被点击文件路径所用的 web file manager |
 | `CLAUDE_CONSOLE_CLAUDE` | `PATH` 中第一个 | 驱动哪个 `claude` 可执行文件；指向某个版本即可钉住它 |
 | `CLAUDE_CONSOLE_RECAP` | `1` | 回到闲置已久的 session 时先给一段摘要 |
@@ -283,7 +291,9 @@ python claude_console.py
 > [!WARNING]
 > 它会在你选定的目录里**驱动 Claude Code** —— 可以在那里读写文件、执行命令 ——
 > 并且会暴露你的**对话历史和源码 diff**。不要在不受信任的网络上暴露它，除非配了
-> `CLAUDE_CONSOLE_AUTH` 并有可信边界（VPN / SSH 隧道 / 反向代理 + TLS）。
+> `CLAUDE_CONSOLE_AUTH` 并有可信边界（VPN / SSH 隧道 / 反向代理 + TLS）。浏览器会把保存的登录
+> 附在发往 console 地址的每个请求上，不管是哪个页面发起的，所以对话 socket 和所有会改动东西的请求
+> 只接受来自 console 自己页面（或不是网页的客户端）的；别的网站上的页面、沙箱里的页面都会被拒绝。
 
 ## 说明
 

@@ -110,6 +110,16 @@ which is the whole point.
   taken from the session's folder, and a picture redrawn on disk shows the new version.
   A web address in an image is not loaded (an image URL is a way for injected
   instructions to carry data out); it stays a link.
+- **Interactive figures inside a reply** — the same with a self-contained `.html` file,
+  `![Rabi oscillation with a detuning slider](~/work/rabi.html)` (Plotly with
+  `include_plotlyjs=True`, Bokeh, D3…), shows a card; **▶ Run** starts the page in a
+  frame below it (its height can be dragged), **⤢** opens it large, **■ Stop** removes
+  it. The page is a program the agent wrote, so it runs sealed: in a sandbox without an
+  origin of its own (it cannot read or drive the console page, its storage or its API)
+  and with no network at all (no requests, WebSocket, outside scripts, images or
+  fonts, no forms or pop-ups). Its libraries must therefore be inside the file; one
+  loaded from a CDN stays blank. An `.svg` with scripts, event handlers or hover
+  styles, which would do nothing as a picture, gets the same card by itself.
 
 ### Working across sessions
 
@@ -324,6 +334,7 @@ HTTPS (a reverse proxy, or `tailscale serve`) unless you open it on `localhost`.
 | `CLAUDE_CONSOLE_PORT` | `7703` | listen port |
 | `CLAUDE_CONSOLE_BIND` | `127.0.0.1` | bind address; set `0.0.0.0` for LAN access |
 | `CLAUDE_CONSOLE_AUTH` | *(disabled)* | optional HTTP Basic Auth `user:pass` |
+| `CLAUDE_CONSOLE_ORIGINS` | *(none)* | more addresses (`host[:port]`, comma-separated) whose pages may use the chat socket and make changes, besides the one asked (also behind a proxy that sets `X-Forwarded-Host`) |
 | `CLAUDE_CONSOLE_WEBFM_URL` | this host on `:7701` | web file manager to open clicked file paths in |
 | `CLAUDE_CONSOLE_CLAUDE` | first on `PATH` | which `claude` binary to drive; point it at a specific version to pin one |
 | `CLAUDE_CONSOLE_RECAP` | `1` | summarize a session you return to after it has been idle |
@@ -360,7 +371,11 @@ The legacy `AGENTLENS_*` names are still honored as a fallback.
 > This **drives Claude Code** in the directory you pick — it can read/write files
 > and run commands there — and it exposes your **chat history and source diffs**.
 > Do not expose it on an untrusted network without `CLAUDE_CONSOLE_AUTH` and a
-> trusted boundary (VPN / SSH tunnel / reverse proxy + TLS).
+> trusted boundary (VPN / SSH tunnel / reverse proxy + TLS). A browser attaches a
+> saved login to every request for the console's address, whichever page makes it,
+> so the chat socket and every request that changes something are accepted only
+> from the console's own page (or a client that is not a web page); a page on
+> another site, or a sandboxed one, is refused.
 
 ## Notes
 

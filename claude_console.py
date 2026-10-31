@@ -363,7 +363,11 @@ IMAGE_PROMPT = (
     "(png, jpg, gif, webp, svg). Use it where a picture helps the explanation: a plot or "
     "figure you made, a screenshot, an image file being discussed. Put it right after the "
     "sentence that introduces it and say in the text what it shows. Only local files are "
-    "shown; web addresses are not loaded.")
+    "shown; web addresses are not loaded. An interactive figure goes the same way with a "
+    "self-contained .html file (`![what it shows](/abs/path/fig.html)`, e.g. Plotly with "
+    "include_plotlyjs=True): the user starts it with a click, and it runs sandboxed without "
+    "any network, so every library must be inside the file. An SVG with scripts, event "
+    "handlers or hover styles gets the same card by itself.")
 TASK_ID_RE = re.compile(r"[Tt]ask #(\d+)")
 TASK_FIELDS = ("subject", "description", "activeForm", "status")
 
@@ -2259,8 +2263,42 @@ def git_snapshot(cwd):
 
 
 # ───────────────────────── auth ─────────────────────────
+# Requests made by other sites. A login does not stop them by itself: a browser attaches
+# the console's saved login to every request for its address, whichever page makes it.
+# So the chat socket, and every request that changes something, must come from the
+# console's own page: one without an Origin header (not a page: curl, an app's own code),
+# or whose Origin is the address the request was sent to (Host, or X-Forwarded-Host behind
+# a proxy), or one listed in CLAUDE_CONSOLE_ORIGINS (host[:port], comma-separated). A
+# sandboxed page (an interactive figure in a reply) has the origin "null" and is refused.
+EXTRA_ORIGINS = {o.strip().lower() for o in (_env("ORIGINS", "") or "").split(",") if o.strip()}
+
+
+def origin_allowed(request, origin):
+    if not origin:
+        return True
+    if origin == "null":
+        return False
+    try:
+        u = urllib.parse.urlsplit(origin)
+        netloc, host = u.netloc.lower(), (u.hostname or "").lower()
+    except ValueError:
+        return False
+    if u.scheme not in ("http", "https") or not netloc:
+        return False
+    allowed = {request.host.lower()}
+    fwd = request.headers.get("X-Forwarded-Host", "")
+    if fwd:
+        allowed.add(fwd.split(",")[0].strip().lower())
+    return netloc in allowed or netloc in EXTRA_ORIGINS or host in EXTRA_ORIGINS
+
+
 class AuthMixin:
     def _ok_auth(self):
+        if self.request.method not in ("GET", "HEAD", "OPTIONS") and not origin_allowed(
+                self.request, self.request.headers.get("Origin")):
+            self.set_status(403)
+            self.finish()
+            return False
         if not AUTH:
             return True
         header = self.request.headers.get("Authorization", "")
@@ -3935,15 +3973,126 @@ def local_image_path(path):
     real = os.path.realpath(path)
     if os.path.splitext(real)[1].lower() not in LOCAL_IMAGE_TYPES or not os.path.isfile(real):
         return None
+    return real if _under_roots(real) else None
+
+
+def _under_roots(real):
+    """real (a resolved path) lies under the home folder, the temporary folder or a live
+    session's working directory."""
     roots = [HOME, tempfile.gettempdir()] + [getattr(s, "cwd", "") for s in list(CHAT_SESSIONS.values())]
     for root in roots:
         if root and (real == os.path.realpath(root) or real.startswith(os.path.realpath(root).rstrip(os.sep) + os.sep)):
-            return real
-    return None
+            return True
+    return False
+
+
+# An interactive page in a reply: a Markdown image whose path ends in .html,
+# ![what it shows](/abs/path/fig.html), for a self-contained Plotly / Bokeh / D3 figure.
+# It is a program the agent wrote, maybe on instructions it read somewhere, so it
+# runs sealed: sandboxed without its own origin (it cannot read or script the console
+# page, its storage or its API) and with no network at all (no fetch, WebSocket,
+# outside scripts, images or fonts; no forms, frames or pop-ups). Libraries must be
+# inside the file. The header holds also when the address is opened on its own.
+LOCAL_HTML_TYPES = {".html": "text/html; charset=utf-8", ".htm": "text/html; charset=utf-8",
+                    ".svg": "image/svg+xml"}   # an interactive SVG runs as a page too
+LOCAL_HTML_MAX = 60 * 1024 * 1024
+LOCAL_HTML_CSP = ("sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' blob: data:; "
+                  "style-src 'unsafe-inline' blob: data:; img-src blob: data:; font-src blob: data:; media-src blob: data:; "
+                  "worker-src blob: data:; connect-src 'none'; frame-src 'none'; object-src 'none'; form-action 'none'; "
+                  "base-uri 'none'")
+
+
+def local_html_path(path):
+    """The real path of an interactive page the page may show, else None."""
+    if not isinstance(path, str) or not path.strip():
+        return None
+    path = path.strip()
+    if path.startswith("file://"):
+        path = urllib.parse.unquote(path[7:])
+    path = os.path.expanduser(path)
+    if not os.path.isabs(path):
+        return None
+    real = os.path.realpath(path)
+    if os.path.splitext(real)[1].lower() not in LOCAL_HTML_TYPES or not os.path.isfile(real):
+        return None
+    return real if _under_roots(real) else None
+
+
+class LocalHtmlHandler(AuthMixin, tornado.web.RequestHandler):
+    """GET / HEAD ?path=… : an interactive page named in the agent's reply (local_html_path),
+    under LOCAL_HTML_CSP."""
+    def _stat(self):
+        real = local_html_path(self.get_argument("path", ""))
+        try:
+            st = os.stat(real) if real else None
+        except OSError:
+            st = None
+        if not st or st.st_size > LOCAL_HTML_MAX:
+            self.set_status(404)
+            return None, None
+        self.set_header("Content-Type", LOCAL_HTML_TYPES[os.path.splitext(real)[1].lower()])
+        self.set_header("Content-Security-Policy", LOCAL_HTML_CSP)
+        self.set_header("X-Content-Type-Options", "nosniff")
+        self.set_header("Referrer-Policy", "no-referrer")
+        self.set_header("Cache-Control", "private, no-cache")
+        self.set_header("ETag", '"%x-%x"' % (st.st_mtime_ns, st.st_size))
+        return real, st
+
+    def head(self):
+        if not self._ok_auth():
+            return
+        self._stat()
+        self.finish()
+
+    async def get(self):
+        if not self._ok_auth():
+            return
+        real, st = self._stat()
+        if not real:
+            self.finish()
+            return
+        if self.request.headers.get("If-None-Match") == self._headers.get("ETag"):
+            self.set_status(304)
+            self.finish()
+            return
+        with open(real, "rb") as fh:
+            while True:
+                chunk = fh.read(256 * 1024)
+                if not chunk:
+                    break
+                self.write(chunk)
+                await self.flush()
+
+
+# An SVG that does something (a script, an event handler, a hover style) shows nothing of it
+# as a picture, so it runs as an interactive page instead (LocalHtmlHandler): the image
+# answer says so in X-Svg-Interactive, and the page turns its picture into a ▶ Run card.
+_SVG_ACTIVE_RE = re.compile(rb"<script\b|\son[a-z]+\s*=|:hover\b", re.I)
+
+
+def svg_interactive(real):
+    try:
+        with open(real, "rb") as fh:
+            return bool(_SVG_ACTIVE_RE.search(fh.read(4 * 1024 * 1024)))
+    except OSError:
+        return False
 
 
 class LocalImageHandler(AuthMixin, tornado.web.RequestHandler):
-    """GET ?path=… : an image file named in the agent's reply (local_image_path)."""
+    """GET / HEAD ?path=… : an image file named in the agent's reply (local_image_path)."""
+    def head(self):
+        if not self._ok_auth():
+            return
+        real = local_image_path(self.get_argument("path", ""))
+        if not real:
+            self.set_status(404)
+        else:
+            self.set_header("Content-Type", LOCAL_IMAGE_TYPES[os.path.splitext(real)[1].lower()])
+            self.set_header("Cache-Control", "private, no-cache")
+            if real.lower().endswith(".svg"):
+                self.set_header("X-Svg-Interactive", "1" if svg_interactive(real) else "0")
+        self.finish()
+
     async def get(self):
         if not self._ok_auth():
             return
@@ -5688,14 +5837,17 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
     Closing the socket only DETACHES — it never kills the claude process."""
 
     def check_origin(self, origin):
-        return True
+        return origin_allowed(self.request, origin)   # the console's own page only (see origin_allowed)
 
     clients = set()          # every open socket — for cross-device favorite sync
 
+    def prepare(self):
+        # The login is asked during the handshake, while the answer can still be a 401.
+        # Once the socket is open, a status can no longer be set (tornado raises), so a
+        # check in open() threw on every socket without the login.
+        self._ok_auth()
+
     def open(self):
-        if AUTH and not self._ok_auth():
-            self.close(4401, "Unauthorized")
-            return
         self.session = None
         ChatSocket.clients.add(self)
         self._say({"type": "hello", "stamp": PAGE_STAMP})
@@ -6388,6 +6540,21 @@ pre code{background:none;border:none;padding:0}
 .mdimg img{display:block;max-width:min(100%,560px);max-height:min(380px,50vh);width:auto;height:auto;border:1px solid var(--line);
   border-radius:6px;background:var(--bg2);cursor:zoom-in}
 .mdimg.broken{line-height:1.4;font-size:12.5px;color:var(--mut)}
+/* an interactive page in a reply (mdImages, a .html path): a bar with ▶ Run and ⤢; running,
+   its sealed frame below, as tall as a plot, the height draggable at the corner */
+.mdhtml{margin:8px 0;border:1px solid var(--line);border-radius:8px;background:var(--bg2);overflow:hidden;max-width:min(100%,760px)}
+.mdhtml .mhbar{display:flex;align-items:center;gap:8px;padding:6px 8px 6px 10px;font-size:13px;line-height:1.4}
+.mdhtml .mhkind{flex:none;font-size:10.5px;font-family:var(--fmono);color:var(--mut);border:1px solid var(--line);border-radius:5px;padding:0 5px}
+.mdhtml .mhname{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600}
+.mdhtml button{flex:none;border:1px solid var(--line);background:var(--bg);color:var(--fg);border-radius:6px;padding:2px 9px;font-size:12px;cursor:pointer}
+.mdhtml button:hover{border-color:var(--acc);color:var(--acc)}
+.mdhtml .mhbox{border-top:1px solid var(--line);height:460px;min-height:160px;max-height:90vh;resize:vertical;overflow:hidden;background:#fff}
+.mdhtml .mhbox[hidden]{display:none}
+.mdhtml .mhbox iframe{display:block;width:100%;height:100%;border:0;background:#fff}
+.mdhtml.broken .mhbox{height:auto;min-height:0;resize:none;padding:7px 10px;background:none;color:var(--mut);font-size:12.5px}
+@media(max-width:599px){.mdhtml .mhbox{height:360px}}
+.imgviewer.page .ivport{touch-action:auto;background:#fff}
+.imgviewer .ivpage{display:block;width:100%;height:100%;border:0;background:#fff}
 /* the picture viewer (openImageViewer): over the chat, nearly the whole window; on a
    phone the whole screen */
 .imgviewer{margin:auto;padding:0;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--fg);
@@ -7710,6 +7877,7 @@ function mdImages(h,links){
     let out;
     if(/^https?:\/\//i.test(target))out='<a href="'+escAttr(target)+'" target="_blank" rel="noopener noreferrer">🖼 '+label+'</a>';
     else{const p=localImageTarget(target);if(!p)return m;
+      if(/\.html?$/i.test(p)){links.push(htmlCardHtml(p,alt));return '%%LK'+(links.length-1)+'%%';}   /* an interactive page */
       out='<figure class="mdimg"><a href="'+escAttr(webfmOpenUrl(p))+'" target="_blank" rel="noopener" title="'+escAttr(unescHtml(alt||p))+'">'+
         '<img src="api/localimage?path='+encodeURIComponent(p)+'" alt="'+escAttr(unescHtml(alt))+'" loading="lazy" data-path="'+escAttr(p)+'"></a></figure>';}
     links.push(out);return '%%LK'+(links.length-1)+'%%';});}
@@ -7725,7 +7893,7 @@ function loadPanzoom(){if(typeof Panzoom==='function')return Promise.resolve(tru
   if(!panzoomLoad)panzoomLoad=new Promise(res=>{const sc=document.createElement('script');sc.src='/static/panzoom/panzoom.min.js';
     sc.onload=()=>res(typeof Panzoom==='function');sc.onerror=()=>{panzoomLoad=null;res(false);};document.head.appendChild(sc);});
   return panzoomLoad;}
-function imgViewDestroy(){const v=imgView;imgView=null;if(!v)return;v.abort.abort();if(v.observer)v.observer.disconnect();
+function imgViewDestroy(){$('#imgViewer').classList.remove('page');const v=imgView;imgView=null;if(!v)return;v.abort.abort();if(v.observer)v.observer.disconnect();
   if(v.panzoom){v.panzoom.destroy();v.panzoom.resetStyle();}$('#ivPort').classList.remove('zoomed','dragging');$('#ivFit').hidden=true;}
 function openImageViewer(o){const d=$('#imgViewer'),port=$('#ivPort'),stage=$('#ivStage'),msg=$('#ivMsg');imgViewDestroy();
   const name=o.name||'image';$('#ivName').textContent=name;$('#ivName').title=o.alt&&o.alt!==name?o.alt:name;$('#ivPath').textContent=o.path||'';
@@ -7746,6 +7914,30 @@ function openImageViewer(o){const d=$('#imgViewer'),port=$('#ivPort'),stage=$('#
     stage.addEventListener('panzoomend',()=>port.classList.remove('dragging'),sig);
     $('#ivFit').hidden=false;};
   img.src=o.src;}
+/* ── interactive pages in replies ─────────────────────────────────────────────
+   A card (mdImages) runs its page on ▶ Run in a frame below it, sandboxed without an
+   origin of its own; the server's header (LOCAL_HTML_CSP) takes the network away. ⤢
+   opens it large in the viewer. ■ Stop removes the frame (and whatever it was doing). */
+function htmlUrl(p){return 'api/localhtml?path='+encodeURIComponent(p);}
+function sealedFrame(src,title){const f=document.createElement('iframe');f.setAttribute('sandbox','allow-scripts');
+  f.referrerPolicy='no-referrer';f.title=title||'interactive page';f.src=src;return f;}
+async function runHtmlCard(fig){const box=fig.querySelector('.mhbox'),btn=fig.querySelector('.mhrun'),p=fig.dataset.path;
+  if(fig.classList.contains('running')){box.replaceChildren();box.hidden=true;fig.classList.remove('running');btn.textContent='▶ Run';return;}
+  let ok=false;try{ok=(await fetch(htmlUrl(p),{method:'HEAD',cache:'no-store'})).ok;}catch(e){}
+  if(!ok){fig.classList.add('broken');box.hidden=false;box.textContent='page not found: '+p;return;}
+  fig.classList.remove('broken');box.replaceChildren(sealedFrame(htmlUrl(p),fig.querySelector('.mhname').textContent));
+  box.hidden=false;fig.classList.add('running');btn.textContent='■ Stop';}
+function openPageViewer(o){const d=$('#imgViewer');imgViewDestroy();
+  $('#ivName').textContent=o.name;$('#ivName').title=o.alt||o.name;$('#ivPath').textContent=o.path||'';
+  const dl=$('#ivDownload');dl.href=o.src;dl.setAttribute('download',o.name);
+  const fm=$('#ivFm');fm.hidden=!o.path;if(o.path)fm.href=webfmOpenUrl(o.path);
+  $('#ivMsg').hidden=true;const f=sealedFrame(o.src,o.alt||o.name);f.className='ivpage';$('#ivStage').replaceChildren(f);
+  imgView={abort:new AbortController(),panzoom:null,observer:null,img:null};d.classList.add('page');
+  if(!d.open)d.showModal();}
+document.addEventListener('click',e=>{const b=e.target.closest&&e.target.closest('.mdhtml .mhrun,.mdhtml .mhbig');if(!b)return;
+  const fig=b.closest('.mdhtml'),p=fig.dataset.path;
+  if(b.classList.contains('mhrun'))runHtmlCard(fig);
+  else openPageViewer({src:htmlUrl(p),name:p.split('/').pop(),path:p,alt:fig.querySelector('.mhname').textContent});});
 /* taps and clicks in the viewer: a double one on the picture zooms there (or back to
    fit), a single one beside an unzoomed picture closes it; a drag or a pinch is neither */
 (function(){const port=$('#ivPort'),d=$('#imgViewer'),pts=new Map();let g=null,lastTap=null;
@@ -7781,6 +7973,20 @@ document.addEventListener('click',e=>{const a=e.target.closest&&e.target.closest
 /* a picture whose file is gone or not an image here: say so, with the path, in its place */
 document.addEventListener('error',e=>{const im=e.target;if(!(im instanceof HTMLImageElement)||!im.closest('.mdimg'))return;
   const f=im.closest('.mdimg');f.classList.add('broken');f.textContent='🖼 image not found: '+(im.dataset.path||'');},true);
+/* an interactive page's card (run on a click, runHtmlCard); label: HTML (escaped) or '' */
+function htmlCardHtml(p,label){return '<figure class="mdhtml" data-path="'+escAttr(p)+'"><div class="mhbar"><span class="mhkind">interactive</span>'+
+  '<span class="mhname" title="'+escAttr(p)+'">'+(label||esc(p.split('/').pop()))+'</span>'+
+  '<button type="button" class="mhrun" title="Run it here, sealed off from the console and the network">▶ Run</button>'+
+  '<button type="button" class="mhbig" title="Open it large">⤢</button></div><div class="mhbox" hidden></div></figure>';}
+/* an SVG picture that does something (a script, an event handler, a hover style; the server
+   says so in X-Svg-Interactive) becomes such a card, since as a picture it would do nothing */
+const svgChecked=new Map();   /* path -> Promise<bool> */
+document.addEventListener('load',e=>{const im=e.target;if(!(im instanceof HTMLImageElement))return;
+  const f=im.closest('.mdimg'),p=im.dataset.path||'';if(!f||!/\.svg$/i.test(p)||f.dataset.svgChecked)return;f.dataset.svgChecked='1';
+  if(!svgChecked.has(p))svgChecked.set(p,fetch('api/localimage?path='+encodeURIComponent(p),{method:'HEAD',cache:'no-store'})
+    .then(r=>r.ok&&r.headers.get('X-Svg-Interactive')==='1').catch(()=>false));
+  svgChecked.get(p).then(on=>{if(!on||!f.isConnected)return;const t=document.createElement('div');
+    t.innerHTML=htmlCardHtml(p,esc(im.alt||''));f.replaceWith(t.firstChild);});},true);
 function linkLocalPaths(h){
   const exts='pdf|png|jpe?g|gif|webp|svg|avif|heic|txt|md|markdown|rst|log|py|pyi|ipynb|js|mjs|ts|tsx|jsx|css|json|ya?ml|toml|ini|cfg|conf|xml|csv|tsv|sh|bash|zsh|fish|c|h|cpp|cc|hpp|rs|go|java|kt|rb|php|pl|lua|sql|tex|bib|m|jl|r|swift|html?';
   const re=new RegExp('(^|[\\s(>])((?:~|/)[^\\n<]*?\\.('+exts+'))(?=$|[\\s.,;:!?)}\\]]|<br>)','gi');
@@ -7831,7 +8037,7 @@ function md(src){
   h=h.replace(/(<oli[^>]*>.*?<\/oli>(?:\n<oli[^>]*>.*?<\/oli>)*)/g,m=>'<ol>'+m.replace(/\n/g,'').replace(/<(\/?)oli/g,'<$1li')+'</ol>');
   h=h.replace(/\*(\S[^*\n]*?\S|\S)\*/g,'<i>$1</i>');
   h=h.replace(/\n/g,'<br>').replace(/<br>(<(?:pre|h2|h3|ul|ol|table)>)/g,'$1').replace(/(<\/(?:pre|h2|h3|ul|ol|table)>)<br>/g,'$1')
-   .replace(/<br>(<figure class="mdimg">)/g,'$1').replace(/(<\/figure>)<br>/g,'$1');
+   .replace(/<br>(<figure class="md(?:img|html)"[^>]*>)/g,'$1').replace(/(<\/figure>)<br>/g,'$1');
   h=h.replace(/%%CB(\d+)%%/g,(m,i)=>bl[+i]);
   h=h.replace(/%%MJ(\d+)%%/g,(m,i)=>'<span class="math'+(ml[+i].d?' display':'')+'" data-d="'+ml[+i].d+'">'+esc(ml[+i].t)+'</span>');
   return h;
@@ -11093,6 +11299,7 @@ def main():
         (r"/api/image", ImageHandler),
         (r"/api/image/save", ImageSaveHandler),
         (r"/api/localimage", LocalImageHandler),
+        (r"/api/localhtml", LocalHtmlHandler),
         (r"/api/notify/stream", NotifyStreamHandler),
         (r"/api/notify/approve", NotifyApproveHandler),
         (r"/api/android/latest", AndroidLatestHandler),
